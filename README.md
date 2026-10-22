@@ -1,6 +1,6 @@
 # Shared Agent Memory
 
-[English](README.en.md) · [协议](docs/protocol.md) · [维护](docs/operations.md) · [按需检索架构](docs/retrieval-architecture.md) · [MIT](LICENSE)
+[English](README.en.md) · [协议](docs/protocol.md) · [维护](docs/operations.md) · [自适应检索](docs/adaptive-retrieval.md) · [实测报告](docs/adaptive-results.md) · [MIT](LICENSE)
 
 供同一台机器上的多个 AI Agent 共用的本地记忆服务。提供标准 **MCP STDIO** 和 **CLI**，用本地 embedding、关键词和代码标识符检索，按当前任务返回相关片段。
 
@@ -95,7 +95,13 @@ Agent 调用 `memory_recall`，只需描述当前任务需要的经验：
 {"ids":["11111111-1111-4111-8111-111111111111"]}
 ```
 
-上面的 ID 只是格式示例，应替换为真实检索结果。默认最多返回 5 条，`limit` 最多 10 条；`token_budget` 可下调单次预算，服务端 `response_token_budget` 默认 6000。Token 按紧凑 JSON 的 UTF-8 bytes / 3 向上估算，不是指定 LLM 的 tokenizer。正文合计最多 5000 字符，JSON payload 最多 32000 bytes；预算截断保留来源并标记 `truncated`。空结果和 `insufficient` 是正常结果，不能据此编造历史。
+上面的 ID 只是格式示例，应替换为真实检索结果。0.4.0 默认 `mode=auto`，也可选择 `focused`（事实）或 `broad`（综合证据）。`limit` 表示单页建议，默认服务端保护为128条，不限制累计检索数量。`token_budget` / `max_bytes` 调整单页预算；配置默认6000估算Token、32000 bytes。预算截断保留来源并标记 `truncated`，有更多候选时返回 `has_more` 与 `next_cursor`。
+
+```json
+{"query":"过去的设计选择有哪些反复出现的偏好、反例和临时要求？","mode":"broad","view":"evidence","limit":12}
+```
+
+后续用 `{"cursor":"上次返回的 next_cursor"}` 继续，分批归纳后再按 ID 深读。普通响应默认不含 diagnostics，显式 `debug:true` 才返回完整计数。相关性和证据充分性都是启发式判断，不能当作事实核验；数据或权限变化会令旧游标失效。详见[架构、分页示例与回滚](docs/adaptive-retrieval.md)及[120条查询评估](docs/adaptive-results.md)。空结果和 `insufficient` 是正常结果，不能据此编造历史。
 
 ## 工具与权限
 

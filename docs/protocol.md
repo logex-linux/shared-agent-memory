@@ -6,7 +6,7 @@ MCP STDIO 和 CLI 使用相同的 `MemoryService`。配置路径通过 `SHARED_M
 
 | 工具 | 必要参数 | 说明 |
 |---|---|---|
-| `memory_recall` | `query` 或 `ids` 二选一 | `project_id`、`include_global`、`context`、`limit`、`exact_only` 可选 |
+| `memory_recall` | `query`、`ids` 或 `cursor` 三选一 | `mode`、`view`、`limit`、单页预算、`debug`；原 project/context/exact_only 参数保留 |
 | `memory_propose` | UUID `request_id`、完整 `record` | 更新时同时提供 `target_id` 和 `expected_revision` |
 | `memory_commit` | UUID `request_id`、`proposal_id`、`expected_revision` | 新记忆的 expected_revision 为 0 |
 | `memory_forget` | UUID `request_id`、`memory_id`、`expected_revision` | 版本必须与当前记录一致 |
@@ -23,7 +23,7 @@ MCP STDIO 和 CLI 使用相同的 `MemoryService`。配置路径通过 `SHARED_M
 
 旧配置省略 `all_projects` 时，仍按 `allowed_projects` 列表检索。工具参数只能进一步缩小已有配置范围。指定的分支、commit、environment 与记录条件不符时排除；缺少必需上下文时返回 `requires_check`，过期记录排除。
 
-默认 `limit=5`，最多 10；query 最多 512 字符，并检查加检索前缀后是否超过 512 模型 token。正文片段总预算为 5000 字符、响应预算为 32000 bytes。
+0.4.0 支持 `mode=auto|focused|broad`，默认auto。limit为单页建议，不再最多10；服务端page_item_limit默认128，无累计上限。返回has_more/next_cursor继续分页。query最多512字符，并检查加前缀后的模型token数。`view=evidence`提供最佳命中的短片段，普通响应默认不含诊断，debug=true显式开启。预算、游标失效、安全与完整示例见[自适应检索协议](adaptive-retrieval.md)。
 
 代码标识符匹配仅提供有限排序加权；`exact_only: true` 才按标识符严格过滤，且必须存在可识别的标识符。
 
@@ -117,12 +117,12 @@ SQLite schema 5 使用 WAL、Chunk FTS5 与 sqlite-vec cosine KNN。从 schema4 
 常见错误码：`INVALID_INPUT`、`SCOPE_DENIED`、`PROJECT_UNKNOWN`、`OPERATION_DENIED`、`QUERY_TOO_LONG`、`VERSION_CONFLICT`、`REQUEST_ID_REUSED`、`DEPENDENCY_STALE`、`DEPENDENCY_CYCLE`、`EMBEDDING_UNAVAILABLE`、`INDEX_PROFILE_MISMATCH`、`REVOKED_IMPORT`、`BUSY_RETRYABLE`。维护与恢复见 [operations.md](operations.md)。
 
 
-## 0.3.0 片段与诊断
+## 0.4.0 片段与诊断
 
-工具名称和写入生命周期不变。`memory_recall` 可加 `token_budget`（512–10000），只下调配置的 `response_token_budget`（默认6000）。估算单位为紧凑返回 JSON 的 UTF-8 bytes / 3 向上取整；含元数据与诊断，不是模型真实 tokenizer。JSON payload 上限32000 bytes，content总长上限5000个JS字符；不含外层JSON-RPC包裹。预算不足时缩短content或减少条目，保留来源，返回RESPONSE_BUDGET/truncated；候选存在但无法输出时evidence_status=insufficient。
+工具名称和写入生命周期不变。token_budget为512–1,000,000，只能下调配置上限（默认6000）；max_bytes只能下调page_response_bytes（默认32000）。预算为当前传输，按UTF-8 bytes/3估算，诊断不占内容Token预算。字节硬限制仍包含诊断，不含外层JSON-RPC。预算不足缩短content或减少条目，保留来源并标记RESPONSE_BUDGET/truncated；来源本身过大则返回blocked_ids，扩大单页预算后重试。
 
 普通查询最多读取每条入选记忆的两个命中Chunk，优先命中位置，重叠/相邻片段合并。新增`excerpts[]`提供每段start/end及chunk_ids，均为原始正文JS字符偏移；非相邻片段由换行省略号连接。原`excerpt`保留为范围包络，精确定位应看excerpts。按ids读取完整正文仍受响应预算约束。
 
-`diagnostics`提供elapsed_ms、candidate_ids、candidates_ranked、full_body_records_read/full_body_bytes_read、json_parses/metadata_json_parses、chunk_text_rows_read、query_embeddings、vector_queries/vector_rows_returned、response_bytes、estimated_tokens。JSON解析数指检索物化层的显式解析，不涵盖模型库初始化；基准另用全局JSON.parse观测作交叉验证。普通查询的完整正文读取应为0。
+`diagnostics`提供elapsed_ms、candidate_ids、candidates_ranked、full_body_records_read/full_body_bytes_read、json_parses/metadata_json_parses、chunk_text_rows_read、query_embeddings、vector_queries/vector_rows_returned、response_bytes、estimated_tokens。JSON解析数包含检索与查询缓存的显式解析，不涵盖模型库初始化；基准另用全局JSON.parse观测作交叉验证。普通查询的完整正文读取应为0。
 
 sqlite-vec内部的向量扫描量、距离计算次数没有公开计数接口，`vector_internal_scanned`和`vector_distance_computations`为null。vector_rows_returned只表示KNN返回Node的候选行，不能解释为内部扫描量。候选通道在同一个SQLite读快照内独立检索，SQL按顺序执行，保持一致性；没有伪称同步SQLite调用在多核上并行。

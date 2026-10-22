@@ -26,3 +26,13 @@ test('official SDK STDIO: schemas, instructions, cross-process updates, restart,
     const bad=await b.callTool({name:'memory_recall',arguments:{project_id:randomUUID(),query:'x'}});assert.equal(bad.isError,true);
   }finally{await a.close();await b.close();}
 });
+
+test('official SDK exposes adaptive pagination and compact sourced evidence without granting write operations',async()=>{
+ const {fake,seed}=await import('./adaptive-helpers.mjs');const {service:s,root,config,project}=await setup();s.encoder=fake;const gold=seed(s,[project],61);s.close();const path=root+'/adaptive-reader.json';await writeFile(path,JSON.stringify({...config,operations:['recall']}));
+ const c=new Client({name:'adaptive-reader',version:'test'});await c.connect(new StdioClientTransport({command:process.execPath,args:[resolve('dist/mcp/server.js')],env:{SHARED_MEMORY_CONFIG:path},stderr:'pipe'}));
+ try{
+  const tool=(await c.listTools()).tools[0];assert.equal(tool.name,'memory_recall');assert.ok(tool.inputSchema.properties.cursor);assert.deepEqual(tool.inputSchema.properties.mode.enum,['auto','focused','broad']);assert.ok(!tool.inputSchema.properties.limit.maximum||tool.inputSchema.properties.limit.maximum>1000);
+  let request={query:'设计偏好',mode:'broad',view:'evidence',limit:9};const ids=[];do{const result=await c.callTool({name:'memory_recall',arguments:request});assert.ok(!result.isError,JSON.stringify(result));const r=JSON.parse(result.content[0].text);assert.equal(r.diagnostics,undefined);assert.ok(r.items.length<=9);assert.ok(r.items.every(i=>i.content.length<=200&&i.sources.length&&i.verification.status==='unverified'));ids.push(...r.items.map(i=>i.id));if(!r.has_more)break;request={cursor:r.next_cursor};}while(true);
+  assert.equal(new Set(ids).size,ids.length);assert.deepEqual(new Set(ids),new Set(gold));assert.match(c.getInstructions(),/heuristic/);
+ }finally{await c.close();}
+});

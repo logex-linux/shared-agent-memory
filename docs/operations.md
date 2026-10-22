@@ -65,3 +65,8 @@ node scripts/client-configs.mjs --config "$HOME/.local/share/shared-agent-memory
 生成器校验UUID已注册且当前连接可访问、路径存在且是目录、最长别名映射匹配。失效别名、错误UUID和路径映射冲突会失败，不再使用allowed_projects的第一项猜测身份。安装器自动用实际工作目录及返回UUID生成三种角色的Codex配置。
 
 Schema4→5 的备份、迁移、完整性检查与回滚步骤见[按需检索架构](retrieval-architecture.md)。首次用新版打开库会在事务中迁移；升级前保留备份，旧程序不能打开Schema5。
+
+
+## 0.4.0 查询状态
+
+canonical仍为Schema5，无新迁移。首次查询会创建database真实路径旁的 `.retrieval.db`、WAL和SHM，仅保存短期查询进度与轻量候选，不保存正文。备份可忽略它；停掉全部实例后才可删除或VACUUM。默认30分钟滑动TTL，后续查询清理到期状态。游标过期或generation变化时重新检索，不强行续取。回滚到0.3无需回滚canonical数据，详见[升级与回滚](adaptive-retrieval.md#升级备份与回滚)。

@@ -51,10 +51,12 @@ export const forgetSchema = z.object({ request_id: request, memory_id: z.string(
 export const recallSchema = z.object({
   query: text(512).optional(), ids: z.array(z.string().uuid()).min(1).max(10).optional(),
   project_id: z.string().uuid().optional(), include_global: z.boolean().optional(),
-  context: validSchema.omit({expires_at:true}).default({}), limit: z.number().int().min(1).max(10).default(5),
-  exact_only:z.boolean().default(false),token_budget:z.number().int().min(512).max(10000).optional()
+  context: validSchema.omit({expires_at:true}).default({}), limit: z.number().int().positive().safe().optional(),
+  exact_only:z.boolean().default(false),token_budget:z.number().int().min(512).max(1000000).optional(),
+  mode:z.enum(['auto','focused','broad']).optional(),view:z.enum(['chunks','evidence']).optional(),
+  cursor:text(160).optional(),debug:z.boolean().default(false),max_bytes:z.number().int().min(2048).max(1048576).optional()
 }).strict().superRefine((r,ctx) => {
-  if (Boolean(r.query) === Boolean(r.ids)) ctx.addIssue({code:'custom', message:'exactly one of query or ids required'});
+  if (Number(Boolean(r.query))+Number(Boolean(r.ids))+Number(Boolean(r.cursor))!==1) ctx.addIssue({code:'custom', message:'exactly one of query, ids or cursor required'});
   if(r.exact_only && !r.query)ctx.addIssue({code:'custom',message:'exact_only requires query'});
 });
 export const configSchema = z.object({
@@ -65,7 +67,13 @@ export const configSchema = z.object({
   semantic_threshold: z.number().min(0).max(1).default(0.425),
   evidence_threshold: z.number().min(0).max(1).default(0.575),
   dtype: z.enum(['fp32','q8']).default('fp32'), threads: z.number().int().min(1).max(8).default(2),
-  response_token_budget:z.number().int().min(512).max(10000).default(6000)
+  response_token_budget:z.number().int().min(512).max(1000000).default(6000),
+  page_response_bytes:z.number().int().min(2048).max(1048576).default(32000),
+  page_item_limit:z.number().int().min(1).max(10000).default(128),
+  page_candidate_budget:z.number().int().min(32).max(10000).default(512),
+  page_time_budget_ms:z.number().int().min(10).max(60000).default(2000),
+  query_ttl_seconds:z.number().int().min(1).max(86400).default(1800),
+  diagnostics:z.boolean().default(false)
 }).strict();
 export type Config = z.infer<typeof configSchema>;
 export type RecallInput = z.infer<typeof recallSchema>;

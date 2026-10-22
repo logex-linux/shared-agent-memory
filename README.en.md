@@ -68,6 +68,12 @@ Source code is MIT-licensed. Dependencies and model artifacts retain their upstr
 
 See [scale measurements](docs/scale-benchmark.md) and [0.2.0 repair notes](docs/repairs-0.2.0.md) for regression coverage, restore requirements and permission changes.
 
-## On-demand retrieval (0.3.0)
+## Adaptive retrieval (0.4.0)
 
-Schema 5 uses scoped cosine KNN, chunk FTS and indexed identifiers before loading selected metadata and hit excerpts. Ordinary recall reads no full memory bodies. ID expansion remains explicit. `token_budget` can reduce the configured `response_token_budget` (default 6000 estimated tokens, UTF-8 JSON bytes / 3 rounded up); 32,000 payload bytes and 5,000 content characters remain hard caps. Diagnostics distinguish returned vector rows from unobservable internal scans. See the [architecture, migration and A/B report](docs/retrieval-architecture.md).
+Schema 5 keeps scoped cosine KNN, chunk FTS and indexed identifiers before materializing selected excerpts. Ordinary recall reads zero full memory bodies. Use `mode: "auto"` (default), `"focused"` or `"broad"`; broad supports historical synthesis and long-term preference evidence across projects and dates. Use `view: "evidence"` for short sourced hit excerpts, then expand chosen IDs. Existing tools, arguments, permissions and lifecycle remain available.
+
+`limit` is a page hint, not a cumulative cap. Follow `next_cursor` while `has_more` when more evidence is useful. The service defaults to 128 items, 6000 estimated content tokens and 32000 hard payload bytes per page, with configurable candidate/time budgets. Tokens use UTF-8 JSON bytes / 3 rounded up. Debug diagnostics are opt-in and excluded from the content token budget, while still respecting the hard byte ceiling. Sources and verification basis/status are preserved.
+
+Cursors bind query, scope, ranking and database generation; mutations or changed permissions require a new query. A disposable SQLite sidecar stores query progress and IDs/scores, not memory bodies. Canonical Schema 5 needs no migration and can still be opened by 0.3. Evidence sufficiency is a disclosed heuristic, never proof. Never infer a permanent preference from one project or persist a new profile without authorization.
+
+See [architecture, paging and rollback](docs/adaptive-retrieval.md), [quality/performance results](docs/adaptive-results.md), and the [auditable fictional 120-query protocol](bench/adaptive/README.md). The earlier [0.3 report](docs/retrieval-architecture.md) remains as historical evidence.
