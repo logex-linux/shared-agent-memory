@@ -1,6 +1,6 @@
 # Shared Agent Memory
 
-[English](README.en.md) · [协议](docs/protocol.md) · [维护](docs/operations.md) · [MIT](LICENSE)
+[English](README.en.md) · [协议](docs/protocol.md) · [维护](docs/operations.md) · [按需检索架构](docs/retrieval-architecture.md) · [MIT](LICENSE)
 
 供同一台机器上的多个 AI Agent 共用的本地记忆服务。提供标准 **MCP STDIO** 和 **CLI**，用本地 embedding、关键词和代码标识符检索，按当前任务返回相关片段。
 
@@ -25,6 +25,8 @@ flowchart LR
     R --> P[相关片段 + ID + revision + 来源]
     P -->|选中 ID 后展开| M
 ```
+
+普通查询先在授权范围内做 cosine KNN、Chunk FTS 和标识符索引检索，排序后只加载入选记录的元数据与最多两个命中片段；不会在 Node 中读取或解析全库正文。相邻命中片段合并，按 ID 才展开完整正文。
 
 这是检索式的按需注意：不把整个记忆库放入每次对话。向量相似度表示相关性，是否足以支持结论仍由 Agent 结合来源判断。
 
@@ -93,7 +95,7 @@ Agent 调用 `memory_recall`，只需描述当前任务需要的经验：
 {"ids":["11111111-1111-4111-8111-111111111111"]}
 ```
 
-上面的 ID 只是格式示例，应替换为真实检索结果。默认最多返回 5 条，`limit` 最多 10 条，正文合计最多 5000 字符，响应最多 32000 bytes。空结果和 `insufficient` 是正常结果，不能据此编造历史。
+上面的 ID 只是格式示例，应替换为真实检索结果。默认最多返回 5 条，`limit` 最多 10 条；`token_budget` 可下调单次预算，服务端 `response_token_budget` 默认 6000。Token 按紧凑 JSON 的 UTF-8 bytes / 3 向上估算，不是指定 LLM 的 tokenizer。正文合计最多 5000 字符，JSON payload 最多 32000 bytes；预算截断保留来源并标记 `truncated`。空结果和 `insufficient` 是正常结果，不能据此编造历史。
 
 ## 工具与权限
 

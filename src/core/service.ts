@@ -3,15 +3,15 @@ import { readFile, writeFile, mkdir, unlink, realpath,stat } from 'node:fs/promi
 import { dirname, join, resolve } from 'node:path';
 import { writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs';
 import { Storage } from '../storage/database.js';
+import { indexChunk } from '../retrieval/indexes.js';
+import { retrieve } from '../retrieval/recall.js';
 import { BgeEncoder } from '../embedding/bge.js';
-import { exactScore, ftsQuery, terms, lexicalCoverage, identifiers } from '../retrieval/lexical.js';
+import { ftsQuery, terms, identifiers } from '../retrieval/lexical.js';
 import { MemoryError, applicability, hash, stable, configSchema, proposeSchema, recallSchema, commitSchema, forgetSchema,
-  recordSchema, verificationSchema, type Config, type Encoder, type MemoryRecord, type Chunk } from './contracts.js';
+  recordSchema, type Config, type Encoder, type MemoryRecord, type Chunk } from './contracts.js';
 
 type Row={id:string;project_id:string|null;scope:string;body:string;revision:number;status:string;created_at:string;verified_at:string;profile_id:string;content_hash:string;import_key:string|null;written_by:string};
 const now=()=>new Date().toISOString();
-const LEXICAL_RRF_WEIGHT=0.125;
-const IDENTIFIER_BOOST=0.01;
 const blob=(v:Float32Array)=>Buffer.from(v.buffer,v.byteOffset,v.byteLength);
 
 export async function readConfig(path:string):Promise<Config> {
@@ -199,6 +199,7 @@ export class MemoryService {
       for(const c of chunks) {
         const result=this.db.prepare('INSERT INTO memory_chunks(memory_id,revision,start,end,tokens,text,profile_id) VALUES(?,?,?,?,?,?,?)').run(id,revision,c.start,c.end,c.tokens,c.text,profile.id);
         this.db.prepare('INSERT INTO memory_vec VALUES(?,?,?)').run(BigInt(result.lastInsertRowid),blob(c.vector),record.project_id??'global');
+        indexChunk(this.db,{id:Number(result.lastInsertRowid),memory_id:id,text:c.text},record.title,record.tags);
       }
       this.checkpoint('chunks');
       this.db.prepare('INSERT INTO memories_fts VALUES(?,?)').run(id,terms(record.title+' '+record.content+' '+record.tags.join(' ')).join(' '));
@@ -213,93 +214,8 @@ export class MemoryService {
     this.permission('recall');const input=recallSchema.parse(raw);
     if(input.exact_only && (!input.query || identifiers(input.query).length===0))throw new MemoryError('EXACT_IDENTIFIER_REQUIRED');
     if(input.project_id)this.scope(input.project_id,'project');
-    const includeGlobal=input.include_global??(!input.project_id && this.config.allow_global);
-    if(includeGlobal)this.scope(null,'global');
-    let queryVector:Float32Array|undefined,profileId:string|undefined;
-    const warnings:string[]=[];
-    let retrievalMode:string=input.ids?'ids':mode;
-    if(input.query && mode!=='lexical') {
-      try {profileId=(await this.encoder.profile()).id;queryVector=await this.encoder.query(input.query);}
-      catch(error) {
-        if(error instanceof MemoryError && error.code==='QUERY_TOO_LONG')throw error;
-        retrievalMode='lexical_degraded';warnings.push('EMBEDDING_UNAVAILABLE');
-      }
-    }
-    // Start the SQLite snapshot after encoding; read all channels from this snapshot.
-    this.db.exec('BEGIN');
-    try {
-      const generation=this.storage.generation();
-      const projects=input.project_id?[input.project_id]:this.config.all_projects?(this.db.prepare('SELECT id FROM projects').all() as {id:string}[]).map(p=>p.id):this.config.allowed_projects;
-      let rows=this.db.prepare("SELECT * FROM memories WHERE status='active' AND ((scope='project' AND project_id IN (SELECT value FROM json_each(?))) OR (?=1 AND scope='global'))").all(JSON.stringify(projects),Number(includeGlobal)) as Row[];
-      rows=rows.filter(row=>applicability(JSON.parse(row.body).valid_for,input.context)!=='excluded');
-      const eligible=new Map(rows.map(r=>[r.id,r]));
-      if(input.ids)rows=input.ids.flatMap(id=>eligible.has(id)?[eligible.get(id)!]:[]);
-      const scores=new Map<string,{rrf:number;exact:number;cosine?:number;lexical?:number;reason:string[];chunk?:any}>();
-      const score=(id:string)=>{if(!scores.has(id))scores.set(id,{rrf:0,exact:0,reason:[]});return scores.get(id)!;};
-      if(input.query) {
-        const allowed=JSON.stringify([...eligible.keys()]);
-        if(mode!=='vector' || retrievalMode==='lexical_degraded') {
-          const q=ftsQuery(input.query);
-          const lexical=q?this.db.prepare(`SELECT memory_id,bm25(memories_fts) AS rank FROM memories_fts WHERE memories_fts MATCH ? AND memory_id IN (SELECT value FROM json_each(?)) ORDER BY rank LIMIT 20`).all(q,allowed) as any[]:[];
-          lexical.forEach((r,i)=>{const body:MemoryRecord=JSON.parse(eligible.get(r.memory_id)!.body);const s=score(r.memory_id);s.rrf+=LEXICAL_RRF_WEIGHT/(60+i+1);s.lexical=r.rank;s.reason.push(lexicalCoverage(input.query!,body.title+' '+body.content+' '+body.tags.join(' '))>=0.6?'lexical':'lexical_weak');});
-        }
-        if(mode!=='vector' || input.exact_only || retrievalMode==='lexical_degraded') {
-          for(const row of rows) {
-            const body:MemoryRecord=JSON.parse(row.body),exact=exactScore(input.query,body.title,body.content,body.tags);
-            if(exact){const s=score(row.id);s.exact=exact;s.reason.push('identifier');}
-          }
-        }
-        if(queryVector) {
-          if(rows.some(r=>r.profile_id!==profileId)) {retrievalMode='lexical_degraded';warnings.push('INDEX_PROFILE_MISMATCH');}
-          else {
-            try {
-              const chunks=this.db.prepare('SELECT id,memory_id,revision,profile_id FROM memory_chunks WHERE memory_id IN (SELECT value FROM json_each(?))').all(allowed) as any[];
-              const vectorIds=new Set((this.db.prepare('SELECT chunk_id FROM memory_vec WHERE chunk_id IN (SELECT id FROM memory_chunks WHERE memory_id IN (SELECT value FROM json_each(?)))').all(allowed) as any[]).map(v=>v.chunk_id));
-              const indexed=new Set(chunks.map(c=>c.memory_id));
-              if(rows.some(r=>!indexed.has(r.id)) || chunks.some(c=>!vectorIds.has(c.id) || c.revision!==eligible.get(c.memory_id)!.revision || c.profile_id!==profileId))throw new MemoryError('INDEX_INCOMPLETE');
-              // Scan the vector table once. A chunk-first join makes vec0 perform
-              // thousands of separate lookups. Eligible IDs still filter BEFORE ranking.
-              const vectors=this.db.prepare(`SELECT c.memory_id,c.text,c.start,c.end,vec_distance_cosine(v.embedding,?) AS distance FROM memory_vec v CROSS JOIN memory_chunks c ON c.id=v.chunk_id WHERE v.chunk_id IN (SELECT id FROM memory_chunks WHERE memory_id IN (SELECT value FROM json_each(?)) AND profile_id=?) ORDER BY distance`).all(blob(queryVector),allowed,profileId!) as any[];
-              const seen=new Set<string>(); let rank=0;
-              for(const v of vectors) {
-                if(seen.has(v.memory_id))continue;seen.add(v.memory_id);rank++;
-                if(rank>20)break;
-                const s=score(v.memory_id);s.cosine=1-v.distance;s.chunk=v;
-                if(s.cosine>=this.config.semantic_threshold) {s.rrf+=1/(60+rank);s.reason.push('semantic');}
-              }
-            } catch(error) {
-              retrievalMode='lexical_degraded';warnings.push(error instanceof MemoryError?error.code:'VECTOR_INDEX_UNAVAILABLE');
-            }
-          }
-        }
-        const exactRequested=input.exact_only;
-        rows=rows.filter(r=>{const s=scores.get(r.id);return s && (exactRequested?s.exact>0:(s.exact>0 || s.reason.includes('semantic') || s.reason.includes('lexical') || s.reason.includes('lexical_weak')));});
-        rows.sort((a,b)=>{const sa=score(a.id),sb=score(b.id);return (sb.rrf+Math.min(sb.exact,3)*IDENTIFIER_BOOST)-(sa.rrf+Math.min(sa.exact,3)*IDENTIFIER_BOOST) || a.id.localeCompare(b.id);});
-      }
-      const index_profiles=[...new Set([...eligible.values()].map(r=>r.profile_id))];
-      const result:any={items:[],generation,retrieval_mode:retrievalMode,index_profiles,warnings,empty_reason:null};
-      let characters=0;
-      for(const row of rows.slice(0,input.limit)) {
-        const body:MemoryRecord=JSON.parse(row.body),s=scores.get(row.id);
-        const chunk=s?.chunk??this.db.prepare('SELECT text,start,end FROM memory_chunks WHERE memory_id=? ORDER BY id LIMIT 1').get(row.id) as any;
-        const content=input.ids?body.content:(chunk?.text??body.content);
-        if(characters+content.length>5000)break;
-        const strength=input.ids || (s && (s.exact>0 || s.reason.includes('lexical') || (s.cosine??0)>=this.config.evidence_threshold))?'supported':'weak';
-        const item={id:row.id,revision:row.revision,scope:row.scope,project_id:row.project_id,kind:body.kind,title:body.title,content,tags:body.tags,evidence_strength:strength,
-          sources:body.sources,verification:verificationSchema.parse(body.verification),written_by:row.written_by,record_updated_at:row.verified_at,valid_for:body.valid_for,
-          applicability:applicability(body.valid_for,input.context),content_hash:row.content_hash,
-          embedding_profile_id:row.profile_id,derived_from:body.derived_from,author_client:body.author_client,author_session:body.author_session,import_key:body.import_key,
-          excerpt:{start:input.ids?0:chunk?.start??0,end:input.ids?body.content.length:chunk?.end??body.content.length},
-          recall_reason:s?.reason??['id'],relevance:s?{rrf:s.rrf,cosine:s.cosine,identifier_matches:s.exact}:undefined};
-        result.items.push(item);
-        if(Buffer.byteLength(JSON.stringify(result))>32000){result.items.pop();warnings.push('RESPONSE_BUDGET');break;}
-        characters+=content.length;
-      }
-      result.evidence_status=result.items.some((i:any)=>i.evidence_strength==='supported')?'related_evidence':result.items.length?'insufficient':'none';
-      if(result.evidence_status==='insufficient')warnings.push('WEAK_RELEVANCE_VERIFY_SOURCE_BEFORE_USE');
-      if(result.items.length===0)result.empty_reason='NO_VISIBLE_APPLICABLE_EVIDENCE';
-      this.db.exec('COMMIT');return result;
-    }catch(error){this.db.exec('ROLLBACK');throw error;}
+    if(input.include_global??(!input.project_id&&this.config.allow_global))this.scope(null,'global');
+    return retrieve({db:this.db,config:this.config,encoder:this.encoder,generation:()=>this.storage.generation()},input,mode);
   }
   async forget(raw:unknown) {
     this.permission('forget');const input=forgetSchema.parse(raw);
@@ -327,7 +243,7 @@ export class MemoryService {
         try {unlinkSync(entry.path);this.db.prepare("UPDATE exports SET status='removed' WHERE id=?").run(entry.id);}
         catch(e:any) {if(e.code==='ENOENT')this.db.prepare("UPDATE exports SET status='removed' WHERE id=?").run(entry.id);else errors.push('EXPORT_CLEANUP_PENDING');}
       }
-      try{this.db.exec("INSERT INTO memories_fts(memories_fts) VALUES('optimize')");}catch{errors.push('FTS_CLEANUP_PENDING');}
+      try{this.db.exec("INSERT INTO memories_fts(memories_fts) VALUES('optimize'); INSERT INTO chunk_fts(chunk_fts) VALUES('optimize');");}catch{errors.push('FTS_CLEANUP_PENDING');}
       try {
         const root=dirname(this.config.database);mkdirSync(root,{recursive:true,mode:0o700});
         const tombstones=this.db.prepare('SELECT * FROM tombstones ORDER BY id').all();
@@ -350,7 +266,7 @@ export class MemoryService {
     this.permission('manage');
     const projects=(this.db.prepare('SELECT * FROM projects').all() as any[]).filter(p=>this.config.all_projects || this.config.allowed_projects.includes(p.id));
     const counts=this.db.prepare("SELECT scope,project_id,status,count(*) AS count FROM memories GROUP BY scope,project_id,status").all().filter((r:any)=>(r.scope==='global'?this.config.allow_global:this.config.all_projects || this.config.allowed_projects.includes(r.project_id)));
-    return {schema:4,generation:this.storage.generation(),projects,counts};
+    return {schema:5,generation:this.storage.generation(),projects,counts};
   }
   check() {
     this.permission('manage');
@@ -359,7 +275,12 @@ export class MemoryService {
     const orphan_vectors=this.db.prepare('SELECT count(*) AS n FROM memory_vec v LEFT JOIN memory_chunks c ON c.id=v.chunk_id WHERE c.id IS NULL').get();
     const missing_vectors=this.db.prepare('SELECT count(*) AS n FROM memory_chunks c LEFT JOIN memory_vec v ON c.id=v.chunk_id WHERE v.chunk_id IS NULL').get();
     const unindexed=this.db.prepare("SELECT count(*) AS n FROM memories m WHERE status='active' AND (NOT EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=m.id) OR NOT EXISTS(SELECT 1 FROM memories_fts f WHERE f.memory_id=m.id))").get();
-    return {integrity,orphan_chunks,orphan_vectors,missing_vectors,unindexed};
+    const search_mismatch=this.db.prepare(`SELECT count(*) n FROM memories m LEFT JOIN memory_search s ON s.memory_id=m.id
+      WHERE s.memory_id IS NULL OR s.revision!=m.revision OR s.status!=m.status OR s.profile_id!=m.profile_id OR s.project_id IS NOT m.project_id OR s.scope!=m.scope OR s.metadata!=json_remove(m.body,'$.content')`).get();
+    const missing_chunk_fts=this.db.prepare("SELECT count(*) n FROM memory_chunks c JOIN memories m ON m.id=c.memory_id WHERE m.status='active' AND NOT EXISTS(SELECT 1 FROM chunk_fts f WHERE f.chunk_id=c.id AND f.memory_id=c.memory_id)").get();
+    const orphan_chunk_fts=this.db.prepare('SELECT count(*) n FROM chunk_fts f LEFT JOIN memory_chunks c ON c.id=f.chunk_id WHERE c.id IS NULL OR c.memory_id!=f.memory_id').get();
+    const orphan_identifiers=this.db.prepare('SELECT count(*) n FROM chunk_identifiers i LEFT JOIN memory_chunks c ON c.id=i.chunk_id WHERE c.id IS NULL OR c.memory_id!=i.memory_id').get();
+    return {integrity,orphan_chunks,orphan_vectors,missing_vectors,unindexed,search_mismatch,missing_chunk_fts,orphan_chunk_fts,orphan_identifiers};
   }
   async export(project_id:string,include_global=false,format:'json'|'markdown'='json') {
     this.permission('manage');this.scope(project_id,'project');if(include_global)this.scope(null,'global');
@@ -395,7 +316,7 @@ export class MemoryService {
       for(const {row,chunks} of encoded) {
         const body=JSON.parse(row.body);
         this.db.prepare('UPDATE memories SET profile_id=? WHERE id=?').run(profile.id,row.id);
-        for(const c of chunks){const r=this.db.prepare('INSERT INTO memory_chunks(memory_id,revision,start,end,tokens,text,profile_id) VALUES(?,?,?,?,?,?,?)').run(row.id,row.revision,c.start,c.end,c.tokens,c.text,profile.id);this.db.prepare('INSERT INTO memory_vec VALUES(?,?,?)').run(BigInt(r.lastInsertRowid),blob(c.vector),row.project_id??'global');}
+        for(const c of chunks){const r=this.db.prepare('INSERT INTO memory_chunks(memory_id,revision,start,end,tokens,text,profile_id) VALUES(?,?,?,?,?,?,?)').run(row.id,row.revision,c.start,c.end,c.tokens,c.text,profile.id);this.db.prepare('INSERT INTO memory_vec VALUES(?,?,?)').run(BigInt(r.lastInsertRowid),blob(c.vector),row.project_id??'global');indexChunk(this.db,{id:Number(r.lastInsertRowid),memory_id:row.id,text:c.text},body.title,body.tags);}
         this.db.prepare('INSERT INTO memories_fts VALUES(?,?)').run(row.id,terms(body.title+' '+body.content+' '+body.tags.join(' ')).join(' '));
       }
       return {reindexed:rows.length,profile_id:profile.id,generation:this.storage.advance()};

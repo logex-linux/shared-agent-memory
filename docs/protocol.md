@@ -108,10 +108,21 @@ verified要求服务端配置包含verify能力，basis必须为用户确认或�
 
 ## 编码、存储与降级
 
-SQLite schema 4 使用 WAL、FTS5 与 sqlite-vec。索引可以从正文重建。BGE 使用固定模型 revision、512 维、FP32、CLS pooling、L2 normalization；query 加中文检索前缀，正文分块最多 384 tokens、重叠约 32 tokens。文件 hash、dtype、前缀和分块协议共同形成 embedding profile。
+SQLite schema 5 使用 WAL、Chunk FTS5 与 sqlite-vec cosine KNN。从 schema4 原地迁移的步骤与回滚见 [按需检索架构](retrieval-architecture.md)。索引可以从正文重建。BGE 使用固定模型 revision、512 维、FP32、CLS pooling、L2 normalization；query 加中文检索前缀，正文分块最多 384 tokens、重叠约 32 tokens。文件 hash、dtype、前缀和分块协议共同形成 embedding profile。
 
 检索融合 RRF（k=60）、关键词和标识符精确匹配。模型失败、profile 不符或向量索引不完整时，读取可返回 `lexical_degraded`；恢复完整向量功能需要修复配置/文件及必要的索引重建。无法生成有效向量时，发布不能假装成功。
 
 新增错误码包括EXACT_IDENTIFIER_REQUIRED、IMPORT_MODE_REQUIRED、LATEST_REVOCATIONS_REQUIRED、RESTORE_METADATA_NOT_ALLOWED、REQUEST_ID_OWNER_MISMATCH、VERIFICATION_EVIDENCE_REQUIRED。
 
 常见错误码：`INVALID_INPUT`、`SCOPE_DENIED`、`PROJECT_UNKNOWN`、`OPERATION_DENIED`、`QUERY_TOO_LONG`、`VERSION_CONFLICT`、`REQUEST_ID_REUSED`、`DEPENDENCY_STALE`、`DEPENDENCY_CYCLE`、`EMBEDDING_UNAVAILABLE`、`INDEX_PROFILE_MISMATCH`、`REVOKED_IMPORT`、`BUSY_RETRYABLE`。维护与恢复见 [operations.md](operations.md)。
+
+
+## 0.3.0 片段与诊断
+
+工具名称和写入生命周期不变。`memory_recall` 可加 `token_budget`（512–10000），只下调配置的 `response_token_budget`（默认6000）。估算单位为紧凑返回 JSON 的 UTF-8 bytes / 3 向上取整；含元数据与诊断，不是模型真实 tokenizer。JSON payload 上限32000 bytes，content总长上限5000个JS字符；不含外层JSON-RPC包裹。预算不足时缩短content或减少条目，保留来源，返回RESPONSE_BUDGET/truncated；候选存在但无法输出时evidence_status=insufficient。
+
+普通查询最多读取每条入选记忆的两个命中Chunk，优先命中位置，重叠/相邻片段合并。新增`excerpts[]`提供每段start/end及chunk_ids，均为原始正文JS字符偏移；非相邻片段由换行省略号连接。原`excerpt`保留为范围包络，精确定位应看excerpts。按ids读取完整正文仍受响应预算约束。
+
+`diagnostics`提供elapsed_ms、candidate_ids、candidates_ranked、full_body_records_read/full_body_bytes_read、json_parses/metadata_json_parses、chunk_text_rows_read、query_embeddings、vector_queries/vector_rows_returned、response_bytes、estimated_tokens。JSON解析数指检索物化层的显式解析，不涵盖模型库初始化；基准另用全局JSON.parse观测作交叉验证。普通查询的完整正文读取应为0。
+
+sqlite-vec内部的向量扫描量、距离计算次数没有公开计数接口，`vector_internal_scanned`和`vector_distance_computations`为null。vector_rows_returned只表示KNN返回Node的候选行，不能解释为内部扫描量。候选通道在同一个SQLite读快照内独立检索，SQL按顺序执行，保持一致性；没有伪称同步SQLite调用在多核上并行。

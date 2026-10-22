@@ -3,6 +3,7 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as sqliteVec from 'sqlite-vec';
 import { MemoryError } from '../core/contracts.js';
+import { migrateSearch } from '../retrieval/indexes.js';
 
 export class Storage {
   db: DatabaseSync;
@@ -14,7 +15,7 @@ export class Storage {
     this.db.enableLoadExtension(false);
     this.db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON;');
     const version=(this.db.prepare('PRAGMA user_version').get() as any).user_version;
-    if (version>4) throw new MemoryError('SCHEMA_TOO_NEW');
+    if (version>5) throw new MemoryError('SCHEMA_TOO_NEW');
     if (version===0) this.transaction(()=>this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,aliases TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
@@ -53,6 +54,10 @@ export class Storage {
       ALTER TABLE events ADD COLUMN connection_id TEXT NOT NULL DEFAULT 'legacy:unknown';
       PRAGMA user_version=4;
     `);});
+    if(version<5)this.transaction(()=>{
+      if((this.db.prepare('PRAGMA user_version').get() as any).user_version>=5)return;
+      migrateSearch(this.db);this.db.exec('PRAGMA user_version=5;');
+    });
   }
   transaction<T>(fn:()=>T):T {
     try {

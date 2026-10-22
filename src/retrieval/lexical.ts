@@ -8,7 +8,13 @@ export function lexicalCoverage(query:string,body:string) {
   return q.length?q.filter(x=>document.has(x)).length/q.length:0;
 }
 export function identifiers(text:string) {
-  return [...new Set((text.match(/(?:\/[\w.\-\u4e00-\u9fff]+){2,}|@[\w-]+\/[\w.-]+|[\w-]+\.[\w.-]+|(?:ERR_|E[A-Z_]{2,})[A-Z_0-9]*|-?\d{4,}|[a-zA-Z][a-zA-Z0-9]*[-_][a-zA-Z0-9_-]+/g)??[]).map(x=>x.toLowerCase()))];
+  const found=text.match(/(?:\.?\.?\/|\/)?(?:[\w.\-\u4e00-\u9fff]+\/)+[\w.\-\u4e00-\u9fff]+|@[\w-]+\/[\w.-]+|[\w-]+\.[\w.-]+|(?:ERR_|E[A-Z_]{2,})[A-Z_0-9]*|-?\d{4,}|[a-zA-Z][a-zA-Z0-9]*[-_][a-zA-Z0-9_-]+|[a-zA-Z_$][\w$]*(?=\s*\()/g)??[];
+  return [...new Set(found.map(x=>x.toLowerCase()))];
+}
+export function identifierWeights(title:string,content:string,tags:string[]) {
+  const weights=new Map<string,number>();
+  for(const [value,weight]of [[content,1],[tags.join(' '),2],[title,3]] as const)for(const id of identifiers(value))weights.set(id,Math.max(weights.get(id)??0,weight));
+  return weights;
 }
 export function ftsQuery(text:string) { return terms(text).slice(0,100).map(x=>'"'+x.replaceAll('"','""')+'"').join(' OR '); }
 export function exactScore(query:string,title:string,content:string,tags:string[]) {

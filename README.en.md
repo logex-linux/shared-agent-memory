@@ -67,3 +67,7 @@ This is a same-host local service, not OS-level isolation between hostile proces
 Source code is MIT-licensed. Dependencies and model artifacts retain their upstream licenses; weights and personal memories are not included. See [third-party notices](THIRD_PARTY_NOTICES.md).
 
 See [scale measurements](docs/scale-benchmark.md) and [0.2.0 repair notes](docs/repairs-0.2.0.md) for regression coverage, restore requirements and permission changes.
+
+## On-demand retrieval (0.3.0)
+
+Schema 5 uses scoped cosine KNN, chunk FTS and indexed identifiers before loading selected metadata and hit excerpts. Ordinary recall reads no full memory bodies. ID expansion remains explicit. `token_budget` can reduce the configured `response_token_budget` (default 6000 estimated tokens, UTF-8 JSON bytes / 3 rounded up); 32,000 payload bytes and 5,000 content characters remain hard caps. Diagnostics distinguish returned vector rows from unobservable internal scans. See the [architecture, migration and A/B report](docs/retrieval-architecture.md).

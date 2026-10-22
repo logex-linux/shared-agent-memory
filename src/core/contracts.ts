@@ -52,7 +52,7 @@ export const recallSchema = z.object({
   query: text(512).optional(), ids: z.array(z.string().uuid()).min(1).max(10).optional(),
   project_id: z.string().uuid().optional(), include_global: z.boolean().optional(),
   context: validSchema.omit({expires_at:true}).default({}), limit: z.number().int().min(1).max(10).default(5),
-  exact_only:z.boolean().default(false)
+  exact_only:z.boolean().default(false),token_budget:z.number().int().min(512).max(10000).optional()
 }).strict().superRefine((r,ctx) => {
   if (Boolean(r.query) === Boolean(r.ids)) ctx.addIssue({code:'custom', message:'exactly one of query or ids required'});
   if(r.exact_only && !r.query)ctx.addIssue({code:'custom',message:'exact_only requires query'});
@@ -64,7 +64,8 @@ export const configSchema = z.object({
   connection_id:text(256).default('local-core'),
   semantic_threshold: z.number().min(0).max(1).default(0.425),
   evidence_threshold: z.number().min(0).max(1).default(0.575),
-  dtype: z.enum(['fp32','q8']).default('fp32'), threads: z.number().int().min(1).max(8).default(2)
+  dtype: z.enum(['fp32','q8']).default('fp32'), threads: z.number().int().min(1).max(8).default(2),
+  response_token_budget:z.number().int().min(512).max(10000).default(6000)
 }).strict();
 export type Config = z.infer<typeof configSchema>;
 export type RecallInput = z.infer<typeof recallSchema>;
