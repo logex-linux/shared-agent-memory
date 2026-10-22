@@ -1,0 +1,37 @@
+{
+  "name": "shared-agent-memory",
+  "version": "0.1.2",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.18.0 <25"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test --test-concurrency=1 tests/*.test.mjs",
+    "start": "node dist/mcp/server.js",
+    "cli": "node dist/cli/main.js",
+    "setup": "node scripts/install-local.mjs",
+    "model:download": "python3 scripts/fetch-model.py"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "3.8.1",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "sqlite-vec": "0.1.9",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "typescript": "5.9.3"
+  },
+  "description": "Local-first shared memory for AI agents with MCP, CLI, semantic retrieval and versioned provenance.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/logex-linux/shared-agent-memory.git"
+  },
+  "homepage": "https://github.com/logex-linux/shared-agent-memory#readme",
+  "bugs": {
+    "url": "https://github.com/logex-linux/shared-agent-memory/issues"
+  }
+}

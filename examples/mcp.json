@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "shared_memory": {
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/shared-agent-memory/dist/mcp/server.js"],
+      "env": {
+        "SHARED_MEMORY_CONFIG": "/absolute/path/to/data/config.json"
+      }
+    }
+  }
+}
