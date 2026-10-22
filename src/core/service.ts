@@ -1,22 +1,25 @@
 import { randomUUID } from 'node:crypto';
-import { readFile, writeFile, mkdir, unlink, realpath } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, unlink, realpath,stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs';
 import { Storage } from '../storage/database.js';
 import { BgeEncoder } from '../embedding/bge.js';
 import { exactScore, ftsQuery, terms, lexicalCoverage, identifiers } from '../retrieval/lexical.js';
 import { MemoryError, applicability, hash, stable, configSchema, proposeSchema, recallSchema, commitSchema, forgetSchema,
-  recordSchema, type Config, type Encoder, type MemoryRecord, type Chunk } from './contracts.js';
+  recordSchema, verificationSchema, type Config, type Encoder, type MemoryRecord, type Chunk } from './contracts.js';
 
-type Row={id:string;project_id:string|null;scope:string;body:string;revision:number;status:string;created_at:string;verified_at:string;profile_id:string;content_hash:string;import_key:string|null};
+type Row={id:string;project_id:string|null;scope:string;body:string;revision:number;status:string;created_at:string;verified_at:string;profile_id:string;content_hash:string;import_key:string|null;written_by:string};
 const now=()=>new Date().toISOString();
 const LEXICAL_RRF_WEIGHT=0.125;
+const IDENTIFIER_BOOST=0.01;
 const blob=(v:Float32Array)=>Buffer.from(v.buffer,v.byteOffset,v.byteLength);
 
 export async function readConfig(path:string):Promise<Config> {
-  return configSchema.parse(JSON.parse(await readFile(path,'utf8')));
+  const raw=JSON.parse(await readFile(path,'utf8'));
+  return configSchema.parse({...raw,connection_id:raw.connection_id??'config:'+hash(await realpath(path)).slice(0,24)});
 }
 export class MemoryService {
+  private revocationsChecked=false;
   storage:Storage;
   encoder:Encoder;
   constructor(public config:Config,encoder?:Encoder,private checkpoint:(point:string)=>void=()=>{}) {
@@ -38,11 +41,12 @@ export class MemoryService {
     const event=this.db.prepare('SELECT * FROM events WHERE request_id=?').get(request_id) as any;
     if(!event)return null;
     this.scope(event.project_id,event.scope);
+    if(event.connection_id!=='legacy:unknown' && event.connection_id!==this.config.connection_id)throw new MemoryError('REQUEST_ID_OWNER_MISMATCH');
     if(event.operation!==operation || event.request_hash!==hash(input)) throw new MemoryError('REQUEST_ID_REUSED');
     return JSON.parse(event.result);
   }
   private receipt(request_id:string,operation:string,input:unknown,project:string|null,scope:string,result:unknown) {
-    this.db.prepare('INSERT INTO events VALUES(?,?,?,?,?,?,?)').run(request_id,operation,hash(input),project,scope,JSON.stringify(result),now());
+    this.db.prepare('INSERT INTO events VALUES(?,?,?,?,?,?,?,?)').run(request_id,operation,hash(input),project,scope,JSON.stringify(result),now(),this.config.connection_id);
   }
   private find(id:string):Row {
     const row=this.db.prepare('SELECT * FROM memories WHERE id=?').get(id) as Row|undefined;
@@ -54,6 +58,7 @@ export class MemoryService {
     this.permission('manage');
     if(!this.config.all_projects && !this.config.allowed_projects.includes(id))throw new MemoryError('SCOPE_DENIED');
     const path=await realpath(alias);
+    if(!(await stat(path)).isDirectory())throw new MemoryError('PROJECT_NOT_DIRECTORY');
     return this.storage.transaction(()=>{
       const projects=this.db.prepare('SELECT * FROM projects').all() as any[];
       if(projects.some(x=>x.id!==id && JSON.parse(x.aliases).includes(path)))throw new MemoryError('ALIAS_CONFLICT');
@@ -64,7 +69,7 @@ export class MemoryService {
     });
   }
   async resolveProject(path:string) {
-    this.permission('manage');
+    this.permission('recall');
     const absolute=await realpath(path);
     const matches=(this.db.prepare('SELECT * FROM projects').all() as any[]).filter(p=>this.config.all_projects || this.config.allowed_projects.includes(p.id)).flatMap(p=>JSON.parse(p.aliases).filter((a:string)=>absolute===a || absolute.startsWith(a+'/')).map((a:string)=>({project_id:p.id,alias:a})));
     matches.sort((a,b)=>b.alias.length-a.alias.length);
@@ -104,6 +109,12 @@ export class MemoryService {
           if(!Object.hasOwn(supplied,key) && previous[key]!==undefined)(record as any)[key]=previous[key];
         }
       }
+      if(record.verification.status==='verified'){
+        this.permission('verify');
+        if(['source_claim','model_inference'].includes(record.verification.basis) || !record.verification.evidence)throw new MemoryError('VERIFICATION_EVIDENCE_REQUIRED');
+      }
+      const {reviewer,reviewed_at,...verification}=record.verification;
+      record.verification=verification.status==='unverified'?verification:{...verification,reviewer:this.config.connection_id,reviewed_at:now()};
       this.dependencies(record,input.target_id);
       const contentHash=hash(record);
       if(this.db.prepare('SELECT id FROM tombstones WHERE content_hash=? OR (? IS NOT NULL AND import_key=?)').get(contentHash,record.import_key??null,record.import_key??null))throw new MemoryError('REVOKED_IMPORT');
@@ -116,7 +127,7 @@ export class MemoryService {
       const words=new Set(terms(record.title+' '+record.content));
       const similar=candidates.map(x=>({memory_id:x.id,revision:x.revision,overlap:terms(JSON.parse(x.body).title+' '+JSON.parse(x.body).content).filter(w=>words.has(w)).length})).filter(x=>x.overlap>=3).sort((a,b)=>b.overlap-a.overlap).slice(0,5);
       const id=randomUUID();
-      this.db.prepare('INSERT INTO proposals VALUES(?,?,?,?,?,?,?,?)').run(id,record.project_id,record.scope,JSON.stringify(record),input.target_id??null,input.expected_revision??0,'pending',now());
+      this.db.prepare('INSERT INTO proposals VALUES(?,?,?,?,?,?,?,?,?)').run(id,record.project_id,record.scope,JSON.stringify(record),input.target_id??null,input.expected_revision??0,'pending',now(),this.config.connection_id);
       if(importTarget)this.db.prepare('INSERT INTO import_targets VALUES(?,?,?)').run(id,importTarget.id,importTarget.revision);
       const result={proposal_id:id,expected_revision:input.expected_revision??0,similar_candidates:similar,missing_fields:[],warning:'Similarity does not establish contradiction or permission to merge.'};
       this.receipt(input.request_id,'propose',fingerprint,record.project_id,record.scope,result);
@@ -156,7 +167,7 @@ export class MemoryService {
     this.scope(proposal.project_id,proposal.scope);
     if(proposal.status!=='pending')throw new MemoryError('PROPOSAL_NOT_PENDING');
     if(proposal.expected_revision!==input.expected_revision)throw new MemoryError('VERSION_CONFLICT');
-    const record:MemoryRecord=JSON.parse(proposal.body); this.sourceCheck(record);this.dependencies(record,proposal.target_id);
+    const record:MemoryRecord=JSON.parse(proposal.body); if(record.verification.status==='verified')this.permission('verify'); this.sourceCheck(record);this.dependencies(record,proposal.target_id);
     let chunks,profile;
     try { profile=await this.encoder.profile(); chunks=await this.encoder.chunks(record.title,record.content); }
     catch(error) { if(error instanceof MemoryError && error.code==='QUERY_TOO_LONG')throw error;throw new MemoryError('EMBEDDING_UNAVAILABLE'); }
@@ -180,7 +191,7 @@ export class MemoryService {
       const revision=old?old.revision+1:imported?.revision??1;
       if(old) {this.invalidate(this.descendants(id),false);this.deleteIndexes(id);}
       this.checkpoint('index_delete');
-      this.db.prepare(`INSERT INTO memories VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body,revision=excluded.revision,status=excluded.status,verified_at=excluded.verified_at,profile_id=excluded.profile_id,content_hash=excluded.content_hash,import_key=excluded.import_key`).run(id,record.project_id,record.scope,JSON.stringify(record),revision,'active',old?.created_at??now(),now(),profile.id,hash(record),record.import_key??null);
+      this.db.prepare(`INSERT INTO memories VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body,revision=excluded.revision,status=excluded.status,verified_at=excluded.verified_at,profile_id=excluded.profile_id,content_hash=excluded.content_hash,import_key=excluded.import_key,written_by=excluded.written_by`).run(id,record.project_id,record.scope,JSON.stringify(record),revision,'active',old?.created_at??now(),now(),profile.id,hash(record),record.import_key??null,this.config.connection_id);
       this.checkpoint('row');
       this.db.prepare('DELETE FROM dependencies WHERE child_id=?').run(id);
       for(const dep of record.derived_from)this.db.prepare('INSERT INTO dependencies VALUES(?,?,?)').run(id,dep.memory_id,dep.revision);
@@ -194,12 +205,13 @@ export class MemoryService {
       this.checkpoint('fts');
       this.db.prepare("UPDATE proposals SET status='committed',body=NULL WHERE id=?").run(proposal.id);
       this.checkpoint('proposal');
-      const result={memory_id:id,revision,generation:this.storage.advance(),embedding_profile_id:profile.id};
+      const result={memory_id:id,revision,generation:this.storage.advance(),embedding_profile_id:profile.id,written_by:this.config.connection_id};
       this.receipt(input.request_id,'commit',input,record.project_id,record.scope,result);this.checkpoint('receipt');return result;
     });
   }
   async recall(raw:unknown,mode:'hybrid'|'lexical'|'vector'='hybrid') {
     this.permission('recall');const input=recallSchema.parse(raw);
+    if(input.exact_only && (!input.query || identifiers(input.query).length===0))throw new MemoryError('EXACT_IDENTIFIER_REQUIRED');
     if(input.project_id)this.scope(input.project_id,'project');
     const includeGlobal=input.include_global??(!input.project_id && this.config.allow_global);
     if(includeGlobal)this.scope(null,'global');
@@ -230,6 +242,8 @@ export class MemoryService {
           const q=ftsQuery(input.query);
           const lexical=q?this.db.prepare(`SELECT memory_id,bm25(memories_fts) AS rank FROM memories_fts WHERE memories_fts MATCH ? AND memory_id IN (SELECT value FROM json_each(?)) ORDER BY rank LIMIT 20`).all(q,allowed) as any[]:[];
           lexical.forEach((r,i)=>{const body:MemoryRecord=JSON.parse(eligible.get(r.memory_id)!.body);const s=score(r.memory_id);s.rrf+=LEXICAL_RRF_WEIGHT/(60+i+1);s.lexical=r.rank;s.reason.push(lexicalCoverage(input.query!,body.title+' '+body.content+' '+body.tags.join(' '))>=0.6?'lexical':'lexical_weak');});
+        }
+        if(mode!=='vector' || input.exact_only || retrievalMode==='lexical_degraded') {
           for(const row of rows) {
             const body:MemoryRecord=JSON.parse(row.body),exact=exactScore(input.query,body.title,body.content,body.tags);
             if(exact){const s=score(row.id);s.exact=exact;s.reason.push('identifier');}
@@ -258,9 +272,9 @@ export class MemoryService {
             }
           }
         }
-        const exactRequested=mode!=='vector' && identifiers(input.query).length>0;
-        rows=rows.filter(r=>{const s=scores.get(r.id);return s && (exactRequested?s.exact>0:(s.reason.includes('semantic') || s.reason.includes('lexical') || s.reason.includes('lexical_weak')));});
-        rows.sort((a,b)=>{const sa=score(a.id),sb=score(b.id);return sb.exact-sa.exact || sb.rrf-sa.rrf || a.id.localeCompare(b.id);});
+        const exactRequested=input.exact_only;
+        rows=rows.filter(r=>{const s=scores.get(r.id);return s && (exactRequested?s.exact>0:(s.exact>0 || s.reason.includes('semantic') || s.reason.includes('lexical') || s.reason.includes('lexical_weak')));});
+        rows.sort((a,b)=>{const sa=score(a.id),sb=score(b.id);return (sb.rrf+Math.min(sb.exact,3)*IDENTIFIER_BOOST)-(sa.rrf+Math.min(sa.exact,3)*IDENTIFIER_BOOST) || a.id.localeCompare(b.id);});
       }
       const index_profiles=[...new Set([...eligible.values()].map(r=>r.profile_id))];
       const result:any={items:[],generation,retrieval_mode:retrievalMode,index_profiles,warnings,empty_reason:null};
@@ -272,7 +286,7 @@ export class MemoryService {
         if(characters+content.length>5000)break;
         const strength=input.ids || (s && (s.exact>0 || s.reason.includes('lexical') || (s.cosine??0)>=this.config.evidence_threshold))?'supported':'weak';
         const item={id:row.id,revision:row.revision,scope:row.scope,project_id:row.project_id,kind:body.kind,title:body.title,content,tags:body.tags,evidence_strength:strength,
-          sources:body.sources,verification:body.verification,verified_at:row.verified_at,valid_for:body.valid_for,
+          sources:body.sources,verification:verificationSchema.parse(body.verification),written_by:row.written_by,record_updated_at:row.verified_at,valid_for:body.valid_for,
           applicability:applicability(body.valid_for,input.context),content_hash:row.content_hash,
           embedding_profile_id:row.profile_id,derived_from:body.derived_from,author_client:body.author_client,author_session:body.author_session,import_key:body.import_key,
           excerpt:{start:input.ids?0:chunk?.start??0,end:input.ids?body.content.length:chunk?.end??body.content.length},
@@ -302,9 +316,10 @@ export class MemoryService {
       const result={memory_id:row.id,forgotten:true,derived_erased:children.length,generation:this.storage.advance(),managed_copies:'pending_check',outside_control:['prior chat/tool context','unmanaged backups','OS snapshots','SSD forensic erasure']};
       this.receipt(input.request_id,'forget',input,row.project_id,row.scope,result);return result;
     });
-    return {...result,maintenance:await this.maintenance()};
+    return {...result,maintenance:await this.maintain()};
   }
-  async maintenance() {
+  async maintenance() {this.permission('manage');return this.maintain();}
+  private async maintain() {
     const errors:string[]=[];
     // Serialize filesystem maintenance with exporters/forgetters; no asynchronous gap.
     this.storage.transaction(()=>{
@@ -335,7 +350,7 @@ export class MemoryService {
     this.permission('manage');
     const projects=(this.db.prepare('SELECT * FROM projects').all() as any[]).filter(p=>this.config.all_projects || this.config.allowed_projects.includes(p.id));
     const counts=this.db.prepare("SELECT scope,project_id,status,count(*) AS count FROM memories GROUP BY scope,project_id,status").all().filter((r:any)=>(r.scope==='global'?this.config.allow_global:this.config.all_projects || this.config.allowed_projects.includes(r.project_id)));
-    return {schema:3,generation:this.storage.generation(),projects,counts};
+    return {schema:4,generation:this.storage.generation(),projects,counts};
   }
   check() {
     this.permission('manage');
@@ -387,13 +402,15 @@ export class MemoryService {
     });
   }
   previewImport(entry:any) {
-    this.permission('manage');const record=recordSchema.parse(entry.record??entry);
+    this.permission('manage');const original=entry.record??entry,parsed=recordSchema.parse(original);
+    const {reviewer,reviewed_at,...verification}=parsed.verification;
+    const record={...parsed,verification:{...verification,status:'unverified' as const,basis:'source_claim' as const}};
     this.scope(record.project_id,record.scope);this.sourceCheck(record);
     const import_key=record.import_key??'source:'+hash(record.sources.map(s=>({uri:s.uri,locator:s.locator})));
     const normalized={...record,import_key};
     const existing=this.db.prepare('SELECT * FROM memories WHERE import_key=? OR id=?').get(import_key,entry.id??'') as Row|undefined;
     if(existing)this.scope(existing.project_id,existing.scope);
-    const revoked=this.db.prepare('SELECT id FROM tombstones WHERE import_key=? OR id=? OR content_hash=?').get(import_key,entry.id??'',hash(normalized));
+    const revoked=this.db.prepare('SELECT id FROM tombstones WHERE import_key=? OR id=? OR content_hash IN (?,?,?,?)').get(import_key,entry.id??'',hash(original),hash(parsed),hash(normalized),entry.content_hash??'');
     let action=revoked?'blocked_revoked':existing?(existing.content_hash===hash(normalized)?'unchanged':'update'):'create';
     if(existing && (existing.project_id!==record.project_id || existing.scope!==record.scope))action='blocked_scope';
     if(existing && entry.revision && existing.revision!==entry.revision && action!=='unchanged')action='blocked_revision';
@@ -401,6 +418,7 @@ export class MemoryService {
   }
   async importEntry(entry:any) {
     const preview=this.previewImport(entry);
+    if(!this.revocationsChecked)throw new MemoryError('LATEST_REVOCATIONS_REQUIRED');
     if(preview.action.startsWith('blocked'))throw new MemoryError('IMPORT_'+preview.action.toUpperCase());
     if(preview.action==='unchanged')return {memory_id:preview.existing_id,revision:preview.existing_revision,unchanged:true};
     let imported;
@@ -412,8 +430,8 @@ export class MemoryService {
     return this.commit({request_id:randomUUID(),proposal_id:p.proposal_id,expected_revision:p.expected_revision});
   }
   async applyRevocations(entries:any[]) {
-    this.permission('manage');
-    return this.storage.transaction(()=>{
+    this.permission('manage');this.revocationsChecked=false;
+    const result=this.storage.transaction(()=>{
       for(const t of entries) {
         this.scope(t.project_id,t.scope);
         if(typeof t.id!=='string' || !Number.isSafeInteger(t.revision) || typeof t.content_hash!=='string' || !/^[a-f0-9]{64}$/.test(t.content_hash))throw new MemoryError('REVOCATION_INVALID');
@@ -428,5 +446,8 @@ export class MemoryService {
       this.db.prepare("INSERT OR REPLACE INTO meta VALUES('revocations_pending',1)").run();
       return {revocations_applied:entries.length,generation:this.storage.advance()};
     });
+    const maintenance=await this.maintain();
+    if(!maintenance.revocations_synced)throw new MemoryError('REVOCATIONS_UNSYNCED_RESTORE_FORBIDDEN');
+    this.revocationsChecked=true;return result;
   }
 }

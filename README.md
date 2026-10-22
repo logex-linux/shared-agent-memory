@@ -40,7 +40,7 @@ nvm use
 npm ci
 npm run build
 npm run model:download
-npm run setup -- --project "$PWD"
+npm run setup -- --project /absolute/path/to/your-work-project
 ```
 
 `nvm` 是选择固定 Node 版本的一个方式；已有相同版本时可直接使用。模型下载是显式安装步骤，固定上游 revision 并核对 SHA-256；服务运行时不下载模型。
@@ -53,11 +53,13 @@ npm run setup -- --project "$PWD"
 npm run setup -- --root "$HOME/.local/share/my-agent-memory" --project /absolute/path/to/project
 ```
 
-安装结果会输出项目 UUID 和配置绝对路径。新安装的库为空，不含个人记忆、聊天记录或预置的用户偏好。
+安装必须显式指定真实工作项目，服务代码目录与工作项目目录分别记录，不默认把服务仓库注册成你的项目。安装结果会输出项目 UUID 和配置绝对路径。新安装的库为空，不含个人记忆、聊天记录或预置的用户偏好。
 
 ## 接入 MCP
 
-安装器会在数据目录的 `client-configs/` 生成配置模板；使用其中已填好的 Node、server 和 config 绝对路径，按客户端格式接入。通用定义如下，也可参考 [示例配置](examples/mcp.json)：
+安装器生成三套连接配置：`config.json` 默认只读（可全库搜索）、`project.config.json` 仅目标项目读写、`admin.config.json` 全局管理及核验。对应的[只读](examples/configs/read-only.json)、[项目读写](examples/configs/project-rw.json)、[管理员](examples/configs/admin.json)示例可供检查。默认只给日常 Agent 只读配置；写配置由操作者显式选择，服务端按操作与项目范围拒绝越权。
+
+在 `client-configs/read-only/`、`client-configs/project-rw/`、`client-configs/admin/` 生成对应客户端模板；使用其中已填好的 Node、server 和 config 绝对路径，按客户端格式接入。通用定义如下，也可参考 [示例配置](examples/mcp.json)：
 
 ```json
 {
@@ -85,7 +87,7 @@ Agent 调用 `memory_recall`，只需描述当前任务需要的经验：
 
 默认公共配置启用 `all_projects: true` 和 `allow_global: true`：不传 `project_id` 时跨项目搜索，也包含 global 记忆。需要聚焦某个项目时，可选传 `project_id`；这时默认不包含 global，可用 `include_global: true` 加入。
 
-返回相关片段、ID、revision、所属项目、来源与适用条件。选中后，用同一工具的 `ids` 参数读取完整正文：
+返回相关片段、ID、revision、所属项目、来源与适用条件。查询含代码标识符时，精确命中只提供有限排序加权，不会排除语义相关记录；严格标识符筛选需要显式设置 `exact_only: true`。选中后，用同一工具的 `ids` 参数读取完整正文：
 
 ```json
 {"ids":["11111111-1111-4111-8111-111111111111"]}
@@ -93,18 +95,18 @@ Agent 调用 `memory_recall`，只需描述当前任务需要的经验：
 
 上面的 ID 只是格式示例，应替换为真实检索结果。默认最多返回 5 条，`limit` 最多 10 条，正文合计最多 5000 字符，响应最多 32000 bytes。空结果和 `insufficient` 是正常结果，不能据此编造历史。
 
-## 四个工具
+## 工具与权限
 
 | 工具 | 用途 |
 |---|---|
-| `memory_recall` | 自然语言/标识符检索，或按 ID 展开记录 |
+| `memory_recall`（默认只读连接唯一工具） | 自然语言/标识符检索，或按 ID 展开记录 |
 | `memory_propose` | 持久化候选，尚不可被正常检索 |
 | `memory_commit` | 原子发布候选、向量和关键词索引 |
 | `memory_forget` | 遗忘记录及依赖，返回受管理副本清理结果 |
 
 新增：`propose → commit`，首次 `expected_revision` 为 `0`。编辑：先读取，propose 时传 `target_id` 与当前 `expected_revision`，再 commit。遗忘也需要当前版本。每次逻辑写请求使用新的 UUID；同一请求重试复用原 UUID，避免重复写入。
 
-写入记录必须有来源和核验说明，并保留项目归属或 global 标记。仅在用户明确要求记住、更新、忘记，或已有相应授权时写入。完整参数见 [协议与示例](docs/protocol.md)。
+写入记录必须有来源和核验说明，并保留项目归属或 global 标记。核验状态独立于相关性，默认为 `unverified`；`disputed` 表示存在争议，`verified` 必须由拥有 verify 能力的配置提供依据并留存真实核验身份。来源字段齐全、模型自称核验或向量相似度高都不会自动提升状态。仅在用户明确要求记住、更新、忘记，或已有相应授权时写入。完整参数见 [协议与示例](docs/protocol.md)。
 
 ## CLI
 
@@ -112,9 +114,10 @@ CLI 与 MCP 使用同一业务核心和数据库。在仓库目录执行：
 
 ```sh
 export SHARED_MEMORY_CONFIG="$HOME/.local/share/shared-agent-memory/config.json"
-npm run cli -- inspect
-npm run cli -- check
 npm run cli -- recall --input examples/recall.json
+# 管理操作使用显式管理员配置
+npm run cli -- inspect --config "$HOME/.local/share/shared-agent-memory/admin.config.json"
+npm run cli -- check --config "$HOME/.local/share/shared-agent-memory/admin.config.json"
 ```
 
 `propose`、`commit`、`forget` 同样通过 `--input /absolute/path/to/arguments.json` 读取参数，结构与 MCP 一致。新项目注册、备份、迁移与停用见 [维护文档](docs/operations.md)。
@@ -127,9 +130,13 @@ npm run cli -- recall --input examples/recall.json
 npm test
 ```
 
-测试使用合成记录和临时数据库，覆盖语义检索、可选项目筛选、官方 MCP SDK STDIO 调用、更新与幂等、遗忘、四进程 400 次发布、版本竞争和 10 个 SIGKILL 恢复点。生成的报告在 `test-results/`，不提交到仓库。当前 18 项测试在 macOS 通过；GitHub Actions 在 Linux 执行同一套检查。
+测试使用合成记录和临时数据库，覆盖语义检索、可选项目筛选、官方 MCP SDK STDIO 调用、更新与幂等、遗忘、四进程 400 次发布、版本竞争和 10 个 SIGKILL 恢复点。生成的报告在 `test-results/`，不提交到仓库。新增回归覆盖标识符与语义并存、恢复数组撤销、只读拒写、服务端写入身份、核验状态及工作项目映射；GitHub Actions 在 Linux 执行同一套检查。
+
+100 / 1,000 / 10,000 条真实向量的 p50/p95、RSS 与 Recall@5 实测及检索方案决策见[规模测试](docs/scale-benchmark.md)。
 
 ## 使用边界
+
+权限来自操作者配置，不是对自然语言“用户授权”的自动识别。持有写连接的 Agent 具有相应能力，逐次人工审批仍由 harness 管理。`author_client` 是自报来源；`written_by`、事件 connection_id 和核验 reviewer 来自服务端连接配置。
 
 本项目是同机本地服务；不提供远程 HTTP 服务或操作系统级租户隔离。本地 embedding 不代表 Agent 模型调用离线：检索出的片段会进入所连接客户端的上下文。记忆正文是证据，不能把夹带指令当作工具授权。
 

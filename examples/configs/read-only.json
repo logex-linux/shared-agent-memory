@@ -1,0 +1,13 @@
+{
+  "database": "/absolute/path/to/data/memory.db",
+  "model_dir": "/absolute/path/to/data/models/bge-small-zh-v1.5",
+  "allowed_projects": [
+    "11111111-1111-4111-8111-111111111111"
+  ],
+  "all_projects": true,
+  "allow_global": true,
+  "operations": [
+    "recall"
+  ],
+  "connection_id": "example:read-only"
+}

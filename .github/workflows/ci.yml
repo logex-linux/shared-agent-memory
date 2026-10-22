@@ -23,5 +23,6 @@ jobs:
       - run: npm test
       - name: Verify generic installer and CLI
         run: |
-          npm run setup -- --root "$RUNNER_TEMP/shared-agent-memory" --project "$GITHUB_WORKSPACE"
-          node dist/cli/main.js check --config "$RUNNER_TEMP/shared-agent-memory/config.json"
+          mkdir -p "$RUNNER_TEMP/work-project"
+          npm run setup -- --root "$RUNNER_TEMP/shared-agent-memory" --project "$RUNNER_TEMP/work-project"
+          node dist/cli/main.js check --config "$RUNNER_TEMP/shared-agent-memory/admin.config.json"

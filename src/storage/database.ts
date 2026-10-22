@@ -14,7 +14,7 @@ export class Storage {
     this.db.enableLoadExtension(false);
     this.db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON;');
     const version=(this.db.prepare('PRAGMA user_version').get() as any).user_version;
-    if (version>3) throw new MemoryError('SCHEMA_TOO_NEW');
+    if (version>4) throw new MemoryError('SCHEMA_TOO_NEW');
     if (version===0) this.transaction(()=>this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,aliases TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
@@ -45,6 +45,14 @@ export class Storage {
     `));
     if(version<2)this.transaction(()=>this.db.exec('CREATE TABLE IF NOT EXISTS import_targets(proposal_id TEXT PRIMARY KEY,memory_id TEXT NOT NULL,revision INTEGER NOT NULL); PRAGMA user_version=2;'));
     if(version<3)this.transaction(()=>this.db.exec("INSERT INTO memories_fts(memories_fts,rank) VALUES('secure-delete',1); PRAGMA user_version=3;"));
+    if(version<4)this.transaction(()=>{
+      if((this.db.prepare('PRAGMA user_version').get() as any).user_version>=4)return;
+      this.db.exec(`
+      ALTER TABLE memories ADD COLUMN written_by TEXT NOT NULL DEFAULT 'legacy:unknown';
+      ALTER TABLE proposals ADD COLUMN connection_id TEXT NOT NULL DEFAULT 'legacy:unknown';
+      ALTER TABLE events ADD COLUMN connection_id TEXT NOT NULL DEFAULT 'legacy:unknown';
+      PRAGMA user_version=4;
+    `);});
   }
   transaction<T>(fn:()=>T):T {
     try {

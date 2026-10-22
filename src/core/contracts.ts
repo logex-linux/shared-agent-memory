@@ -20,12 +20,18 @@ export const validSchema = z.object({
   branch: text(256).optional(), commit: text(128).optional(), environment: text(256).optional(),
   expires_at: z.string().datetime().optional()
 }).strict();
+export const verificationSchema = z.object({
+  method:text(300),summary:text(1000),
+  status:z.enum(['unverified','verified','disputed']).default('unverified'),
+  basis:z.enum(['source_claim','model_inference','user_confirmation','code_review','document_review']).default('source_claim'),
+  evidence:text(2000).optional(),reviewer:text(256).optional(),reviewed_at:z.string().datetime().optional()
+}).strict();
 export const recordSchema = z.object({
   project_id: z.string().uuid().nullable(), scope: z.enum(['project', 'global']),
   kind: z.enum(['preference', 'fact', 'decision', 'procedure', 'lesson']),
   title: text(180), content: text(4000), tags: z.array(text(80)).max(20).default([]),
   sources: z.array(sourceSchema).min(1).max(12),
-  verification: z.object({ method: text(300), summary: text(1000) }).strict(),
+  verification: verificationSchema,
   valid_for: validSchema.default({}),
   author_client: text(80), author_session: text(256),
   derived_from: z.array(z.object({ memory_id: z.string().uuid(), revision: z.number().int().positive() }).strict()).max(20).default([]),
@@ -45,14 +51,17 @@ export const forgetSchema = z.object({ request_id: request, memory_id: z.string(
 export const recallSchema = z.object({
   query: text(512).optional(), ids: z.array(z.string().uuid()).min(1).max(10).optional(),
   project_id: z.string().uuid().optional(), include_global: z.boolean().optional(),
-  context: validSchema.omit({expires_at:true}).default({}), limit: z.number().int().min(1).max(10).default(5)
+  context: validSchema.omit({expires_at:true}).default({}), limit: z.number().int().min(1).max(10).default(5),
+  exact_only:z.boolean().default(false)
 }).strict().superRefine((r,ctx) => {
   if (Boolean(r.query) === Boolean(r.ids)) ctx.addIssue({code:'custom', message:'exactly one of query or ids required'});
+  if(r.exact_only && !r.query)ctx.addIssue({code:'custom',message:'exact_only requires query'});
 });
 export const configSchema = z.object({
   database: z.string().startsWith('/'), model_dir: z.string().startsWith('/'),
   allowed_projects: z.array(z.string().uuid()).min(1), all_projects: z.boolean().default(false), allow_global: z.boolean().default(false),
-  operations: z.array(z.enum(['recall','propose','commit','forget','manage'])).min(1),
+  operations: z.array(z.enum(['recall','propose','commit','forget','manage','verify'])).min(1).default(['recall']),
+  connection_id:text(256).default('local-core'),
   semantic_threshold: z.number().min(0).max(1).default(0.425),
   evidence_threshold: z.number().min(0).max(1).default(0.575),
   dtype: z.enum(['fp32','q8']).default('fp32'), threads: z.number().int().min(1).max(8).default(2)

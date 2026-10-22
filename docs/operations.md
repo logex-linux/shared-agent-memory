@@ -3,7 +3,7 @@
 以下命令在仓库目录运行，使用安装器默认数据目录。也可为每条命令显式传 `--config /absolute/path/config.json`。
 
 ```sh
-export SHARED_MEMORY_CONFIG="$HOME/.local/share/shared-agent-memory/config.json"
+export SHARED_MEMORY_CONFIG="$HOME/.local/share/shared-agent-memory/admin.config.json"
 npm run cli -- inspect
 npm run cli -- check
 ```
@@ -12,7 +12,7 @@ check 要求 `integrity_check` 为 `ok`，`orphan_chunks`、`orphan_vectors`、`
 
 ## 注册项目
 
-写入项目记录前需注册 UUID 与真实目录别名。同一个项目的多个 worktree 可共用一个 UUID；不根据目录名称猜测身份。公共安装的 `all_projects: true` 让新注册项目自动参与跨项目检索。
+写入项目记录前需注册 UUID 与真实目录别名。同一个项目的多个 worktree 可共用一个 UUID；不根据目录名称猜测身份。默认只读与管理员配置的 `all_projects: true` 让新注册项目自动参与跨项目检索。
 
 ```sh
 PROJECT_ID=$(node -p 'crypto.randomUUID()')
@@ -39,10 +39,10 @@ npm run cli -- check
 ```sh
 npm run cli -- export --project "$PROJECT_ID"
 npm run cli -- import --input /absolute/path/export.json
-npm run cli -- import --input /absolute/path/export.json --revocations /absolute/path/latest-revocations.jsonl --commit
+npm run cli -- import --mode restore --input /absolute/path/export.json --revocations /absolute/path/latest-revocations.jsonl --commit
 ```
 
-import 默认只预览。导出对象重导保留 ID/revision，并要求最新的外部撤销清单，先应用撤销再导入。不能把旧导出自带清单当成最新清单，也不能在有版本冲突时强行覆盖。重复导入保持幂等，已撤销记录不得因旧导出复活。
+import 默认只预览。提交必须显式选择 `--mode new`（新的外部原始记录数组，不允许导出身份字段）或 `--mode restore`（恢复导出，可为对象、导出数组或记录正文数组）。为避免改输入结构绕过校验，所有 `--commit` 均须提供外部 `--revocations` 最新清单，连原始正文数组也不例外。全新且没有撤销历史的资料库可显式提供空清单；系统不能凭文件名证明清单最新，操作者必须取得真实最新版本。导出对象重导保留 ID/revision，并要求最新的外部撤销清单，先应用撤销再导入。不能把旧导出自带清单当成最新清单，也不能在有版本冲突时强行覆盖。重复导入保持幂等，已撤销记录不得因旧导出复活。
 
 `sources[].source_hash` 是来源文件 hash；导入预览中的 source_hash 是整个来源描述集合的摘要，二者含义不同。
 
@@ -55,3 +55,11 @@ import 默认只预览。导出对象重导保留 ID/revision，并要求最新�
 从客户端配置移除新增的服务器条目或扩展参数，关闭相应 STDIO 子进程。保留数据目录即可在以后重新连接。安装器没有修改客户端原生记忆。
 
 程序和依赖可重新构建；数据库、模型、撤销清单和配置属于用户数据。删除代码不会自动撤回聊天上下文、非托管导出或系统快照。
+
+## 为实际项目生成 Codex 配置
+
+```sh
+node scripts/client-configs.mjs --config "$HOME/.local/share/shared-agent-memory/config.json" --project-id "$PROJECT_ID" --project /absolute/path/to/project --output .local/client-configs/my-project
+```
+
+生成器校验UUID已注册且当前连接可访问、路径存在且是目录、最长别名映射匹配。失效别名、错误UUID和路径映射冲突会失败，不再使用allowed_projects的第一项猜测身份。安装器自动用实际工作目录及返回UUID生成三种角色的Codex配置。

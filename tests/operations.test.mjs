@@ -21,6 +21,7 @@ test('export/import preserves ID/revision; repeat import is idempotent; revocati
     const initial=await publish(a,r);const updated=await publish(a,{...r,content:'新版内容。'},{target_id:initial.memory_id,expected_revision:1});
     const e=await a.export(first.project);const data=JSON.parse(await readFile(e.path,'utf8'));
     b.config.allowed_projects.push(first.project);await b.project(first.project,'imported',first.root);
+    await b.applyRevocations([]);
     const imported=await b.importEntry(data.memories[0]);assert.equal(imported.memory_id,initial.memory_id);assert.equal(imported.revision,2);
     assert.equal((await b.importEntry(data.memories[0])).unchanged,true);
     assert.equal(b.db.prepare('SELECT count(*) n FROM memories').get().n,1);

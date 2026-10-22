@@ -16,6 +16,8 @@ try {
       if(retry.memory_id!==r.memory_id)throw new Error('non-idempotent');results.push(r.memory_id);
     }
     console.log(JSON.stringify({ids:results,rss:process.memoryUsage().rss}));
+  } else if(operation==='inspect') {
+    console.log(JSON.stringify(service.inspect()));
   } else {
     const request=JSON.parse(await readFile(arg.endsWith('.json')?arg:configFile+'.request','utf8'));
     console.log(JSON.stringify(await service.commit(request)));
