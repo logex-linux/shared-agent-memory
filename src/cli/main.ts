@@ -28,6 +28,8 @@ async function main() {
   const service=new MemoryService(await readConfig(resolve(configPath)));
   try {
     switch(command) {
+      case 'cache-inspect':return service.cache();
+      case 'cache-maintenance':return service.cache(true);
       case 'inspect':return await service.inspect();
       case 'check':return await service.check();
       case 'maintenance':return await service.maintenance();
@@ -67,7 +69,7 @@ async function main() {
         }
         return {dry_run:!args.includes('--commit'),entries};
       }
-      default:throw new Error('Commands: init project resolve-project inspect recall propose commit forget discard-proposal import export reindex check maintenance');
+      default:throw new Error('Commands: cache-inspect cache-maintenance init project resolve-project inspect recall propose commit forget discard-proposal import export reindex check maintenance');
     }
   } finally {service.close();}
 }

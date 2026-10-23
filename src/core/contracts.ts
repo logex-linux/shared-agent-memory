@@ -73,6 +73,10 @@ export const configSchema = z.object({
   page_candidate_budget:z.number().int().min(32).max(10000).default(512),
   page_time_budget_ms:z.number().int().min(10).max(60000).default(2000),
   query_ttl_seconds:z.number().int().min(1).max(86400).default(1800),
+  cache_max_bytes:z.number().int().min(65536).max(1073741824).default(67108864),
+  cache_query_max_bytes:z.number().int().min(16384).max(1073741824).default(8388608),
+  cache_disk_max_bytes:z.number().int().min(1048576).max(4294967296).default(134217728),
+  cache_cleanup_rows:z.number().int().min(1).max(4096).default(256),
   diagnostics:z.boolean().default(false)
 }).strict();
 export type Config = z.infer<typeof configSchema>;

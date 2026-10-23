@@ -26,7 +26,7 @@ flowchart LR
     P -->|选中 ID 后展开| M
 ```
 
-普通查询先在授权范围内做 cosine KNN、Chunk FTS 和标识符索引检索，排序后只加载入选记录的元数据与最多两个命中片段；不会在 Node 中读取或解析全库正文。相邻命中片段合并，按 ID 才展开完整正文。
+普通查询先在授权范围内做 cosine KNN、Chunk FTS 和标识符索引检索，Focused 在候选预算内读取少量命中 Chunk 进行原文重排，最终只返回入选记录的元数据与命中片段；不会在 Node 中读取或解析全库正文。相邻命中片段合并，按 ID 才展开完整正文。
 
 这是检索式的按需注意：不把整个记忆库放入每次对话。向量相似度表示相关性，是否足以支持结论仍由 Agent 结合来源判断。
 
@@ -187,3 +187,21 @@ npm test
 `src/` 是业务核心、存储、编码、检索、MCP 与 CLI；`tests/` 是合成集成测试；`scripts/` 提供模型安装和配置生成；`docs/` 是协议和维护说明。
 
 代码采用 [MIT](LICENSE)。依赖和模型各自遵循上游许可，模型权重不随仓库分发，见 [第三方来源](THIRD_PARTY_NOTICES.md)。
+
+## v0.4.1 检索质量与缓存维护 / Retrieval quality and cache maintenance
+
+Focused 会结合命中 Chunk 的原文、查询意图和检索信号重排，区分已执行的原文主张、建议、否决与未知状态。`answer_relevance` 是局部原文的启发式分析，不代表事实核验；`verification` 和来源仍应单独检查。Broad 的跨项目覆盖和持续分页保持不变。
+
+`view=evidence` 优先返回实际标识符或关键词附近的原文窗口，保留 ID、Revision、Chunk、偏移与来源。纯语义命中无法定位时会标记 `snippet_selection=chunk_fallback`；需要更多上下文时按 ID 展开。
+
+查询缓存默认有 64 MiB 逻辑总预算、8 MiB 单查询预算、128 MiB 数据库分配预算，每次最多清理256行过期状态。它们保护驻留资源，不是累计召回条数上限。`QUERY_CACHE_CAPACITY` / `QUERY_CACHE_DISK_CAPACITY` 表示容量不足，不能视为证据已检索完毕。由操作者清理过期缓存或调整预算后重新检索；同样大小的单查询预算不足时，简单重试不会解决问题。
+
+```sh
+# 仅已有 manage 权限的操作者使用；普通 MCP 不返回缓存诊断
+node dist/cli/main.js cache-inspect --config /absolute/path/admin.config.json
+node dist/cli/main.js cache-maintenance --config /absolute/path/admin.config.json
+```
+
+Focused reranks bounded hit chunks using query intent and local evidence. State labels describe local claims, never proof of execution or truth. Evidence windows preserve original offsets and provenance; purely semantic hits may explicitly fall back to a chunk excerpt. Broad coverage and unlimited cumulative pagination remain available. Cache quotas protect resident resources; capacity errors are not exhaustion. Cache inspection and maintenance require the existing `manage` permission.
+
+详见 [实现、配置、升级回滚与边界 / implementation and operations](docs/quality-v041.md)、[质量和性能结果 / results](docs/quality-v041-results.md)。未修改用户真实记忆或客户端配置。

@@ -109,3 +109,16 @@ Schema 5 keeps scoped cosine KNN, chunk FTS and indexed identifiers before mater
 Cursors bind query, scope, ranking and database generation; mutations or changed permissions require a new query. A disposable SQLite sidecar stores query progress and IDs/scores, not memory bodies. Canonical Schema 5 needs no migration and can still be opened by 0.3. Evidence sufficiency is a disclosed heuristic, never proof. Never infer a permanent preference from one project or persist a new profile without authorization.
 
 See [architecture, paging and rollback](docs/adaptive-retrieval.md), [quality/performance results](docs/adaptive-results.md), and the [auditable fictional 120-query protocol](bench/adaptive/README.md). The earlier [0.3 report](docs/retrieval-architecture.md) remains as historical evidence.
+
+## v0.4.1 quality and cache operations
+
+Focused adds bounded hit-chunk reranking by informative query coverage and local answer intent. `answer_relevance` describes explicit local claims, not factual verification; model inference remains unknown. Broad discovery and cumulative paging are preserved. Evidence windows now locate identifiers or locally matching sentences, preserving exact original offsets and sources. Pure semantic hits without a reliable local match use `snippet_selection=chunk_fallback`.
+
+Optional cache configuration: `cache_max_bytes` (64 MiB logical total), `cache_query_max_bytes` (8 MiB per query), `cache_disk_max_bytes` (128 MiB allocated database) and `cache_cleanup_rows` (256 expired rows per pass). Capacity failures are explicit resource errors, never exhaustion of relevant evidence. WAL can transiently exceed the configured disk target; freed SQLite pages are reused rather than automatically shrinking files. Inspection/maintenance requires existing `manage` permission:
+
+```sh
+node dist/cli/main.js cache-inspect --config /absolute/path/admin.config.json
+node dist/cli/main.js cache-maintenance --config /absolute/path/admin.config.json
+```
+
+See [implementation, backup and rollback](docs/quality-v041.md) and [measured results](docs/quality-v041-results.md). Canonical Schema 5 and existing memory IDs/revisions are unchanged. Existing cursors must restart after the ranking-version update. No live memory library or client configuration was changed during development.

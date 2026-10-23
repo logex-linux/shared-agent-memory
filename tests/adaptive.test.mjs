@@ -32,7 +32,7 @@ test('pagination is resumable, deterministic and query/authority bound across re
 
 test('project/global filters apply throughout many pages; concurrent readers do not borrow another query scope',async()=>{
  const {service:s,project,other,config,root}=await setup();s.encoder=fake;const gold=seed(s,[project],58);seed(s,[other,null],80);s.close();const path=root+'/narrow.json';await writeFile(path,JSON.stringify({...config,allowed_projects:[project],allow_global:false}));
- const results=await Promise.all([0,1,2,3].map(()=>worker(path,'collect',{query:'设计偏好',mode:'broad',limit:7})));for(const r of results){assert.equal(r.code,0,r.err);assert.deepEqual(new Set(r.result.ids),new Set(gold));}
+ const results=await Promise.all([0,1,2,3].map(()=>worker(path,'collect',{query:'设计偏好',mode:'broad',limit:7})));for(const r of results){assert.equal(r.code,0,JSON.stringify(r));assert.deepEqual(new Set(r.result.ids),new Set(gold));}
 });
 
 test('new, revised and forgotten records invalidate cursors; concurrent writers cannot expose old revisions',async()=>{

@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs';
 import { Storage } from '../storage/database.js';
 import { indexChunk } from '../retrieval/indexes.js';
+import { QueryState } from '../retrieval/state.js';
 import { retrieve } from '../retrieval/recall.js';
 import { BgeEncoder } from '../embedding/bge.js';
 import { ftsQuery, terms, identifiers } from '../retrieval/lexical.js';
@@ -25,7 +26,7 @@ export class MemoryService {
   constructor(public config:Config,encoder?:Encoder,private checkpoint:(point:string)=>void=()=>{}) {
     this.config=configSchema.parse(config);
     this.storage=new Storage(config.database);
-    this.encoder=encoder??new BgeEncoder(config);
+    this.encoder=encoder??new BgeEncoder(this.config);
   }
   get db(){return this.storage.db;}
   close(){this.storage.close();}
@@ -234,7 +235,12 @@ export class MemoryService {
     });
     return {...result,maintenance:await this.maintain()};
   }
-  async maintenance() {this.permission('manage');return this.maintain();}
+  cache(maintenance=false) {
+    this.permission('manage');
+    const cache=new QueryState(this.db,this.config);
+    try{if(maintenance){cache.begin();try{cache.cleanup();cache.commit();}catch(e){cache.rollback();throw e;}cache.checkpoint();}return cache.inspect();}finally{cache.close();}
+  }
+  async maintenance() {this.permission('manage');return {...await this.maintain(),query_cache:this.cache(true)};}
   private async maintain() {
     const errors:string[]=[];
     // Serialize filesystem maintenance with exporters/forgetters; no asynchronous gap.
@@ -266,7 +272,7 @@ export class MemoryService {
     this.permission('manage');
     const projects=(this.db.prepare('SELECT * FROM projects').all() as any[]).filter(p=>this.config.all_projects || this.config.allowed_projects.includes(p.id));
     const counts=this.db.prepare("SELECT scope,project_id,status,count(*) AS count FROM memories GROUP BY scope,project_id,status").all().filter((r:any)=>(r.scope==='global'?this.config.allow_global:this.config.all_projects || this.config.allowed_projects.includes(r.project_id)));
-    return {schema:5,generation:this.storage.generation(),projects,counts};
+    return {query_cache:this.cache(),schema:5,generation:this.storage.generation(),projects,counts};
   }
   check() {
     this.permission('manage');
