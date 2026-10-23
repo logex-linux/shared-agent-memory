@@ -1,0 +1,23 @@
+# v0.4.2 profiling and decisions
+
+Baseline: ff210f0 (v0.4.1). Original compiled code is frozen under ignored `.local/v042/original/dist`; a second frozen copy adds the same opt-in stage and lock timers as the candidate implementation. Original 120-query / 240-record and specialist 60-query / 126-record scenarios and labels are unchanged. No real memory is used for performance tuning.
+
+Three initial real-BGE four-process rounds identified:
+
+1. Sidecar writer serialization: stable Focused rounds average approximately 16ms waiting versus 8–9ms holding; KNN itself averages 0.8ms. Every request opens/initializes a sidecar, takes a cleanup writer transaction even without expired rows, then holds another writer transaction throughout retrieval. First-round tails are materially noisier.
+2. Repeated local work: main/state SQL is recompiled repeatedly; the same hit chunks are read for ranking and again for final evidence, and evidence windows are selected twice. Query term segmentation and some metadata extraction also repeat per candidate.
+3. Startup allocation: manifest verification reads both ~90MiB fp32 and ~23MiB q8 files into buffers. A profile-only probe rises from ~6MiB to ~119MiB external memory before inference; this is not proof of duplicate model initialization or a leak.
+
+Accepted low-complexity candidates: per-canonical-connection sidecar reuse with explicit disposal; bounded 96-entry prepared-statement caches; skip cleanup writer when the indexed expiry probe is empty; per-request hit-chunk reuse; reuse already-read scalar metadata/query terms/window selection; serialize each budget probe once; stream SHA-256 verification while preserving every manifest check and identical embedding profile.
+
+Not adopted: per-query leases/CAS, an optimistic page commit protocol, or releasing the existing transaction around computation. The page writer still serializes deterministic state transitions, and all provisional rows/pages remain one atomic transaction. Shortening actual work and eliminating no-op transactions is substantially smaller than a new concurrency protocol. Dynamic candidate truncation is also not adopted: coverage/admission and unknown-state fallbacks depend on local content, and a safe bound would need disproportionate complexity. All existing ranking candidates remain eligible for the same analysis; only redundant work is removed.
+
+Gates: exact ordered-ID comparison across both frozen quality sets, unchanged evidence inclusion/adoption ordering/absence decisions, all regression tests, paired real-model rounds, 1-vs-2-thread trials, 100/1,000/10,000 scale tests and cumulative 1,000/5,000/10,000-query checkpoints. Use the same queries, page budgets, fp32 model and scopes in each A/B. Record noise rather than selecting the fastest round.
+
+The profiler is debug-only; ordinary response shape stays compact. Model and runtime telemetry hooks are benchmark-only and never installed in the MCP launch definition. Detailed traces, temporary DBs and generated JSON reports stay ignored. The final report publishes measured aggregates and caveats, not raw user data.
+
+## Measurement caveats
+
+The ordinary protocol remains unchanged. Opt-in `debug` diagnostics add exclusive SQL/ranking/materialization stages, main sidecar BEGIN wait, cleanup time and separate lock-held totals. `total` is server work through commit; MCP request latency includes transport/driver processing. SQL prepare/metadata validation, candidate sorting and query-state preparation outside explicit SQL timers are included in `candidates`; `candidate_sql` is their separately timed SQL execution portion. The `cleanup` stage includes its own lock wait, while `state_lock.wait_ms` also reports all waits; do not add those overlapping fields. Materialization includes budget-probe serialization; the `serialization` stage is final response serialization only. Each stage's mean fraction is averaged per request; individual stage p95s cannot be summed into total p95.
+
+The 200ms Node probe records heap/external/arrayBuffers (arrayBuffers is a subset of external), CPU usage and resourceUsage. `ps` samples RSS and lifetime CPU percentage every100ms. An on-demand macOS `vmmap -summary` obtains OS-accounted Physical footprint at warm and post-cleanup checkpoints; it is not Linux PSS, and neither RSS sums nor footprint sums certify uniquely owned system RAM. `vmmap` can perturb checkpoints, so it is outside the request timing samples. Cold means a new model process; OS caches are not flushed. Benchmark hooks count pipeline starts; allocator-retained pages and a finite plateau are not a leak proof.

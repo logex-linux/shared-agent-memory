@@ -1,0 +1,169 @@
+--- a/retrieval/recall.js
++++ b/retrieval/recall.js
+@@ -1,6 +1,7 @@
+ import { MemoryError, verificationSchema, hash } from '../core/contracts.js';
+ import { identifiers, ftsQuery, terms } from './lexical.js';
+ import { answerIntent, factState, focusTerms, evidenceWindow } from './evidence.js';
++import { RetrievalProfile } from './profile.js';
+ import { QueryState, authority } from './state.js';
+ const blob = (v) => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+ export const estimateTokens = (bytes) => Math.ceil(bytes / 3);
+@@ -34,8 +35,9 @@
+     }
+ }
+ export async function retrieve(ctx, request, channel) {
+-    const { db, config, encoder } = ctx, start = performance.now(), debug = request.debug || config.diagnostics;
++    const { config, encoder } = ctx, profileTrace = (request.debug || config.diagnostics) ? new RetrievalProfile() : undefined, db = profileTrace?.database(ctx.db) ?? ctx.db, start = performance.now(), debug = request.debug || config.diagnostics;
+     const d = { elapsed_ms: 0, candidate_ids: 0, candidates_ranked: 0, full_body_records_read: 0, full_body_bytes_read: 0, json_parses: 0, metadata_json_parses: 0, chunk_text_rows_read: 0, vector_queries: 0, vector_rows_returned: 0, vector_internal_scanned: null, vector_distance_computations: null, query_embeddings: 0, response_bytes: 0, estimated_tokens: 0, content_estimated_tokens: 0, token_estimator: 'ceil(utf8_bytes/3)', cache_replay: false, ranking_chunk_rows_read: 0 };
++    let traceResponse;
+     const parse = (s, metadata = false) => {
+         d.json_parses++;
+         if (metadata)
+@@ -43,6 +45,7 @@
+         return JSON.parse(s);
+     };
+     let input = request, queryVector = null, profile = null, retrievalMode = request.ids ? 'ids' : channel, warnings = [], state, q = '', page = 0, resolved = 'focused', progress = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage;
++    const embeddingStarted = performance.now();
+     if (!request.cursor && request.query && channel !== 'lexical')
+         try {
+             profile = (await encoder.profile()).id;
+@@ -55,13 +58,18 @@
+             retrievalMode = 'lexical_degraded';
+             warnings.push('EMBEDDING_UNAVAILABLE');
+         }
++    profileTrace?.add('embedding', performance.now() - embeddingStarted);
+     try {
+         if (!request.ids) {
+-            state = new QueryState(db, config);
++            const opened = performance.now();
++            state = new QueryState(ctx.db, config);
++            profileTrace?.add('state_open', performance.now() - opened);
++            const cleaning = performance.now();
+             state.begin();
+             state.cleanup();
+             state.commit();
+-            state.begin();
++            profileTrace?.add('cleanup', performance.now() - cleaning);
++            const lockStarted=performance.now();state.begin();profileTrace?.add('state_wait',performance.now()-lockStarted);
+             if (request.cursor) {
+                 const found = state.lookup(request.cursor);
+                 q = found.row.id;
+@@ -81,7 +89,7 @@
+             }
+         }
+         // Freeze expiry after query encoding; all channels and materialization share this snapshot.
+-        db.exec('BEGIN');
++        const candidateStarted=performance.now();db.exec('BEGIN');
+         const gen = ctx.generation(), auth = authority(config, db), eligible = eligibility(input, config);
+         if (state) {
+             if (request.cursor) {
+@@ -151,6 +159,10 @@
+             const signature = JSON.stringify(c.hits.map(h => h[0]));
+             if (c.answer?.checked === signature)
+                 return;
++            const rankingStarted = performance.now();
++            const previousStage = profileTrace?.current;
++            if (profileTrace)
++                profileTrace.current = 'ranking';
+             const meta = db.prepare("SELECT json_extract(metadata,'$.title') title,json_extract(metadata,'$.verification.basis') basis,json_extract(metadata,'$.verification.status') status FROM memory_search WHERE memory_id=?").get(c.id);
+             const chunks = db.prepare('SELECT text FROM memory_chunks WHERE memory_id=? AND id IN (SELECT value FROM json_each(?)) ORDER BY start').all(c.id, signature);
+             d.ranking_chunk_rows_read += chunks.length;
+@@ -160,6 +172,10 @@
+             const state = factState(chunks.map(r => r.text).join('\n'), meta.basis, meta.status === 'disputed'), intent = answerIntent(input.query);
+             const alignment = intent === 'unknown' ? 0 : state === intent ? 1 : state === 'unknown' ? 0 : state === 'disputed' ? -.35 : -1;
+             c.answer = { state, coverage, alignment, checked: signature };
++            if (profileTrace) {
++                profileTrace.current = previousStage;
++                profileTrace.add('ranking', performance.now() - rankingStarted);
++            }
+         };
+         const persist = () => {
+             for (const c of candidates.values()) {
+@@ -365,6 +381,10 @@
+         d.candidates_ranked = selected.length;
+         const plan = savedPage ? parse(savedPage.plan) : { mode: request.ids ? 'ids' : resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
+         const result = { items: [], generation: gen, retrieval_mode: retrievalMode, warnings: [...new Set(warnings)], empty_reason: null, evidence_status: 'none', has_more: false, next_cursor: null, retrieval: plan };
++        if(profileTrace)profileTrace.add('candidates',Math.max(0,performance.now()-candidateStarted-['knn','fts_identifiers','ranking','candidate_sql'].reduce((n,k)=>n+(profileTrace.times[k]??0),0)));
++        const materializeStarted = performance.now();
++        if (profileTrace)
++            profileTrace.current = 'materialization';
+         const fitted = [], candidateMap = new Map(pool.map(c => [c.id, c]));
+         let blocked = false;
+         const fits = (reserve = 256) => Buffer.byteLength(JSON.stringify(result)) + reserve <= options.max_bytes - Math.min(2048, Math.floor(options.max_bytes / 2)) && estimateTokens(Buffer.byteLength(JSON.stringify(result)) + reserve) <= options.token_budget;
+@@ -457,6 +477,8 @@
+             }
+             fitted.push(id);
+         }
++        profileTrace?.add('materialization', performance.now() - materializeStarted);
++        const persistStarted = performance.now();
+         if (state) {
+             state.db.prepare('UPDATE queries SET expires=? WHERE id=?').run(Date.now() + config.query_ttl_seconds * 1000, q);
+             const done = progress.vectorDone && progress.ftsDone && progress.idDone;
+@@ -480,6 +502,8 @@
+                 delete plan.has_more;
+             }
+         }
++        profileTrace?.add('state_persist', performance.now() - persistStarted);
++        const serializationStarted = performance.now();
+         result.evidence_status = result.items.some((i) => i.evidence_strength === 'supported') ? 'related_evidence' : 'insufficient';
+         result.empty_reason = result.items.length ? null : blocked ? 'item_exceeds_budget' : 'no_relevant_evidence';
+         d.elapsed_ms = Number((performance.now() - start).toFixed(3));
+@@ -493,11 +517,17 @@
+         }
+         if (Buffer.byteLength(JSON.stringify(result)) > options.max_bytes)
+             throw new MemoryError('PAGE_BUDGET_TOO_SMALL');
++        profileTrace?.add('serialization', performance.now() - serializationStarted);
+         if (state)
+             state.enforce(q);
+         db.exec('COMMIT');
++        const committing = performance.now();
+         state?.commit();
+-        return result;
++        profileTrace?.add('state_persist', performance.now() - committing);
++        if (profileTrace && debug) {profileTrace.add('total',performance.now()-start);
++            Object.assign(d, { stages_ms: profileTrace.times, state_lock: state?.timing, memory: process.memoryUsage() });
++        }
++        traceResponse=result;return result;
+     }
+     catch (e) {
+         if (db.isTransaction)
+@@ -514,7 +544,7 @@
+         throw e;
+     }
+     finally {
+-        state?.close();
++        const closed=performance.now();state?.close();if(profileTrace&&traceResponse?.diagnostics){profileTrace.add('state_close',performance.now()-closed);profileTrace.times.total=performance.now()-start;}
+     }
+ }
+ //# sourceMappingURL=recall.js.map--- a/retrieval/state.js
++++ b/retrieval/state.js
+@@ -10,6 +10,8 @@
+ // A separate WAL writer serializes page creation without locking canonical memory writes.
+ export class QueryState {
+     db;
++    timing = { wait_ms: 0, held_ms: 0, transactions: 0 };
++    heldAt = 0;
+     path;
+     constructorConfig;
+     constructor(main, config) {
+@@ -70,7 +72,11 @@
+     }
+     begin() {
+         try {
++            const start = performance.now();
+             this.db.exec('BEGIN IMMEDIATE');
++            this.timing.wait_ms += performance.now() - start;
++            this.heldAt = performance.now();
++            this.timing.transactions++;
+         }
+         catch (e) {
+             if (/busy|locked/i.test(e.message))
+@@ -138,7 +144,7 @@
+         return { row, page: Number(match[2]) };
+     }
+     cursor(q, page) { return `am4:${q}:${page}`; }
+-    commit() { this.db.exec('COMMIT'); }
++    commit() { this.db.exec('COMMIT'); this.timing.held_ms += performance.now() - this.heldAt; }
+     rollback() {
+         if (this.db.isTransaction)
+             this.db.exec('ROLLBACK');

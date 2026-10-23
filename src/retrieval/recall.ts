@@ -2,6 +2,8 @@ import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import { MemoryError, verificationSchema, hash, type Config, type Encoder, type RecallInput } from '../core/contracts.js';
 import { identifiers, ftsQuery, terms } from './lexical.js';
 import { answerIntent, factState, focusTerms, evidenceWindow, type FactState } from './evidence.js';
+import { prepared } from '../storage/statements.js';
+import { RetrievalProfile } from './profile.js';
 import { QueryState, authority } from './state.js';
 type Context = {
     db: DatabaseSync;
@@ -66,11 +68,13 @@ function assess(c: Candidate, config: Config, broad: boolean, progress: any) {
     }
 }
 export async function retrieve(ctx: Context, request: RecallInput, channel: 'hybrid' | 'lexical' | 'vector') {
-    const { db, config, encoder } = ctx, start = performance.now(), debug = request.debug || config.diagnostics;
+    const { config, encoder } = ctx, profileTrace=(request.debug||config.diagnostics)?new RetrievalProfile():undefined, db=profileTrace?.database(prepared(ctx.db))??prepared(ctx.db), start = performance.now(), debug = request.debug || config.diagnostics;
     const d = { elapsed_ms: 0, candidate_ids: 0, candidates_ranked: 0, full_body_records_read: 0, full_body_bytes_read: 0, json_parses: 0, metadata_json_parses: 0, chunk_text_rows_read: 0, vector_queries: 0, vector_rows_returned: 0, vector_internal_scanned: null, vector_distance_computations: null, query_embeddings: 0, response_bytes: 0, estimated_tokens: 0, content_estimated_tokens: 0, token_estimator: 'ceil(utf8_bytes/3)', cache_replay: false, ranking_chunk_rows_read: 0 };
+    let traceResponse:any,traceBudget=config.page_response_bytes;
     const parse = (s: string, metadata = false) => { d.json_parses++; if (metadata)
         d.metadata_json_parses++; return JSON.parse(s); };
     let input = request, queryVector: Buffer | null = null, profile: string | null = null, retrievalMode: string = request.ids ? 'ids' : channel, warnings: string[] = [], state: QueryState | undefined, q = '', page = 0, resolved = 'focused', progress: any = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage: any;
+    const embeddingStarted=performance.now();
     if (!request.cursor && request.query && channel !== 'lexical')
         try {
             profile = (await encoder.profile()).id;
@@ -83,13 +87,14 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             retrievalMode = 'lexical_degraded';
             warnings.push('EMBEDDING_UNAVAILABLE');
         }
+    profileTrace?.add('embedding',performance.now()-embeddingStarted);
     try {
         if (!request.ids) {
-            state = new QueryState(db, config);
-            state.begin();
-            state.cleanup();
-            state.commit();
-            state.begin();
+            const opened=performance.now();
+            state = QueryState.open(ctx.db, config);
+            profileTrace?.add('state_open',performance.now()-opened);
+            const cleaning=performance.now();state.cleanupIfExpired();profileTrace?.add('cleanup',performance.now()-cleaning);
+            const lockStarted=performance.now();state.begin();profileTrace?.add('state_wait',performance.now()-lockStarted);
             if (request.cursor) {
                 const found = state.lookup(request.cursor);
                 q = found.row.id;
@@ -109,7 +114,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
         }
         // Freeze expiry after query encoding; all channels and materialization share this snapshot.
-        db.exec('BEGIN');
+        const candidateStarted=performance.now();db.exec('BEGIN');
         const gen = ctx.generation(), auth = authority(config, db), eligible = eligibility(input, config);
         if (state) {
             if (request.cursor) {
@@ -148,13 +153,15 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         let work = 0, lowGain = false;
         const seen = (ch: keyof typeof local, id: string) => { local[ch].add(id); state!.db.prepare('INSERT OR IGNORE INTO seen VALUES(?,?,?)').run(q, ch, id); };
         const exclusion = (ch: keyof typeof local) => `s.memory_id NOT IN (SELECT id FROM retrieval_state.seen WHERE q=? AND channel='${ch}') AND s.memory_id NOT IN (SELECT value FROM json_each(?))`;
+        const analysisMetadata=new Map<string,any>();
         const candidate = (id: string) => {
             if (!candidates.has(id)) {
                 const old = state!.db.prepare('SELECT data FROM candidates WHERE q=? AND id=?').get(q, id) as any;
                 if (old)
                     candidates.set(id, parse(old.data));
                 else {
-                    const r = db.prepare("SELECT s.project_id,s.branch,s.commit_ref,s.environment,json_extract(s.metadata,'$.kind') kind,json_extract(s.metadata,'$.title') title,json_extract(s.metadata,'$.tags') tags,json_extract(s.metadata,'$.sources[0].checked_at') date,json_extract(s.metadata,'$.sources[0].uri') source FROM memory_search s WHERE s.memory_id=?").get(id) as any;
+                    const r = db.prepare("SELECT s.project_id,s.branch,s.commit_ref,s.environment,json_extract(s.metadata,'$.kind') kind,json_extract(s.metadata,'$.title') title,json_extract(s.metadata,'$.verification.basis') basis,json_extract(s.metadata,'$.verification.status') status,json_extract(s.metadata,'$.tags') tags,json_extract(s.metadata,'$.sources[0].checked_at') date,json_extract(s.metadata,'$.sources[0].uri') source FROM memory_search s WHERE s.memory_id=?").get(id) as any;
+                    analysisMetadata.set(id,r);
                     const tags: string[] = parse(r.tags ?? '[]');
                     candidates.set(id, { id, head: 0, rrf: 0, exact: 0, coverage: 0, reasons: [], hits: [], project: r.project_id ?? 'global', topic: hash(tags.at(-1) ?? r.kind), period: (r.date ?? 'unknown').slice(0, 7), source: hash((r.source ?? '').replace(/\/[^/]*$/, '')), family: tags.length ? hash(tags[0]) : '', matchedTags: tags.filter(t => t.length >= 2 && input.query!.toLowerCase().includes(t.toLowerCase())), tagMatch: false, kind: r.kind, requiresCheck: Boolean(r.branch && !input.context.branch || r.commit_ref && !input.context.commit || r.environment && !input.context.environment), base: 0, admitted: false });
                 }
@@ -164,6 +171,15 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         const hit = (c: Candidate, id: number, p: number) => { const hits = new Map(c.hits); hits.set(id, Math.max(hits.get(id) ?? -Infinity, p)); c.hits = [...hits].sort((a, b) => b[1] - a[1] || a[0] - b[0]).slice(0, 2); };
         const reason = (c: Candidate, r: string) => { if (!c.reasons.includes(r))
             c.reasons.push(r); };
+        const chunkCache=new Map<number,any>();
+        const readChunks=(id:string,ids:number[])=>{
+            const missing=ids.filter(id=>!chunkCache.has(id));let read=0;
+            if(missing.length){
+                const rows=db.prepare('SELECT id,start,end,text FROM memory_chunks WHERE memory_id=? AND revision=(SELECT revision FROM memory_search WHERE memory_id=?) AND id IN (SELECT value FROM json_each(?)) ORDER BY start').all(id,id,JSON.stringify(missing)) as any[];
+                read=rows.length;for(const row of rows)chunkCache.set(row.id,row);
+            }
+            return {rows:ids.map(id=>chunkCache.get(id)).filter(Boolean).sort((a,b)=>a.start-b.start),read};
+        };
         const queryTerms=input.query?focusTerms(input.query):[], termWeights=new Map<string,number>();
         if(resolved==='focused'&&input.query) {
             db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS temp.recall_vocab USING fts5vocab(main,chunk_fts,'row')");
@@ -175,15 +191,18 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             if (resolved!=='focused') return;
             const signature=JSON.stringify(c.hits.map(h=>h[0]));
             if (c.answer?.checked===signature) return;
-            const meta=db.prepare("SELECT json_extract(metadata,'$.title') title,json_extract(metadata,'$.verification.basis') basis,json_extract(metadata,'$.verification.status') status FROM memory_search WHERE memory_id=?").get(c.id) as any;
-            const chunks=db.prepare('SELECT text FROM memory_chunks WHERE memory_id=? AND id IN (SELECT value FROM json_each(?)) ORDER BY start').all(c.id,signature) as any[];
-            d.ranking_chunk_rows_read+=chunks.length;
-            const text=[meta.title,...chunks.map(r=>r.text)].join('\n'), words=new Set(terms(text)), qt=focusTerms(input.query!);
+            const rankingStarted=performance.now();
+            const previousStage=profileTrace?.current;if(profileTrace)profileTrace.current='ranking';
+            const meta=analysisMetadata.get(c.id)??db.prepare("SELECT json_extract(metadata,'$.title') title,json_extract(metadata,'$.verification.basis') basis,json_extract(metadata,'$.verification.status') status FROM memory_search WHERE memory_id=?").get(c.id) as any;
+            const loaded=readChunks(c.id,c.hits.map(h=>h[0])),chunks=loaded.rows;
+            d.ranking_chunk_rows_read+=loaded.read;
+            const text=[meta.title,...chunks.map(r=>r.text)].join('\n'), words=new Set(terms(text)), qt=queryTerms;
             const denominator=qt.reduce((n,t)=>n+(termWeights.get(t)??Math.log(2+Number((progress.vectorRank??0)+32))),0);
             const coverage=denominator?qt.filter(t=>words.has(t)).reduce((n,t)=>n+(termWeights.get(t)??1),0)/denominator:0;
             const state=factState(chunks.map(r=>r.text).join('\n'),meta.basis,meta.status==='disputed'), intent=answerIntent(input.query!);
             const alignment=intent==='unknown'?0:state===intent?1:state==='unknown'?0:state==='disputed'?-.35:-1;
             c.answer={state,coverage,alignment,checked:signature};
+            if(profileTrace){profileTrace.current=previousStage!;profileTrace.add('ranking',performance.now()-rankingStarted);}
         };
         const persist = () => { for (const c of candidates.values()) {
             analyze(c);
@@ -322,6 +341,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             options = prior;
             d.cache_replay = true;
         }
+        traceBudget=options.max_bytes;
         let pool: Candidate[] = [], selected: string[] = [];
         if (request.ids)
             selected = request.ids;
@@ -386,9 +406,11 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         d.candidates_ranked = selected.length;
         const plan: any = savedPage ? parse(savedPage.plan) : { mode: request.ids ? 'ids' : resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
         const result: any = { items: [], generation: gen, retrieval_mode: retrievalMode, warnings: [...new Set(warnings)], empty_reason: null, evidence_status: 'none', has_more: false, next_cursor: null, retrieval: plan };
+        if(profileTrace)profileTrace.add('candidates',Math.max(0,performance.now()-candidateStarted-['knn','fts_identifiers','ranking','candidate_sql'].reduce((n,k)=>n+(profileTrace.times[k]??0),0)));
+        const materializeStarted=performance.now();if(profileTrace)profileTrace.current='materialization';
         const fitted: string[] = [], candidateMap = new Map(pool.map(c => [c.id, c]));
         let blocked = false;
-        const fits = (reserve = 256) => Buffer.byteLength(JSON.stringify(result)) + reserve <= options.max_bytes - Math.min(2048, Math.floor(options.max_bytes / 2)) && estimateTokens(Buffer.byteLength(JSON.stringify(result)) + reserve) <= options.token_budget;
+        const fits = (reserve = 256) => {const bytes=Buffer.byteLength(JSON.stringify(result))+reserve;return bytes<=options.max_bytes-Math.min(2048,Math.floor(options.max_bytes/2))&&estimateTokens(bytes)<=options.token_budget;};
         for (const id of selected.slice(0, Math.min(options.limit, config.page_item_limit))) {
             const row = db.prepare(`SELECT s.revision,s.project_id,s.scope,s.profile_id,s.metadata,m.content_hash,m.written_by,m.verified_at${request.ids ? ',m.body' : ''} FROM memory_search s JOIN memories m ON m.id=s.memory_id WHERE s.memory_id=?`).get(id) as any;
             let body: any;
@@ -399,11 +421,13 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
             else
                 body = parse(row.metadata, true);
-            const c = candidateMap.get(id), ids = c?.hits.slice(0, options.view === 'evidence' ? 1 : 2).map(h => h[0]) ?? [], chunks = request.ids ? [] : db.prepare(`SELECT id,start,end,text FROM memory_chunks WHERE memory_id=? AND revision=? AND id IN (SELECT value FROM json_each(?)) ORDER BY start`).all(id, row.revision, JSON.stringify(ids)) as any[];
-            d.chunk_text_rows_read += chunks.length;
+            const c = candidateMap.get(id), ids = c?.hits.slice(0, options.view === 'evidence' ? 1 : 2).map(h => h[0]) ?? [];
+            const loaded=request.ids?{rows:[],read:0}:readChunks(id,ids),chunks=loaded.rows;
+            d.chunk_text_rows_read += loaded.read;
             const excerpts: any[] = [];
+            let snippetSelection='chunk_fallback';
             for (const original of chunks) {
-                const window=options.view==='evidence'?evidenceWindow(original.text,input.query??'',200):null;
+                const window=options.view==='evidence'?evidenceWindow(original.text,input.query??'',200):null;if(window)snippetSelection=window.selection;
                 const x=window?{...original,start:original.start+window.start,end:original.start+window.end,text:window.text}:original;
                 const last = excerpts.at(-1);
                 if (last && x.start <= last.end) {
@@ -426,7 +450,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             const strength = request.ids || c && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold) ? 'supported' : 'weak';
             const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: flags.get(id) ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? ['id'] };
             if (c?.answer) item.answer_relevance={state:c.answer.state,assessment:'local_claim_heuristic',intent:answerIntent(input.query??'')};
-            if (options.view==='evidence'&&!request.ids) item.snippet_selection=evidenceWindow(chunks[0]?.text??'',input.query??'').selection;
+            if (options.view==='evidence'&&!request.ids) item.snippet_selection=snippetSelection;
             if (request.ids)
                 Object.assign(item, { written_by: row.written_by, content_hash: row.content_hash, embedding_profile_id: row.profile_id, derived_from: body.derived_from, author_client: body.author_client, author_session: body.author_session, import_key: body.import_key, relevance: c ? { rrf: c.rrf, cosine: c.cosine, identifier_matches: c.exact } : undefined });
             result.items.push(item);
@@ -468,6 +492,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
             fitted.push(id);
         }
+        profileTrace?.add('materialization',performance.now()-materializeStarted);
+        const persistStarted=performance.now();
         if (state) {
             state.db.prepare('UPDATE queries SET expires=? WHERE id=?').run(Date.now() + config.query_ttl_seconds * 1000, q);
             const done = progress.vectorDone && progress.ftsDone && progress.idDone;
@@ -491,6 +517,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 delete plan.has_more;
             }
         }
+        profileTrace?.add('state_persist',performance.now()-persistStarted);
+        const serializationStarted=performance.now();
         result.evidence_status = result.items.some((i: any) => i.evidence_strength === 'supported') ? 'related_evidence' : 'insufficient';
         result.empty_reason = result.items.length ? null : blocked ? 'item_exceeds_budget' : 'no_relevant_evidence';
         d.elapsed_ms = Number((performance.now() - start).toFixed(3));
@@ -504,10 +532,15 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         if (Buffer.byteLength(JSON.stringify(result)) > options.max_bytes)
             throw new MemoryError('PAGE_BUDGET_TOO_SMALL');
+        profileTrace?.add('serialization',performance.now()-serializationStarted);
         if(state)state.enforce(q);
         db.exec('COMMIT');
-        state?.commit();
-        return result;
+        const committing=performance.now();state?.commit();profileTrace?.add('state_persist',performance.now()-committing);
+        if(profileTrace&&debug){profileTrace.add('total',performance.now()-start);Object.assign(d,{stages_ms:profileTrace.times,state_lock:state?.timing,memory:process.memoryUsage()});
+            if(Buffer.byteLength(JSON.stringify(result))>options.max_bytes){delete (d as any).stages_ms;delete (d as any).state_lock;delete (d as any).memory;}
+            for(let i=0;i<4;i++){d.response_bytes=Buffer.byteLength(JSON.stringify(result));d.estimated_tokens=estimateTokens(d.response_bytes);}
+        }
+        traceResponse=result;return result;
     }
     catch (e) {
         if (db.isTransaction)
@@ -520,6 +553,11 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         throw e;
     }
     finally {
-        state?.close();
+        const closed=performance.now();state?.close();
+        if(profileTrace&&traceResponse?.diagnostics){
+            profileTrace.add('state_close',performance.now()-closed);profileTrace.times.total=performance.now()-start;
+            if(Buffer.byteLength(JSON.stringify(traceResponse))>traceBudget){delete (d as any).stages_ms;delete (d as any).state_lock;delete (d as any).memory;}
+            for(let i=0;i<4;i++){d.response_bytes=Buffer.byteLength(JSON.stringify(traceResponse));d.estimated_tokens=estimateTokens(d.response_bytes);}
+        }
     }
 }

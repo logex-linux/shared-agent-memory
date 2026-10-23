@@ -1,3 +1,4 @@
+import { prepared } from '../storage/statements.js';
 import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, realpathSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -9,13 +10,19 @@ export function authority(config: Config, db: DatabaseSync) {
 // Disposable query state: IDs, scores, offsets and facet keys only; never memory bodies.
 // A separate WAL writer serializes page creation without locking canonical memory writes.
 export class QueryState {
+    private static instances=new WeakMap<DatabaseSync,QueryState>();private pooled=false;
+    static open(main:DatabaseSync,config:Config){let state=this.instances.get(main);if(!state){state=new QueryState(main,config);state.pooled=true;this.instances.set(main,state);}state.constructorConfig=config;state.timing={wait_ms:0,held_ms:0,transactions:0};return state;}
+    static dispose(main:DatabaseSync){const state=this.instances.get(main);if(state){state.db.close();this.instances.delete(main);}}
+    cleanupIfExpired(){if(!this.db.prepare('SELECT 1 FROM queries WHERE expires<? LIMIT 1').get(Date.now()))return false;this.begin();try{this.cleanup();this.commit();return true;}catch(e){this.rollback();throw e;}}
+
     db: DatabaseSync;
+    timing={wait_ms:0,held_ms:0,transactions:0};private heldAt=0;
     path: string;
     constructorConfig: Config;
     constructor(main: DatabaseSync, config: Config) {
         this.constructorConfig=config;
         const path = this.path = realpathSync(config.database) + '.retrieval.db';
-        this.db = new DatabaseSync(path);
+        this.db = prepared(new DatabaseSync(path));
         chmodSync(path, 0o600);
         const initialize=()=>this.db.exec(`PRAGMA busy_timeout=5000;PRAGMA journal_mode=WAL;PRAGMA secure_delete=ON;PRAGMA wal_autocheckpoint=256;PRAGMA journal_size_limit=1048576;
     CREATE TABLE IF NOT EXISTS queries(id TEXT PRIMARY KEY,authority TEXT NOT NULL,generation INTEGER NOT NULL,input TEXT NOT NULL,vector BLOB,profile TEXT,retrieval_mode TEXT NOT NULL,resolved TEXT NOT NULL,progress TEXT NOT NULL,expires INTEGER NOT NULL);
@@ -54,7 +61,7 @@ export class QueryState {
             main.prepare('ATTACH DATABASE ? AS retrieval_state').run(path);
     }
     begin() { try {
-        this.db.exec('BEGIN IMMEDIATE');
+        const start=performance.now();this.db.exec('BEGIN IMMEDIATE');this.timing.wait_ms+=performance.now()-start;this.heldAt=performance.now();this.timing.transactions++;
     }
     catch (e: any) {
         if (/busy|locked/i.test(e.message))
@@ -121,8 +128,8 @@ export class QueryState {
         return { row, page: Number(match[2]) };
     }
     cursor(q: string, page: number) { return `am4:${q}:${page}`; }
-    commit() { this.db.exec('COMMIT'); }
+    commit() { this.db.exec('COMMIT');this.timing.held_ms+=performance.now()-this.heldAt; }
     rollback() { if (this.db.isTransaction)
         this.db.exec('ROLLBACK'); }
-    close() { this.db.close(); }
+    close() { if(!this.pooled)this.db.close(); }
 }

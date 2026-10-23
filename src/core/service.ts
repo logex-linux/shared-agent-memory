@@ -29,7 +29,7 @@ export class MemoryService {
     this.encoder=encoder??new BgeEncoder(this.config);
   }
   get db(){return this.storage.db;}
-  close(){this.storage.close();}
+  close(){QueryState.dispose(this.db);this.storage.close();}
   private permission(operation:Config['operations'][number]) {
     if(!this.config.operations.includes(operation)) throw new MemoryError('OPERATION_DENIED');
   }
@@ -237,7 +237,7 @@ export class MemoryService {
   }
   cache(maintenance=false) {
     this.permission('manage');
-    const cache=new QueryState(this.db,this.config);
+    const cache=QueryState.open(this.db,this.config);
     try{if(maintenance){cache.begin();try{cache.cleanup();cache.commit();}catch(e){cache.rollback();throw e;}cache.checkpoint();}return cache.inspect();}finally{cache.close();}
   }
   async maintenance() {this.permission('manage');return {...await this.maintain(),query_cache:this.cache(true)};}

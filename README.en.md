@@ -122,3 +122,11 @@ node dist/cli/main.js cache-maintenance --config /absolute/path/admin.config.jso
 ```
 
 See [implementation, backup and rollback](docs/quality-v041.md) and [measured results](docs/quality-v041-results.md). Canonical Schema 5 and existing memory IDs/revisions are unchanged. Existing cursors must restart after the ranking-version update. No live memory library or client configuration was changed during development.
+
+## v0.4.2 resource efficiency
+
+Retrieval policy, permissions, pagination and the embedding profile are unchanged. The release reuses sidecar connections and bounded prepared statements, skips cleanup writes when nothing has expired, reuses request-local hit chunks and metadata, avoids duplicate snippet/budget work, and streams model-file SHA-256 validation.
+
+All 180 frozen queries preserve their cumulative ordered IDs. Focused reads at 10,000 memories drop from 33.5 to 28.55 chunks per request without trimming ranking candidates. Some short concurrency measurements improve; the 10,000-query sustained p95 is essentially unchanged and total RSS does not consistently decrease. FP32 and two CPU threads remain the defaults.
+
+See the [profiling, quality, memory and rollback report](docs/performance-v042-results.md). Stage diagnostics are debug-only; no raw benchmark reports, live data or client settings are published.

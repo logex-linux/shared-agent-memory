@@ -205,3 +205,11 @@ node dist/cli/main.js cache-maintenance --config /absolute/path/admin.config.jso
 Focused reranks bounded hit chunks using query intent and local evidence. State labels describe local claims, never proof of execution or truth. Evidence windows preserve original offsets and provenance; purely semantic hits may explicitly fall back to a chunk excerpt. Broad coverage and unlimited cumulative pagination remain available. Cache quotas protect resident resources; capacity errors are not exhaustion. Cache inspection and maintenance require the existing `manage` permission.
 
 详见 [实现、配置、升级回滚与边界 / implementation and operations](docs/quality-v041.md)、[质量和性能结果 / results](docs/quality-v041-results.md)。未修改用户真实记忆或客户端配置。
+
+## v0.4.2 性能与资源效率
+
+检索规则、权限和分页保持不变，主要减少重复工作：复用 sidecar 连接和有界预编译语句，无过期记录时跳过清理写事务，请求内复用精排 Chunk、元数据与证据窗口，并用流式 SHA-256 校验模型文件。没有减少精排候选或重建用户向量，默认仍为 FP32 / 两线程。
+
+冻结的180个查询累计返回 ID 和顺序完全一致。10,000条规模的 Focused 平均 Chunk 读取从33.5降到28.55；普通查询完整正文读取仍为0。三轮并发实验部分指标改善，但10,000次持续查询的p95基本持平，整体RSS没有稳定下降，不承诺所有负载更快。
+
+详见[性能剖析、质量门槛、内存与回滚报告](docs/performance-v042-results.md)。新增阶段诊断仅在 debug 下返回；常规 Agent 响应仍保持简洁。

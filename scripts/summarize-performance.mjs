@@ -1,0 +1,14 @@
+// Aggregate ignored real-MCP traces without publishing raw records or PIDs.
+import {readFile,writeFile,readdir} from 'node:fs/promises';import {resolve,join} from 'node:path';
+const root=resolve(process.argv[2]??'.local/v042'),folders=(await readdir(root)).filter(n=>/^release-0\.4\.[12]-r\d+$|^phase-0\.4\.[12]-r\d+$|^long-0\.4\.[12]$|^release-thread1-r\d+$/.test(n));
+const pct=(a,p)=>{const sorted=a.filter(Number.isFinite).sort((a,b)=>a-b);return sorted[Math.max(0,Math.ceil(sorted.length*p)-1)]??null;};const stats=a=>({p50:pct(a,.5),p95:pct(a,.95),mean:a.length?a.reduce((n,x)=>n+x,0)/a.length:null});
+const output={};
+for(const folder of folders){const r=JSON.parse(await readFile(join(root,folder,'report.json'),'utf8')),stages={},memory={};
+ for(const scenario of [...new Set(r.samples.map(x=>x.scenario))]){const samples=r.samples.filter(x=>x.scenario===scenario),keys=[...new Set(samples.flatMap(x=>Object.keys(x.stages??{})))];stages[scenario]=Object.fromEntries(keys.map(k=>[k,{...stats(samples.map(x=>x.stages?.[k]??0)),mean_share_of_total:samples.reduce((n,x)=>n+(x.stages?.[k]??0)/Math.max(.0001,x.stages?.total??x.ms),0)/samples.length}]));stages[scenario].lock_wait=stats(samples.map(x=>x.lock?.wait_ms??0));stages[scenario].lock_held=stats(samples.map(x=>x.lock?.held_ms??0));}
+ for(const phase of r.snapshots??[]){memory[phase.name]={memory_per_process:phase.memory.map(x=>x.memory),simultaneous_rss_sum:phase.memory.reduce((n,x)=>n+x.memory.rss,0),physical_footprint:phase.footprint?.map(x=>x.physical_footprint??'unavailable')};}
+ const warm=r.snapshots.find(x=>x.name==='warmed'),end=r.snapshots.find(x=>x.name==='sustained');
+ const warmRequests=r.samples.filter(x=>['four_broad','same_cursor_seed','same_cursor','read_write','sustained'].includes(x.scenario)).length;
+ const modelStarts=Object.values(Object.fromEntries((r.models??[]).filter(x=>r.samples.some(s=>s.pid===x.pid&&s.scenario==='four_cold')).map(x=>[x.pid,x.starts])));
+ output[folder]={warm_workload_recall_per_second:warm&&end?warmRequests/((end.time-warm.time)/1000):null,label:r.label,threads:r.encoder,requests:r.successes,summary:r.summary,cold:r.cold,stages,memory,aggregate_sampled_peak_rss_kib:r.aggregate_sampled_peak_rss_kib,model_starts_per_process:modelStarts,cleanup_ms:stats(r.cleanupTimes??[]),maintenance:r.maintenance,expiredMaintenance:r.expiredMaintenance,coverage:r.coverage,events:r.events,per_process_peak_rss_kib:Object.entries(r.per_pid).filter(([pid])=>r.samples.some(x=>String(x.pid)===pid&&x.scenario==='four_cold')).map(([,x])=>x.peak_rss_kib),mean_cpu_percent_per_process:Object.entries(r.per_pid).filter(([pid])=>r.samples.some(x=>String(x.pid)===pid&&x.scenario==='four_cold')).map(([,x])=>x.mean_cpu_percent)};
+}
+await writeFile(join(root,'summary.json'),JSON.stringify(output,null,2));console.log(JSON.stringify({aggregated:Object.keys(output),output:join(root,'summary.json')}));

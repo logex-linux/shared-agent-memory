@@ -1,3 +1,5 @@
+import { createReadStream } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { env, pipeline } from '@huggingface/transformers';
@@ -17,7 +19,9 @@ export class BgeEncoder implements Encoder {
       const manifest = JSON.parse(await readFile(join(this.config.model_dir,'manifest.json'),'utf8'));
       for (const [name, expected] of Object.entries(manifest.files)) {
         if (!/^(config\.json|tokenizer\.json|tokenizer_config\.json|special_tokens_map\.json|onnx\/model(_quantized)?\.onnx)$/.test(name)) throw new MemoryError('MODEL_MANIFEST_INVALID');
-        if (hash(await readFile(join(this.config.model_dir,name))) !== expected) throw new MemoryError('MODEL_HASH_MISMATCH',name);
+        const digest=createHash('sha256');
+        for await(const chunk of createReadStream(join(this.config.model_dir,name)))digest.update(chunk);
+        if (digest.digest('hex') !== expected) throw new MemoryError('MODEL_HASH_MISMATCH',name);
       }
       const required = ['config.json','tokenizer.json','tokenizer_config.json','onnx/'+(this.config.dtype === 'fp32'?'model.onnx':'model_quantized.onnx')];
       if (required.some(x=>!manifest.files[x])) throw new MemoryError('MODEL_MANIFEST_INVALID');
