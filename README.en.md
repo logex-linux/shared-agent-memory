@@ -31,6 +31,8 @@ Use the generated template, or replace the absolute paths in [examples/mcp.json]
 
 Daily agents use `config.json`: recall only, with whole-library search. `project.config.json` grants writes within the selected project; `admin.config.json` grants global management and review. Only enabled tools are exposed. Server-side permission checks do not infer human authorization from a prompt.
 
+If an agent can read but cannot save, inspect its actual tool list. AGENTS.md guidance cannot grant a read-only connection write access. An operator may explicitly select a project writer or authorize `operations: ["recall", "propose", "commit"]` in a dedicated configuration without adding administrator permissions. Reconnect MCP after changing it. A write-capable connection still requires authorization for the particular memory being saved.
+
 Available tools:
 
 | Tool | Purpose |
@@ -130,3 +132,9 @@ Retrieval policy, permissions, pagination and the embedding profile are unchange
 All 180 frozen queries preserve their cumulative ordered IDs. Focused reads at 10,000 memories drop from 33.5 to 28.55 chunks per request without trimming ranking candidates. Some short concurrency measurements improve; the 10,000-query sustained p95 is essentially unchanged and total RSS does not consistently decrease. FP32 and two CPU threads remain the defaults.
 
 See the [profiling, quality, memory and rollback report](docs/performance-v042-results.md). Stage diagnostics are debug-only; no raw benchmark reports, live data or client settings are published.
+
+## v0.4.3 call-audit fixes
+
+Focused retrieval distinguishes source-category tags from topical evidence, avoids a contextual year acting as a strong identifier, and abstains instead of forcing an unqualified semantic fallback. Complementary subject matches retain relevant sources within longer queries. Ordinary responses no longer reserve large byte allowances for absent diagnostics. Broad pagination, explicit identifier searches, permissions and Schema 5 remain compatible; old ranking-version cursors require a new query.
+
+Prefer default budgets. `max_bytes` must be at least 2048; when mandatory source metadata cannot fit, resume an `item_exceeds_budget` page using its cursor and a larger byte budget. See [quality results, verification, limitations and rollback](docs/retrieval-v043.md). Private call transcripts and memory records are not published.

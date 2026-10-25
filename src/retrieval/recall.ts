@@ -12,6 +12,7 @@ type Context = {
     generation: () => number;
 };
 type Candidate = {
+    specificTopic?: boolean;
     id: string;
     head: number;
     rrf: number;
@@ -34,9 +35,11 @@ type Candidate = {
     requiresCheck: boolean;
     base: number;
     admitted: boolean;
-    answer?: { state: FactState; coverage: number; alignment: number; checked: string };
+    answer?: { state: FactState; coverage: number; alignment: number; checked: string; salient?: boolean; subjectMatches?: number };
 };
 const blob = (v: Float32Array) => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+// These describe the request, rather than its subject; they must not dominate IDF anchors.
+const salienceScaffolding=new Set(terms('用户 已 废弃 改用 决定 配置 入口 最近 排错 记录 相关 当前 已有 既有'));
 export const estimateTokens = (bytes: number) => Math.ceil(bytes / 3);
 function eligibility(input: RecallInput, config: Config) {
     const params: SQLInputValue[] = [Number(!input.project_id && config.all_projects), JSON.stringify(input.project_id ? [input.project_id] : config.allowed_projects), Number(input.include_global ?? (!input.project_id && config.allow_global)), new Date().toISOString()];
@@ -64,6 +67,10 @@ function assess(c: Candidate, config: Config, broad: boolean, progress: any) {
         c.admitted = tail || topicBridge&&semantic || near || a.coverage>=.5 || !progress.hasIdentifiers&&progress.anchors?.includes(c.id);
         if (progress.hasIdentifiers && c.exact===0 && !topicBridge)
             c.admitted = local&&strong&&a.coverage>=.5 || (c.cosine??0)>=Math.max(config.evidence_threshold,peak+.04);
+        // Provenance labels shared by a large part of the library are not topical evidence.
+        // Keep semantic paraphrases; lexical/background matches need local, distinctive support.
+        if (!c.specificTopic && c.exact===0)
+            c.admitted = (c.cosine??0)>=Math.min(1,config.evidence_threshold+.1) || near&&a.coverage>=.2 || a.coverage>=.5&&Boolean(a.salient) || semantic&&Boolean(a.salient)&&(a.coverage>=.2||(a.subjectMatches??0)>=2);
         c.base = c.rrf + Number(c.exact>0)*.06 + a.coverage*.045 + a.alignment*.035;
     }
 }
@@ -153,7 +160,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         let work = 0, lowGain = false;
         const seen = (ch: keyof typeof local, id: string) => { local[ch].add(id); state!.db.prepare('INSERT OR IGNORE INTO seen VALUES(?,?,?)').run(q, ch, id); };
         const exclusion = (ch: keyof typeof local) => `s.memory_id NOT IN (SELECT id FROM retrieval_state.seen WHERE q=? AND channel='${ch}') AND s.memory_id NOT IN (SELECT value FROM json_each(?))`;
-        const analysisMetadata=new Map<string,any>();
+        const analysisMetadata=new Map<string,any>(),topicCounts=new Map<string,number>();
         const candidate = (id: string) => {
             if (!candidates.has(id)) {
                 const old = state!.db.prepare('SELECT data FROM candidates WHERE q=? AND id=?').get(q, id) as any;
@@ -163,7 +170,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     const r = db.prepare("SELECT s.project_id,s.branch,s.commit_ref,s.environment,json_extract(s.metadata,'$.kind') kind,json_extract(s.metadata,'$.title') title,json_extract(s.metadata,'$.verification.basis') basis,json_extract(s.metadata,'$.verification.status') status,json_extract(s.metadata,'$.tags') tags,json_extract(s.metadata,'$.sources[0].checked_at') date,json_extract(s.metadata,'$.sources[0].uri') source FROM memory_search s WHERE s.memory_id=?").get(id) as any;
                     analysisMetadata.set(id,r);
                     const tags: string[] = parse(r.tags ?? '[]');
+                    const topic=tags.at(-1);
                     candidates.set(id, { id, head: 0, rrf: 0, exact: 0, coverage: 0, reasons: [], hits: [], project: r.project_id ?? 'global', topic: hash(tags.at(-1) ?? r.kind), period: (r.date ?? 'unknown').slice(0, 7), source: hash((r.source ?? '').replace(/\/[^/]*$/, '')), family: tags.length ? hash(tags[0]) : '', matchedTags: tags.filter(t => t.length >= 2 && input.query!.toLowerCase().includes(t.toLowerCase())), tagMatch: false, kind: r.kind, requiresCheck: Boolean(r.branch && !input.context.branch || r.commit_ref && !input.context.commit || r.environment && !input.context.environment), base: 0, admitted: false });
+                    const sourceParts=String(r.source??'').toLowerCase().split(/[/.]/);
+                    const sourceLabel=topic&&sourceParts.includes(topic.toLowerCase());
+                    if(resolved==='focused'&&sourceLabel&&!topicCounts.has(topic))topicCounts.set(topic,Number((db.prepare(`SELECT count(*) n FROM (SELECT 1 FROM memory_search s WHERE ${eligible.sql} AND EXISTS(SELECT 1 FROM json_each(json_extract(s.metadata,'$.tags')) WHERE value=?) LIMIT 3)`).get(...eligible.params,topic) as any).n));
+                    candidates.get(id)!.specificTopic=!(sourceLabel&&(topicCounts.get(topic)??0)>=3);
                 }
             }
             return candidates.get(id)!;
@@ -181,6 +193,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             return {rows:ids.map(id=>chunkCache.get(id)).filter(Boolean).sort((a,b)=>a.start-b.start),read};
         };
         const queryTerms=input.query?focusTerms(input.query):[], termWeights=new Map<string,number>();
+        const queryIdentifiers=identifiers(input.query??'').filter(id=>input.exact_only||!/^20\d{2}$/.test(id)||queryTerms.length===1);
         if(resolved==='focused'&&input.query) {
             db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS temp.recall_vocab USING fts5vocab(main,chunk_fts,'row')");
             const total=Number((db.prepare('SELECT count(*) n FROM memory_chunks').get() as any).n);
@@ -201,7 +214,10 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             const coverage=denominator?qt.filter(t=>words.has(t)).reduce((n,t)=>n+(termWeights.get(t)??1),0)/denominator:0;
             const state=factState(chunks.map(r=>r.text).join('\n'),meta.basis,meta.status==='disputed'), intent=answerIntent(input.query!);
             const alignment=intent==='unknown'?0:state===intent?1:state==='unknown'?0:state==='disputed'?-.35:-1;
-            c.answer={state,coverage,alignment,checked:signature};
+            const salient=queryTerms.filter(t=>t.length>=2&&!salienceScaffolding.has(t)&&termWeights.has(t)).sort((a,b)=>termWeights.get(b)!-termWeights.get(a)!);
+            const salientWeight=salient.length?termWeights.get(salient[0])!:Infinity;
+            const salientMatches=salient.filter(t=>termWeights.get(t)!>=salientWeight*.85&&words.has(t)).length;
+            c.answer={state,coverage,alignment,checked:signature,salient:salientMatches>0,subjectMatches:salient.filter(t=>words.has(t)).length};
             if(profileTrace){profileTrace.current=previousStage!;profileTrace.add('ranking',performance.now()-rankingStarted);}
         };
         const persist = () => { for (const c of candidates.values()) {
@@ -276,7 +292,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     }
                 }
                 if (!progress.idDone && work < config.page_candidate_budget) {
-                    const n = Math.min(k, config.page_candidate_budget - work), rows = db.prepare(`WITH matches AS MATERIALIZED (SELECT i.* FROM chunk_identifiers i JOIN memory_chunks c ON c.id=i.chunk_id JOIN memory_search s ON s.memory_id=i.memory_id WHERE i.identifier IN (SELECT value FROM json_each(?)) AND ${eligible.sql} AND c.revision=s.revision AND c.profile_id=s.profile_id AND ${exclusion('identifier')}), per_identifier AS (SELECT memory_id,identifier,max(weight) weight FROM matches GROUP BY memory_id,identifier),totals AS (SELECT memory_id,sum(weight) exact FROM per_identifier GROUP BY memory_id) SELECT t.*,(SELECT chunk_id FROM matches h WHERE h.memory_id=t.memory_id ORDER BY weight DESC,chunk_id LIMIT 1) chunk_id FROM totals t ORDER BY exact DESC,memory_id LIMIT ?`).all(JSON.stringify(identifiers(input.query!)), ...eligible.params, q, JSON.stringify([...local.identifier]), n) as any[];
+                    const n = Math.min(k, config.page_candidate_budget - work), rows = db.prepare(`WITH matches AS MATERIALIZED (SELECT i.* FROM chunk_identifiers i JOIN memory_chunks c ON c.id=i.chunk_id JOIN memory_search s ON s.memory_id=i.memory_id WHERE i.identifier IN (SELECT value FROM json_each(?)) AND ${eligible.sql} AND c.revision=s.revision AND c.profile_id=s.profile_id AND ${exclusion('identifier')}), per_identifier AS (SELECT memory_id,identifier,max(weight) weight FROM matches GROUP BY memory_id,identifier),totals AS (SELECT memory_id,sum(weight) exact FROM per_identifier GROUP BY memory_id) SELECT t.*,(SELECT chunk_id FROM matches h WHERE h.memory_id=t.memory_id ORDER BY weight DESC,chunk_id LIMIT 1) chunk_id FROM totals t ORDER BY exact DESC,memory_id LIMIT ?`).all(JSON.stringify(resolved==='broad'?identifiers(input.query!):queryIdentifiers), ...eligible.params, q, JSON.stringify([...local.identifier]), n) as any[];
                     work += rows.length;
                     for (const r of rows) {
                         const c = candidate(r.memory_id);
@@ -297,7 +313,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                             counts.set(t, (counts.get(t) ?? 0) + 1);
                     const smallest = Math.min(...counts.values());
                     progress.hints = [...counts].filter(([, n]) => n <= smallest * 3).map(([t]) => t);
-                    progress.hasIdentifiers=identifiers(input.query!).length>0;
+                    progress.hasIdentifiers=initial.some(c=>c.exact>0);
                     for(const c of initial)analyze(c);
                     progress.identifierTopics=[...new Set(initial.filter(c=>c.exact>0&&(!c.answer||['unknown','implemented'].includes(c.answer.state))).map(c=>c.topic))];
                     progress.peak = Math.max(0, ...initial.map(c => c.cosine ?? 0));
@@ -352,7 +368,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         else {
             const extra = input.exact_only ? "AND json_extract(data,'$.exact')>0" : '', sql = resolved === 'broad' ? `WITH diverse AS (SELECT *,row_number() OVER(PARTITION BY project,topic,period ORDER BY base DESC,id) facet_rank FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${extra}) SELECT data FROM diverse ORDER BY facet_rank,base DESC,id LIMIT ?` : `SELECT data FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${extra} ORDER BY base DESC,id LIMIT ?`;
             pool = (state!.db.prepare(sql).all(q, config.page_candidate_budget) as any[]).map(r => parse(r.data));
-            if (!pool.length) {
+            if (!pool.length && (resolved==='broad'||channel==='lexical'||retrievalMode==='lexical_degraded')) {
                 pool = (state!.db.prepare(`SELECT data FROM candidates WHERE q=? AND emitted IS NULL ${input.exact_only ? 'AND json_extract(data,\'$.exact\')>0' : ''} ORDER BY base DESC,id LIMIT 1`).all(q) as any[]).map(r => parse(r.data));
             }
             // Quality anchor: score the leading relevance prefix with the v0.3 window.
@@ -410,7 +426,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         const materializeStarted=performance.now();if(profileTrace)profileTrace.current='materialization';
         const fitted: string[] = [], candidateMap = new Map(pool.map(c => [c.id, c]));
         let blocked = false;
-        const fits = (reserve = 256) => {const bytes=Buffer.byteLength(JSON.stringify(result))+reserve;return bytes<=options.max_bytes-Math.min(2048,Math.floor(options.max_bytes/2))&&estimateTokens(bytes)<=options.token_budget;};
+        const fits = (reserve = 256) => {const bytes=Buffer.byteLength(JSON.stringify(result))+reserve;return bytes<=options.max_bytes-(debug?Math.min(2048,Math.floor(options.max_bytes/2)):0)&&estimateTokens(bytes)<=options.token_budget;};
         for (const id of selected.slice(0, Math.min(options.limit, config.page_item_limit))) {
             const row = db.prepare(`SELECT s.revision,s.project_id,s.scope,s.profile_id,s.metadata,m.content_hash,m.written_by,m.verified_at${request.ids ? ',m.body' : ''} FROM memory_search s JOIN memories m ON m.id=s.memory_id WHERE s.memory_id=?`).get(id) as any;
             let body: any;

@@ -61,6 +61,8 @@ npm run setup -- --root "$HOME/.local/share/my-agent-memory" --project /absolute
 
 安装器生成三套连接配置：`config.json` 默认只读（可全库搜索）、`project.config.json` 仅目标项目读写、`admin.config.json` 全局管理及核验。对应的[只读](examples/configs/read-only.json)、[项目读写](examples/configs/project-rw.json)、[管理员](examples/configs/admin.json)示例可供检查。默认只给日常 Agent 只读配置；写配置由操作者显式选择，服务端按操作与项目范围拒绝越权。
 
+**Agent 能读取但不能记录？** 先检查客户端实际列出的工具。如果只有 `memory_recall`，说明连接为只读；`AGENTS.md` 的引导词不会授予写权限。需要保存记忆时，由操作者明确选择项目读写配置，或在保持原有项目范围的专用配置中授权 `operations: ["recall", "propose", "commit"]`，再重新连接 MCP。无需管理员配置。写工具可用后，Agent 仍须取得具体记忆的保存授权，不能因任务结束自动写入；新增使用 `expected_revision=0`，更新先读取当前 Revision。只读连接仍保持只读。
+
 在 `client-configs/read-only/`、`client-configs/project-rw/`、`client-configs/admin/` 生成对应客户端模板；使用其中已填好的 Node、server 和 config 绝对路径，按客户端格式接入。通用定义如下，也可参考 [示例配置](examples/mcp.json)：
 
 ```json
@@ -213,3 +215,11 @@ Focused reranks bounded hit chunks using query intent and local evidence. State 
 冻结的180个查询累计返回 ID 和顺序完全一致。10,000条规模的 Focused 平均 Chunk 读取从33.5降到28.55；普通查询完整正文读取仍为0。三轮并发实验部分指标改善，但10,000次持续查询的p95基本持平，整体RSS没有稳定下降，不承诺所有负载更快。
 
 详见[性能剖析、质量门槛、内存与回滚报告](docs/performance-v042-results.md)。新增阶段诊断仅在 debug 下返回；常规 Agent 响应仍保持简洁。
+
+## v0.4.3 真实调用审计与检索修复
+
+修复来源分类标签被当成主题证据、普通查询仅凭年份提升无关记录，以及默认语义查询强行补出弱结果的问题。保留显式标识符查询、词法降级、中文语义改写与 Broad 持续分页；调整排序后旧游标会要求重新检索。普通响应不再为不存在的诊断字段预留大块字节空间。
+
+预算通常省略即可。`max_bytes` 至少为 2048；长来源信息可能连同最短正文也放不下。遇到 `item_exceeds_budget` 时，用返回的游标和更大的 `max_bytes`（例如 8000）续取，或针对选中的真实 ID 显式展开。空结果不能用来推断整段历史不存在。
+
+详见[审计方法、回归数据、升级与回滚](docs/retrieval-v043.md)。真实调用和个人记忆明细只保存在本机，不随公开仓库发布。

@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, realpathSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { hash, MemoryError, type Config } from '../core/contracts.js';
-export const RANKING_VERSION = 'adaptive-v041';
+export const RANKING_VERSION = 'adaptive-v043';
 export function authority(config: Config, db: DatabaseSync) {
     return hash({ ranking: RANKING_VERSION, database: realpathSync(config.database), connection: config.connection_id, projects: [...config.allowed_projects].sort(), all: config.all_projects, global: config.allow_global, operations: [...config.operations].sort(), semantic: config.semantic_threshold, evidence: config.evidence_threshold, model: config.model_dir, dtype: config.dtype, registry: db.prepare('SELECT id FROM projects ORDER BY id').all() });
 }
