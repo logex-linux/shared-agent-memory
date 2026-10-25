@@ -10,6 +10,14 @@ following an AGENTS.md prompt; an operator must explicitly select a writer confi
 `recall/propose/commit` suffices for creating and updating unverified memories;
 `manage`, `verify` and `forget` are separate capabilities.
 
+A later write trace revealed a second failure: a writer requested
+`verification.status=verified`, which correctly requires `verify`. User confirmation
+is a provenance basis, not that permission. The follow-up preserves
+`OPERATION_DENIED` and adds `required_operation`/`hint` to MCP errors and CLI JSON
+(CLI keeps its existing string `error`). Tool/schema descriptions and both README
+Agent snippets show `basis=user_confirmation` with `status=unverified` for ordinary
+authorized storage. The server never rewrites a denied request or grants privileges.
+
 ## Findings and changes
 
 1. **Source labels could masquerade as topics.** Imported records often share tags
@@ -94,9 +102,14 @@ Those case judgments are an agent's source review, not independent human labels.
 
 ## Verification and measurements
 
-`npm test`: 62/62 pass, including six new audit/permission/budget regressions plus
+`npm test`: 63/63 pass, including seven new audit/permission/budget regressions plus
 existing multi-process writes, revision conflicts, schema migration, source offsets,
-revocations, model degradation, cursor concurrency and SIGKILL recovery.
+revocations, model degradation, cursor concurrency and SIGKILL recovery. The writer
+test commits/reads user-confirmed unverified data, rejects verified data with the
+specific permission hint, and checks the exposed tool/schema guidance. CLI tests
+distinguish propose/verify denials and prove neither persists a candidate or receipt.
+The hint follow-up changes no ranking code; the quality/performance results below
+measure the retrieval patch.
 
 The 100/1,000/10,000 scale comparison uses the same 20 queries × three repetitions,
 matched `limit=5` requests and disposable BGE snapshots. Recall@5 stays 1.0 in all

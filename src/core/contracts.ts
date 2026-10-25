@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { createHash } from 'node:crypto';
 
 export class MemoryError extends Error {
-  constructor(public code: string, message = code) { super(message); }
+  constructor(public code: string, message = code, public details?: {required_operation:string;hint:string}) { super(message); }
 }
 export const hash = (value: unknown) => createHash('sha256').update(typeof value === 'string' || value instanceof Uint8Array ? value : stable(value)).digest('hex');
 export function stable(value: unknown): string {
@@ -22,8 +22,8 @@ export const validSchema = z.object({
 }).strict();
 export const verificationSchema = z.object({
   method:text(300),summary:text(1000),
-  status:z.enum(['unverified','verified','disputed']).default('unverified'),
-  basis:z.enum(['source_claim','model_inference','user_confirmation','code_review','document_review']).default('source_claim'),
+  status:z.enum(['unverified','verified','disputed']).default('unverified').describe('Use unverified for ordinary storage. verified requires the connection to have separate verify permission and review evidence; explicit user confirmation alone does not grant it.'),
+  basis:z.enum(['source_claim','model_inference','user_confirmation','code_review','document_review']).default('source_claim').describe('Provenance basis, independent of verification status. user_confirmation may be stored with status=unverified.'),
   evidence:text(2000).optional(),reviewer:text(256).optional(),reviewed_at:z.string().datetime().optional()
 }).strict();
 export const recordSchema = z.object({

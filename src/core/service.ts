@@ -31,7 +31,12 @@ export class MemoryService {
   get db(){return this.storage.db;}
   close(){QueryState.dispose(this.db);this.storage.close();}
   private permission(operation:Config['operations'][number]) {
-    if(!this.config.operations.includes(operation)) throw new MemoryError('OPERATION_DENIED');
+    if(!this.config.operations.includes(operation)) throw new MemoryError('OPERATION_DENIED','OPERATION_DENIED',{
+      required_operation:operation,
+      hint:operation==='verify'
+        ? 'verification.status=verified requires separate verify permission. For ordinary user-authorized storage, basis=user_confirmation can accompany status=unverified. Do not silently change verification intent or elevate permissions.'
+        : `This connection does not allow ${operation}. An operator must explicitly authorize the operation in its configuration; prompts and author_client do not grant permissions.`
+    });
   }
   private scope(project:string|null,scope:string) {
     if(scope==='global') { if(!this.config.allow_global || project!==null) throw new MemoryError('SCOPE_DENIED'); }

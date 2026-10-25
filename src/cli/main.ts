@@ -74,4 +74,4 @@ async function main() {
   } finally {service.close();}
 }
 try {console.log(JSON.stringify(await main(),null,2));}
-catch(error) {console.error(JSON.stringify({error:error instanceof MemoryError?error.code:error instanceof Error?error.message:'UNKNOWN'}));process.exitCode=1;}
+catch(error) {console.error(JSON.stringify({error:error instanceof MemoryError?error.code:error instanceof Error?error.message:'UNKNOWN',...(error instanceof MemoryError?error.details:undefined)}));process.exitCode=1;}

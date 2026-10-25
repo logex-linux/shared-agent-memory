@@ -2,6 +2,7 @@ import test from 'node:test';import assert from 'node:assert/strict';
 import {setup,record,publish} from './helpers.mjs';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
 import {randomUUID} from 'node:crypto';import {writeFile} from 'node:fs/promises';import {resolve} from 'node:path';
+import {spawnSync} from 'node:child_process';
 const vector=(cos=1)=>{const v=new Float32Array(512);v[0]=cos;v[1]=Math.sqrt(1-cos*cos);return v;};
 const encoder={profile:async()=>({id:'audit-vector',manifest:{synthetic:true}}),query:async()=>vector(),chunks:async(title,text)=>[{text,start:0,end:text.length,tokens:text.length,vector:vector(title.startsWith('共享')?.72:.52)}]};
 const collect=async(s,input)=>{const pages=[];do{const r=await s.recall(input);pages.push(r);if(!r.has_more)break;input={cursor:r.next_cursor};}while(true);return pages;};
@@ -55,7 +56,19 @@ test('an explicitly selected writer exposes propose/commit without administrator
  const call=async(name,args)=>{const r=await c.callTool({name,arguments:args});assert.ok(!r.isError,JSON.stringify(r));return JSON.parse(r.content[0].text);};
  try{
   assert.deepEqual((await c.listTools()).tools.map(t=>t.name).sort(),['memory_commit','memory_propose','memory_recall']);
-  const p=await call('memory_propose',{request_id:randomUUID(),record:record(project)});const m=await call('memory_commit',{request_id:randomUUID(),proposal_id:p.proposal_id,expected_revision:0});assert.equal((await call('memory_recall',{ids:[m.memory_id]})).items[0].written_by,'test:explicit-writer');
-  const bad=await c.callTool({name:'memory_propose',arguments:{request_id:randomUUID(),record:record(project,{verification:{method:'self-claim',summary:'Cannot certify facts',status:'verified'}})}});assert.equal(bad.isError,true);assert.equal(JSON.parse(bad.content[0].text).error.code,'OPERATION_DENIED');
+  const p=await call('memory_propose',{request_id:randomUUID(),record:record(project,{verification:{method:'explicit user instruction',summary:'Synthetic user confirmation',basis:'user_confirmation',status:'unverified'}})});const m=await call('memory_commit',{request_id:randomUUID(),proposal_id:p.proposal_id,expected_revision:0});const saved=(await call('memory_recall',{ids:[m.memory_id]})).items[0];assert.equal(saved.written_by,'test:explicit-writer');assert.equal(saved.verification.status,'unverified');assert.equal(saved.verification.basis,'user_confirmation');
+  const bad=await c.callTool({name:'memory_propose',arguments:{request_id:randomUUID(),record:record(project,{verification:{method:'user confirmation',summary:'Cannot certify facts',basis:'user_confirmation',status:'verified'}})}});assert.equal(bad.isError,true);const denied=JSON.parse(bad.content[0].text).error;assert.equal(denied.code,'OPERATION_DENIED');assert.equal(denied.retryable,false);assert.equal(denied.required_operation,'verify');assert.match(denied.hint,/status=unverified/);
+  const tools=(await c.listTools()).tools;assert.match(tools.find(t=>t.name==='memory_propose').description,/user_confirmation/);assert.match(tools.find(t=>t.name==='memory_propose').inputSchema.properties.record.properties.verification.properties.status.description,/separate verify permission/);
  }finally{await c.close();}
+});
+test('CLI distinguishes missing write permission from missing verification without persisting denied candidates',async()=>{
+ const {service:s,config,project,root}=await setup();const input=root+'/input.json',path=root+'/client.json';
+ const call=async(operations,verification)=>{await writeFile(path,JSON.stringify({...config,operations}));await writeFile(input,JSON.stringify({request_id:randomUUID(),record:record(project,{verification})}));const result=spawnSync(process.execPath,[resolve('dist/cli/main.js'),'propose','--config',path,'--input',input],{encoding:'utf8'});return {exit:result.status,value:JSON.parse(result.status===0?result.stdout:result.stderr.trim().split('\n').find(line=>line.startsWith('{')))};};
+ const counts=()=>['proposals','events'].map(table=>s.db.prepare(`SELECT count(*) n FROM ${table}`).get().n);
+ try{
+  const before=counts(),unverified={method:'synthetic user instruction',summary:'Not privileged verification',basis:'user_confirmation',status:'unverified'};
+  const readonly=await call(['recall'],unverified);assert.equal(readonly.exit,1);assert.equal(readonly.value.error,'OPERATION_DENIED');assert.equal(readonly.value.required_operation,'propose');assert.deepEqual(counts(),before);
+  const denied=await call(['recall','propose','commit'],{...unverified,status:'verified'});assert.equal(denied.exit,1);assert.equal(denied.value.error,'OPERATION_DENIED');assert.equal(denied.value.required_operation,'verify');assert.match(denied.value.hint,/user_confirmation/);assert.deepEqual(counts(),before);
+  const allowed=await call(['recall','propose','commit'],unverified);assert.equal(allowed.exit,0);assert.ok(allowed.value.proposal_id);assert.deepEqual(counts(),before.map(n=>n+1));
+ }finally{s.close();}
 });

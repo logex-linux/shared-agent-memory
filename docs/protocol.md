@@ -86,6 +86,20 @@ propose 返回 `proposal_id` 与 `expected_revision`，随后 commit：
 
 verified要求服务端配置包含verify能力，basis必须为用户确认或代码/文档审阅，并提供evidence。reviewer和reviewed_at由服务端覆盖生成；调用者不能通过author_client或伪造reviewer冒充管理员。unverified会清除伪造核验身份，disputed允许保存反证。verified代表指定审阅者的可追溯核验记录，不是通用自动事实证明。导入内容重新作为unverified处理。
 
+用户明确要求保存偏好时，普通 writer 可以提交以下核验字段。`basis` 描述来源依据，`status` 描述特权核验状态，两者不相互推导：
+
+```json
+{"method":"explicit user instruction","summary":"User explicitly requested this preference be saved.","basis":"user_confirmation","status":"unverified"}
+```
+
+将该例的 status 改为 verified，会在不具备 verify 权限的连接上失败，且不会保存候选。MCP 保持原错误码并增加可选诊断字段：
+
+```json
+{"error":{"code":"OPERATION_DENIED","retryable":false,"required_operation":"verify","hint":"verification.status=verified requires separate verify permission. For ordinary user-authorized storage, basis=user_confirmation can accompany status=unverified. Do not silently change verification intent or elevate permissions."}}
+```
+
+CLI 保留原有字符串 `error: "OPERATION_DENIED"` 和非零退出码，附加顶层 `required_operation`、`hint`。缺少 propose 或 commit 权限时，required_operation 为相应操作，不会误报成 verify。服务端不自动修改核验字段；若调用者确实要求特权核验，需要操作者处理，不能自行切换管理员配置。对于普通保存，应按真实保存意图构造新请求。
+
 数据库schema4为正文写入、候选与事件记录连接配置身份；旧写入保留legacy:unknown。readConfig对没有显式connection_id的旧配置使用真实配置路径摘要。written_by与自报author_client独立，record_updated_at只是记录写入时间，不表示事实核验时间。
 
 ## 编辑、依赖和重试
