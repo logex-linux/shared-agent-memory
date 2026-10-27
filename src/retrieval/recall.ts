@@ -1,7 +1,7 @@
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import { MemoryError, verificationSchema, hash, type Config, type Encoder, type RecallInput } from '../core/contracts.js';
 import { identifiers, ftsQuery, terms } from './lexical.js';
-import { answerIntent, factState, focusTerms, evidenceWindow, type FactState } from './evidence.js';
+import { answerIntent, factState, focusTerms, evidenceWindow, referenceEvidence, type FactState } from './evidence.js';
 import { prepared } from '../storage/statements.js';
 import { RetrievalProfile } from './profile.js';
 import { QueryState, authority } from './state.js';
@@ -35,7 +35,7 @@ type Candidate = {
     requiresCheck: boolean;
     base: number;
     admitted: boolean;
-    answer?: { state: FactState; coverage: number; alignment: number; checked: string; salient?: boolean; subjectMatches?: number };
+    answer?: { state: FactState; coverage: number; alignment: number; checked: string; salient?: boolean; subjectMatches?: number; referenceBackground?: boolean };
 };
 const blob = (v: Float32Array) => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
 // These describe the request, rather than its subject; they must not dominate IDF anchors.
@@ -192,7 +192,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
             return {rows:ids.map(id=>chunkCache.get(id)).filter(Boolean).sort((a,b)=>a.start-b.start),read};
         };
-        const queryTerms=input.query?focusTerms(input.query):[], termWeights=new Map<string,number>();
+        const queryTerms=input.query?focusTerms(input.query):[], termWeights=new Map<string,number>(),references=resolved==='focused'?referenceEvidence(input.query??''):undefined;
         const queryIdentifiers=identifiers(input.query??'').filter(id=>input.exact_only||!/^20\d{2}$/.test(id)||queryTerms.length===1);
         if(resolved==='focused'&&input.query) {
             db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS temp.recall_vocab USING fts5vocab(main,chunk_fts,'row')");
@@ -217,7 +217,11 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             const salient=queryTerms.filter(t=>t.length>=2&&!salienceScaffolding.has(t)&&termWeights.has(t)).sort((a,b)=>termWeights.get(b)!-termWeights.get(a)!);
             const salientWeight=salient.length?termWeights.get(salient[0])!:Infinity;
             const salientMatches=salient.filter(t=>termWeights.get(t)!>=salientWeight*.85&&words.has(t)).length;
-            c.answer={state,coverage,alignment,checked:signature,salient:salientMatches>0,subjectMatches:salient.filter(t=>words.has(t)).length};
+            const refs=references!(text,words);
+            // Preserve semantic paraphrases and accessible cross-project context. A partial
+            // generic filename alone cannot support the rest of a specific reference query.
+            const referenceBackground=refs.count>0&&refs.coverage<.5&&!(refs.subjectCoverage>=.6&&salientMatches>0);
+            c.answer={state,coverage,alignment,checked:signature,salient:salientMatches>0,subjectMatches:salient.filter(t=>words.has(t)).length,referenceBackground};
             if(profileTrace){profileTrace.current=previousStage!;profileTrace.add('ranking',performance.now()-rankingStarted);}
         };
         const persist = () => { for (const c of candidates.values()) {
@@ -401,6 +405,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
             else if (anchors.length)
                 pool = [...anchors, ...pool.filter(c => !anchors.some(a => a.id === c.id))];
+            if(resolved==='focused')pool.sort((a,b)=>Number(Boolean(a.answer?.referenceBackground))-Number(Boolean(b.answer?.referenceBackground)));
             selected = pool.map(c => c.id);
             if (resolved === 'focused' && !(request.limit ?? input.limit) && pool.length > 1) {
                 const a = pool[0], b = pool[1], gap = a.base > 0 ? (a.base - b.base) / a.base : 0;
@@ -463,9 +468,11 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 }
                 excerpts.splice(1);
             }
-            const strength = request.ids || c && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold) ? 'supported' : 'weak';
+            const referenceBackground=resolved==='focused'&&Boolean(c?.answer?.referenceBackground);
+            const strength = request.ids || c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold) ? 'supported' : 'weak';
             const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: flags.get(id) ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? ['id'] };
             if (c?.answer) item.answer_relevance={state:c.answer.state,assessment:'local_claim_heuristic',intent:answerIntent(input.query??'')};
+            if(referenceBackground){item.recall_reason=[...item.recall_reason,'background_only'];if(!result.warnings.includes('REFERENCE_EVIDENCE_MISSING'))result.warnings.push('REFERENCE_EVIDENCE_MISSING');}
             if (options.view==='evidence'&&!request.ids) item.snippet_selection=snippetSelection;
             if (request.ids)
                 Object.assign(item, { written_by: row.written_by, content_hash: row.content_hash, embedding_profile_id: row.profile_id, derived_from: body.derived_from, author_client: body.author_client, author_session: body.author_session, import_key: body.import_key, relevance: c ? { rrf: c.rrf, cosine: c.cosine, identifier_matches: c.exact } : undefined });

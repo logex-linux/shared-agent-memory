@@ -130,6 +130,10 @@ SQLite schema 5 使用 WAL、Chunk FTS5 与 sqlite-vec cosine KNN。从 schema4 
 
 常见错误码：`INVALID_INPUT`、`SCOPE_DENIED`、`PROJECT_UNKNOWN`、`OPERATION_DENIED`、`QUERY_TOO_LONG`、`VERSION_CONFLICT`、`REQUEST_ID_REUSED`、`DEPENDENCY_STALE`、`DEPENDENCY_CYCLE`、`EMBEDDING_UNAVAILABLE`、`INDEX_PROFILE_MISMATCH`、`REVOKED_IMPORT`、`BUSY_RETRYABLE`。维护与恢复见 [operations.md](operations.md)。
 
+0.4.4 的 MCP `INVALID_INPUT` 保留原错误码，`fields[]` 增加实际约束的 `message`。例如同时提交 query 和 cursor，会提示 `exactly one of query, ids or cursor required`。续页只传 `{"cursor":"返回的 next_cursor"}`，不重复 query 或 ids。新增 propose 省略 target_id 和 expected_revision，随后 commit 才使用 expected_revision=0；request_id 必须为 UUID，checked_at 必须为实际 ISO UTC 时间，max_bytes 至少为2048。
+
+Focused 中的 `recall_reason` 可包含 `background_only`，表示命中片段没有充分支持查询中的具体引用，只能作为背景。此条目的 evidence_strength 为 weak；任一条目有此标记时，响应 warnings 包含 `REFERENCE_EVIDENCE_MISSING`。同页其他条目仍可提供相关证据。该启发式不等于事实核验、不改变读取权限，也不禁止按 ID 展开。详见 [0.4.4 质量报告](retrieval-v044.md)。
+
 
 ## 0.4.0 片段与诊断
 

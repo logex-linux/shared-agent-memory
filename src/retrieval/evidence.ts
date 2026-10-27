@@ -1,6 +1,6 @@
 import { identifiers, terms } from './lexical.js';
 // Query scaffolding is not subject evidence. Broad uses its existing lexical channel.
-const scaffolding = new Set(terms('上次 最终 采用 修复 复核 办法 之前 过去 为什么 修改 处理 当前 正式 环境 记录 方案 解决 当时 执行 实施 建议 提案 否决 实际 查找 查 找 怎样 应 当 已经 什么 哪些 能够 验证 结果 原因 什么办法 adopted implemented proposed rejected solution previously final fix review'));
+const scaffolding = new Set(terms('上次 最终 采用 修复 复核 办法 之前 过去 为什么 修改 处理 当前 正式 环境 记录 方案 解决 当时 执行 实施 建议 提案 否决 实际 查找 查 找 怎样 应 当 已经 什么 哪些 能够 验证 结果 原因 什么办法 adopted implemented proposed rejected solution previously final fix review a an the and or but of to for from in on at by with as is are was were be been being have has had do does did this that these those it its i we you they their our my your which what how why when where who should would could can must may will not no if then than also into about through during before after including exactly explicitly said made current previous user'));
 export const focusTerms = (query: string) => terms(query).filter(t => !scaffolding.has(t));
 export type FactState = 'implemented'|'proposed'|'rejected'|'disputed'|'superseded'|'unknown';
 export function answerIntent(query: string) {
@@ -28,8 +28,17 @@ export function factState(text: string, basis: string, disputed = false): FactSt
 // Identifier windows use the same token boundaries as exact identifier scoring.
 function identifierAt(text:string,id:string) {
     const escaped=id.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-    const m=new RegExp('(^|[^\\p{L}\\p{N}_./@-])'+escaped+'(?=$|[^\\p{L}\\p{N}_./@-])','iu').exec(text);
+    const m=new RegExp('(^|[^\\p{L}\\p{N}_./@-])'+escaped+'(?=$|[^\\p{L}\\p{N}_./@-]|\\.(?=\\s|$))','iu').exec(text);
     return m?m.index+m[1].length:-1;
+}
+// References constrain what a hit can support, not what the semantic channel may find.
+// Calendar dates are context; numeric error codes and named code/path references remain evidence.
+export function referenceEvidence(query:string) {
+    const refs=[...new Set([...identifiers(query),...(query.match(/[\p{L}\p{N}]+(?:[_-][\p{L}\p{N}]+)+|\b[A-Z]{2,}\d{2,}\b/gu)??[]).map(x=>x.toLowerCase())])]
+        .filter(x=>!/^20\d{2}(?:\d{4}|[-_]\d{1,2}[-_]\d{1,2})?$/.test(x));
+    const referenceTerms=new Set(refs.flatMap(terms)),subject=focusTerms(query).filter(t=>!referenceTerms.has(t));
+    const patterns=refs.map(id=>new RegExp('(^|[^\\p{L}\\p{N}_./@-]'+(id.includes('/')?'|/':'')+')'+id.replace(/^\//,'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'(?=$|[^\\p{L}\\p{N}_./@-]|\\.(?=\\s|$))','iu'));
+    return (text:string,words=new Set(terms(text)))=>({count:refs.length,coverage:refs.length?patterns.filter(re=>re.test(text)).length/refs.length:1,subjectCoverage:subject.length?subject.filter(t=>words.has(t)).length/subject.length:0});
 }
 // Whole original sentence/line when possible. Long code lines use contiguous windows.
 // Offsets are JS UTF-16 offsets, the same units used by the chunker.

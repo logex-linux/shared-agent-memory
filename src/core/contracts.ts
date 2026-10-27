@@ -14,7 +14,7 @@ const text = (max: number) => z.string().trim().min(1).max(max);
 export const sourceSchema = z.object({
   source_type: z.enum(['user', 'code', 'document', 'web', 'test']),
   uri: text(2048), locator: text(500), revision_ref: text(256),
-  checked_at: z.string().datetime(), source_hash: z.string().regex(/^[a-f0-9]{64}$/).optional()
+  checked_at: z.string().datetime().describe('Actual source-check time as an ISO 8601 UTC datetime, for example 2026-01-01T00:00:00.000Z; never use placeholder text.'), source_hash: z.string().regex(/^[a-f0-9]{64}$/).optional()
 }).strict();
 export const validSchema = z.object({
   branch: text(256).optional(), commit: text(128).optional(), environment: text(256).optional(),
@@ -40,9 +40,9 @@ export const recordSchema = z.object({
   if ((r.scope === 'global') !== (r.project_id === null)) ctx.addIssue({code:'custom', message:'global requires null project_id; project requires UUID'});
 });
 export type MemoryRecord = z.infer<typeof recordSchema>;
-const request = z.string().uuid();
+const request = z.string().uuid().describe('A real UUID for this logical request. Reuse it only when retrying identical input, never send a placeholder.');
 export const proposeSchema = z.object({ request_id: request, record: recordSchema,
-  target_id: z.string().uuid().optional(), expected_revision: z.number().int().positive().optional()
+  target_id: z.string().uuid().optional(), expected_revision: z.number().int().positive().optional().describe('Updates only: current positive revision, together with target_id. For a new proposal omit both fields; revision 0 belongs to memory_commit.')
 }).strict().superRefine((r,ctx) => {
   if (Boolean(r.target_id) !== Boolean(r.expected_revision)) ctx.addIssue({code:'custom', message:'target_id and expected_revision required together'});
 });
