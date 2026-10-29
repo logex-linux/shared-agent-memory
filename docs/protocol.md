@@ -106,7 +106,7 @@ CLI 保留原有字符串 `error: "OPERATION_DENIED"` 和非零退出码，附�
 
 编辑时先 recall 当前记录，再在 propose 顶层增加 `target_id` 和当前 `expected_revision`。记录 ID 保持不变，commit 后版本递增；冲突返回 `VERSION_CONFLICT`，需要重新读取。更新时省略 tags、valid_for、derived_from、import_key 会保留旧值；前三项可用显式空数组/对象清空。
 
-同 request_id、同参数的写请求重试返回相同逻辑结果；同 ID 换参数会被拒绝。不同的逻辑请求使用不同 UUID。依赖记录保存父记忆的 ID 和版本，父来源更新或遗忘时递归失效，不允许循环依赖。
+同 request_id、同参数的写请求重试返回相同逻辑结果；同 ID 换参数会被拒绝。不同的逻辑请求使用不同 UUID；propose 与随后的 commit 也是两个操作，必须分别生成 UUID。依赖记录保存父记忆的 ID 和版本，父来源更新或遗忘时递归失效，不允许循环依赖。
 
 ## 遗忘
 
@@ -133,6 +133,8 @@ SQLite schema 5 使用 WAL、Chunk FTS5 与 sqlite-vec cosine KNN。从 schema4 
 0.4.4 的 MCP `INVALID_INPUT` 保留原错误码，`fields[]` 增加实际约束的 `message`。例如同时提交 query 和 cursor，会提示 `exactly one of query, ids or cursor required`。续页只传 `{"cursor":"返回的 next_cursor"}`，不重复 query 或 ids。新增 propose 省略 target_id 和 expected_revision，随后 commit 才使用 expected_revision=0；request_id 必须为 UUID，checked_at 必须为实际 ISO UTC 时间，max_bytes 至少为2048。
 
 Focused 中的 `recall_reason` 可包含 `background_only`，表示命中片段没有充分支持查询中的具体引用，只能作为背景。此条目的 evidence_strength 为 weak；任一条目有此标记时，响应 warnings 包含 `REFERENCE_EVIDENCE_MISSING`。同页其他条目仍可提供相关证据。该启发式不等于事实核验、不改变读取权限，也不禁止按 ID 展开。详见 [0.4.4 质量报告](retrieval-v044.md)。
+
+0.4.5 将短缩写及紧邻中文的代码引用纳入同一判断。Focused 在事实状态意图未知、存在高覆盖直接命中且缺适用性上下文时，可优先返回该证据，仍标记 `requires_check`；提供不匹配的 context 后照常过滤。不要把高相关度解读为当前适用，按来源核对缺失条件。工具名称、参数、权限和 Schema 5 不变；旧排序游标需以原 query 重新开始。详见 [0.4.5 报告](retrieval-v045.md)。
 
 
 ## 0.4.0 片段与诊断

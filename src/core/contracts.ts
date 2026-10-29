@@ -40,7 +40,7 @@ export const recordSchema = z.object({
   if ((r.scope === 'global') !== (r.project_id === null)) ctx.addIssue({code:'custom', message:'global requires null project_id; project requires UUID'});
 });
 export type MemoryRecord = z.infer<typeof recordSchema>;
-const request = z.string().uuid().describe('A real UUID for this logical request. Reuse it only when retrying identical input, never send a placeholder.');
+const request = z.string().uuid().describe('A fresh real UUID per tool operation; propose and commit need different UUIDs. Reuse only for an identical retry of the same operation, never send a placeholder.');
 export const proposeSchema = z.object({ request_id: request, record: recordSchema,
   target_id: z.string().uuid().optional(), expected_revision: z.number().int().positive().optional().describe('Updates only: current positive revision, together with target_id. For a new proposal omit both fields; revision 0 belongs to memory_commit.')
 }).strict().superRefine((r,ctx) => {

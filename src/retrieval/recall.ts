@@ -51,6 +51,9 @@ function eligibility(input: RecallInput, config: Config) {
     return { sql, params };
 }
 const broadIntent = (q: string) => /(长期|稳定.*偏好|偏好|习惯|倾向|审美|归纳|总结|跨项目|多年来|反复.*选择|preferences?|patterns?|career|across.*projects)/i.test(q);
+// A direct reference with substantial local coverage outranks current but weak
+// background. Missing applicability context is still returned as requires_check.
+const directEvidence = (c: Candidate | undefined) => Boolean(c && c.exact>0 && !c.answer?.referenceBackground && Math.max(c.coverage,c.answer?.coverage??0)>=.6);
 function assess(c: Candidate, config: Config, broad: boolean, progress: any) {
     const semantic = (c.cosine ?? 0) >= config.semantic_threshold, strong = (c.cosine ?? 0) >= config.evidence_threshold;
     const core = c.exact > 0 || c.coverage >= .6 || semantic && (c.coverage >= .2 || strong);
@@ -362,7 +365,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             d.cache_replay = true;
         }
         traceBudget=options.max_bytes;
-        let pool: Candidate[] = [], selected: string[] = [];
+        let pool: Candidate[] = [], selected: string[] = [], contextPriority=false;
         if (request.ids)
             selected = request.ids;
         else if (savedPage) {
@@ -405,7 +408,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
             else if (anchors.length)
                 pool = [...anchors, ...pool.filter(c => !anchors.some(a => a.id === c.id))];
-            if(resolved==='focused')pool.sort((a,b)=>Number(Boolean(a.answer?.referenceBackground))-Number(Boolean(b.answer?.referenceBackground)));
+            // Do not override fact-state ranking or reorder ordinary current evidence.
+            contextPriority=resolved==='focused'&&answerIntent(input.query??'')==='unknown'&&pool.some(c=>c.requiresCheck&&directEvidence(c));
+            if(resolved==='focused')pool.sort((a,b)=>(contextPriority?Number(directEvidence(b))-Number(directEvidence(a)):0)||Number(Boolean(a.answer?.referenceBackground))-Number(Boolean(b.answer?.referenceBackground)));
             selected = pool.map(c => c.id);
             if (resolved === 'focused' && !(request.limit ?? input.limit) && pool.length > 1) {
                 const a = pool[0], b = pool[1], gap = a.base > 0 ? (a.base - b.base) / a.base : 0;
@@ -421,8 +426,10 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 if (!flags.has(id))
                     state.db.prepare('DELETE FROM candidates WHERE q=? AND id=?').run(q, id);
         selected = selected.filter(id => flags.has(id));
-        if (!savedPage)
-            selected.sort((a, b) => Number(flags.get(a)) - Number(flags.get(b)));
+        if (!savedPage) {
+            const ranked=contextPriority?new Map(pool.map(c=>[c.id,c])):null;
+            selected.sort((a, b) => (ranked ? Number(directEvidence(ranked.get(b)))-Number(directEvidence(ranked.get(a))) : 0) || Number(flags.get(a)) - Number(flags.get(b)));
+        }
         d.candidate_ids = state ? Number((state.db.prepare('SELECT count(*) n FROM candidates WHERE q=?').get(q) as any).n) : selected.length;
         d.candidates_ranked = selected.length;
         const plan: any = savedPage ? parse(savedPage.plan) : { mode: request.ids ? 'ids' : resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };

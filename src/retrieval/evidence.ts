@@ -25,25 +25,31 @@ export function factState(text: string, basis: string, disputed = false): FactSt
     if (proposed) return 'proposed';
     return 'unknown';
 }
-// Identifier windows use the same token boundaries as exact identifier scoring.
+// Han prose may touch an ASCII reference; identifier extensions still cannot match.
+function referencePattern(id:string,pathSuffix=false) {
+    const value=pathSuffix?id.replace(/^\//,''):id;
+    const left='(^|[^\\p{L}\\p{N}_./@-]'+(/^\p{Script=Han}/u.test(value)?'':'|\\p{Script=Han}')+(pathSuffix&&id.includes('/')?'|/':'')+')';
+    const right='(?=$|[^\\p{L}\\p{N}_./@-]'+(/\p{Script=Han}$/u.test(value)?'':'|\\p{Script=Han}')+'|\\.(?=\\s|$))';
+    return new RegExp(left+value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+right,'iu');
+}
 function identifierAt(text:string,id:string) {
-    const escaped=id.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-    const m=new RegExp('(^|[^\\p{L}\\p{N}_./@-])'+escaped+'(?=$|[^\\p{L}\\p{N}_./@-]|\\.(?=\\s|$))','iu').exec(text);
+    const m=referencePattern(id).exec(text);
     return m?m.index+m[1].length:-1;
 }
+const namedReferences=(query:string)=>[...new Set([...identifiers(query),...(query.match(/[\p{L}\p{N}]+(?:[_-][\p{L}\p{N}]+)+|\b[A-Z]{2,}\d*\b/gu)??[]).map(x=>x.toLowerCase())])];
 // References constrain what a hit can support, not what the semantic channel may find.
 // Calendar dates are context; numeric error codes and named code/path references remain evidence.
 export function referenceEvidence(query:string) {
-    const refs=[...new Set([...identifiers(query),...(query.match(/[\p{L}\p{N}]+(?:[_-][\p{L}\p{N}]+)+|\b[A-Z]{2,}\d{2,}\b/gu)??[]).map(x=>x.toLowerCase())])]
+    const refs=namedReferences(query)
         .filter(x=>!/^20\d{2}(?:\d{4}|[-_]\d{1,2}[-_]\d{1,2})?$/.test(x));
     const referenceTerms=new Set(refs.flatMap(terms)),subject=focusTerms(query).filter(t=>!referenceTerms.has(t));
-    const patterns=refs.map(id=>new RegExp('(^|[^\\p{L}\\p{N}_./@-]'+(id.includes('/')?'|/':'')+')'+id.replace(/^\//,'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'(?=$|[^\\p{L}\\p{N}_./@-]|\\.(?=\\s|$))','iu'));
+    const patterns=refs.map(id=>referencePattern(id,true));
     return (text:string,words=new Set(terms(text)))=>({count:refs.length,coverage:refs.length?patterns.filter(re=>re.test(text)).length/refs.length:1,subjectCoverage:subject.length?subject.filter(t=>words.has(t)).length/subject.length:0});
 }
 // Whole original sentence/line when possible. Long code lines use contiguous windows.
 // Offsets are JS UTF-16 offsets, the same units used by the chunker.
 export function evidenceWindow(text: string, query: string, budget = 200) {
-    const ids = identifiers(query), qt = focusTerms(query), lower = text.toLowerCase();
+    const ids = namedReferences(query), qt = focusTerms(query), lower = text.toLowerCase();
     const units: { start:number; end:number; score:number; match:number|null }[] = [];
     const re = /[^。！？.!?\n]+(?:[。！？.!?]+|\n|$)|[\n。！？.!?]+/g;
     for (const m of text.matchAll(re)) {
