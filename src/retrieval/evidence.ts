@@ -44,7 +44,7 @@ export function referenceEvidence(query:string) {
         .filter(x=>!/^20\d{2}(?:\d{4}|[-_]\d{1,2}[-_]\d{1,2})?$/.test(x));
     const referenceTerms=new Set(refs.flatMap(terms)),subject=focusTerms(query).filter(t=>!referenceTerms.has(t));
     const patterns=refs.map(id=>referencePattern(id,true));
-    return (text:string,words=new Set(terms(text)))=>({count:refs.length,coverage:refs.length?patterns.filter(re=>re.test(text)).length/refs.length:1,subjectCoverage:subject.length?subject.filter(t=>words.has(t)).length/subject.length:0});
+    return (text:string,words=new Set(terms(text)))=>({count:refs.length,coverage:refs.length?patterns.filter(re=>re.test(text)).length/refs.length:1,subjectCount:subject.length,subjectCoverage:subject.length?subject.filter(t=>words.has(t)).length/subject.length:0});
 }
 // Whole original sentence/line when possible. Long code lines use contiguous windows.
 // Offsets are JS UTF-16 offsets, the same units used by the chunker.

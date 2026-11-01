@@ -50,10 +50,13 @@ function eligibility(input: RecallInput, config: Config) {
     }
     return { sql, params };
 }
-const broadIntent = (q: string) => /(长期|稳定.*偏好|偏好|习惯|倾向|审美|归纳|总结|跨项目|多年来|反复.*选择|preferences?|patterns?|career|across.*projects)/i.test(q);
-// A direct reference with substantial local coverage outranks current but weak
+const broadIntent = (q: string) => /(长期|稳定.*偏好|归纳|总结|跨项目|多年来|反复.*选择|patterns?|career|across.*projects|long.term|over time|summari)/i.test(q)
+    || /(偏好|习惯|倾向|审美|preferences?)/i.test(q)&&!identifiers(q).some(id=>id.includes('/'));
+// Direct reference or specific, salient semantic evidence can precede weak
 // background. Missing applicability context is still returned as requires_check.
-const directEvidence = (c: Candidate | undefined) => Boolean(c && c.exact>0 && !c.answer?.referenceBackground && Math.max(c.coverage,c.answer?.coverage??0)>=.6);
+const directEvidence = (c: Candidate | undefined, threshold: number) => Boolean(c && !c.answer?.referenceBackground &&
+    (c.exact>0&&Math.max(c.coverage,c.answer?.coverage??0)>=.6
+    || c.specificTopic&&c.answer?.salient&&(c.answer.coverage>=.6)&&(c.cosine??0)>=threshold));
 function assess(c: Candidate, config: Config, broad: boolean, progress: any) {
     const semantic = (c.cosine ?? 0) >= config.semantic_threshold, strong = (c.cosine ?? 0) >= config.evidence_threshold;
     const core = c.exact > 0 || c.coverage >= .6 || semantic && (c.coverage >= .2 || strong);
@@ -223,7 +226,10 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             const refs=references!(text,words);
             // Preserve semantic paraphrases and accessible cross-project context. A partial
             // generic filename alone cannot support the rest of a specific reference query.
-            const referenceBackground=refs.count>0&&refs.coverage<.5&&!(refs.subjectCoverage>=.6&&salientMatches>0);
+            const referenceBackground=refs.count>0&&(refs.coverage<.5&&!(refs.subjectCoverage>=.6&&salientMatches>0)
+                // A ubiquitous provenance path cannot answer the rest of a question.
+                // Retain the neighbor, but require local subject evidence for support.
+                || !c.specificTopic&&refs.subjectCount>=3&&refs.subjectCoverage<.3&&salientMatches===0);
             c.answer={state,coverage,alignment,checked:signature,salient:salientMatches>0,subjectMatches:salient.filter(t=>words.has(t)).length,referenceBackground};
             if(profileTrace){profileTrace.current=previousStage!;profileTrace.add('ranking',performance.now()-rankingStarted);}
         };
@@ -409,8 +415,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             else if (anchors.length)
                 pool = [...anchors, ...pool.filter(c => !anchors.some(a => a.id === c.id))];
             // Do not override fact-state ranking or reorder ordinary current evidence.
-            contextPriority=resolved==='focused'&&answerIntent(input.query??'')==='unknown'&&pool.some(c=>c.requiresCheck&&directEvidence(c));
-            if(resolved==='focused')pool.sort((a,b)=>(contextPriority?Number(directEvidence(b))-Number(directEvidence(a)):0)||Number(Boolean(a.answer?.referenceBackground))-Number(Boolean(b.answer?.referenceBackground)));
+            contextPriority=resolved==='focused'&&answerIntent(input.query??'')==='unknown'&&pool.some(c=>c.requiresCheck&&directEvidence(c,config.evidence_threshold));
+            if(resolved==='focused')pool.sort((a,b)=>(contextPriority?Number(directEvidence(b,config.evidence_threshold))-Number(directEvidence(a,config.evidence_threshold)):0)||Number(Boolean(a.answer?.referenceBackground))-Number(Boolean(b.answer?.referenceBackground)));
             selected = pool.map(c => c.id);
             if (resolved === 'focused' && !(request.limit ?? input.limit) && pool.length > 1) {
                 const a = pool[0], b = pool[1], gap = a.base > 0 ? (a.base - b.base) / a.base : 0;
@@ -428,12 +434,15 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         selected = selected.filter(id => flags.has(id));
         if (!savedPage) {
             const ranked=contextPriority?new Map(pool.map(c=>[c.id,c])):null;
-            selected.sort((a, b) => (ranked ? Number(directEvidence(ranked.get(b)))-Number(directEvidence(ranked.get(a))) : 0) || Number(flags.get(a)) - Number(flags.get(b)));
+            selected.sort((a, b) => (ranked ? Number(directEvidence(ranked.get(b),config.evidence_threshold))-Number(directEvidence(ranked.get(a),config.evidence_threshold)) : 0) || Number(flags.get(a)) - Number(flags.get(b)));
         }
         d.candidate_ids = state ? Number((state.db.prepare('SELECT count(*) n FROM candidates WHERE q=?').get(q) as any).n) : selected.length;
         d.candidates_ranked = selected.length;
         const plan: any = savedPage ? parse(savedPage.plan) : { mode: request.ids ? 'ids' : resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
         const result: any = { items: [], generation: gen, retrieval_mode: retrievalMode, warnings: [...new Set(warnings)], empty_reason: null, evidence_status: 'none', has_more: false, next_cursor: null, retrieval: plan };
+        // Explicit expansion has no query cursor. Account for continuation IDs in
+        // the budget before reading bodies; filtered IDs never enter this list.
+        if(request.ids&&selected.length)result.remaining_ids=[...selected];
         if(profileTrace)profileTrace.add('candidates',Math.max(0,performance.now()-candidateStarted-['knn','fts_identifiers','ranking','candidate_sql'].reduce((n,k)=>n+(profileTrace.times[k]??0),0)));
         const materializeStarted=performance.now();if(profileTrace)profileTrace.current='materialization';
         const fitted: string[] = [], candidateMap = new Map(pool.map(c => [c.id, c]));
@@ -521,6 +530,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 shorten(best);
             }
             fitted.push(id);
+        }
+        if(request.ids){
+            const remaining=selected.filter(id=>!fitted.includes(id));
+            if(remaining.length){result.remaining_ids=remaining;result.warnings.push('PARTIAL_ID_EXPANSION');}
+            else delete result.remaining_ids;
+            plan.stop_reason=blocked?'item_exceeds_budget':remaining.length?'page_budget':'exhausted';
         }
         profileTrace?.add('materialization',performance.now()-materializeStarted);
         const persistStarted=performance.now();

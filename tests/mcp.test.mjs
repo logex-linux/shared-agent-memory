@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { setup,record } from './helpers.mjs';
+import { setup,record,publish } from './helpers.mjs';
 test('official SDK STDIO: schemas, instructions, cross-process updates, restart, forget (not C01)',async()=>{
   const {service:s,root,config,project}=await setup();s.close();const path=root+'/config.json';await writeFile(path,JSON.stringify(config));
   async function connect(name){const client=new Client({name,version:'test'});await client.connect(new StdioClientTransport({command:process.execPath,args:[resolve('dist/mcp/server.js')],env:{SHARED_MEMORY_CONFIG:path},stderr:'pipe'}));return client;}
@@ -35,4 +35,26 @@ test('official SDK exposes adaptive pagination and compact sourced evidence with
   let request={query:'设计偏好',mode:'broad',view:'evidence',limit:9};const ids=[];do{const result=await c.callTool({name:'memory_recall',arguments:request});assert.ok(!result.isError,JSON.stringify(result));const r=JSON.parse(result.content[0].text);assert.equal(r.diagnostics,undefined);assert.ok(r.items.length<=9);assert.ok(r.items.every(i=>i.content.length<=200&&i.sources.length&&i.verification.status==='unverified'));ids.push(...r.items.map(i=>i.id));if(!r.has_more)break;request={cursor:r.next_cursor};}while(true);
   assert.equal(new Set(ids).size,ids.length);assert.deepEqual(new Set(ids),new Set(gold));assert.match(c.getInstructions(),/heuristic/);
  }finally{await c.close();}
+});
+
+test('independent writer identities share revisions but cannot reuse each other\'s cursors',async()=>{
+ const {service:s,root,config,project}=await setup();
+ const saved=[];try{for(let i=0;i<4;i++)saved.push(await publish(s,record(project,{title:'共享授权经验 '+i,content:'稳定代码签名后重新授予屏幕录制权限，保留排错证据。步骤 '+i})));}finally{s.close();}
+ const paths={};for(const identity of ['a','b']){paths[identity]=root+'/'+identity+'.json';await writeFile(paths[identity],JSON.stringify({...config,connection_id:'test:writer:'+identity,operations:['recall','propose','commit']}));}
+ async function connect(identity){const c=new Client({name:'writer-'+identity,version:'test'});await c.connect(new StdioClientTransport({command:process.execPath,args:[resolve('dist/mcp/server.js')],env:{SHARED_MEMORY_CONFIG:paths[identity]},stderr:'pipe'}));return c;}
+ async function call(c,name,input){const r=await c.callTool({name,arguments:input});assert.ok(!r.isError,JSON.stringify(r));return JSON.parse(r.content[0].text);}
+ async function denied(c,input,code){const r=await c.callTool({name:'memory_recall',arguments:input});assert.ok(r.isError);assert.equal(JSON.parse(r.content[0].text).error.code,code);}
+ let a=await connect('a');const b=await connect('b');
+ try{
+  assert.deepEqual((await b.listTools()).tools.map(t=>t.name).sort(),['memory_commit','memory_propose','memory_recall']);
+  const input={query:'稳定代码签名与屏幕录制权限排错经验',mode:'broad',view:'evidence',limit:1};
+  const first=await call(a,'memory_recall',input);assert.ok(first.has_more);
+  const [next,replay]=await Promise.all([call(a,'memory_recall',{cursor:first.next_cursor}),call(a,'memory_recall',{cursor:first.next_cursor})]);assert.deepEqual(next.items,replay.items);assert.ok(next.items.every(i=>!first.items.some(j=>i.id===j.id)));
+  await denied(b,{cursor:first.next_cursor},'CURSOR_SCOPE_CHANGED');
+  await a.close();a=await connect('a');assert.deepEqual((await call(a,'memory_recall',{cursor:first.next_cursor})).items,next.items);
+  const p=await call(b,'memory_propose',{request_id:randomUUID(),target_id:saved[0].memory_id,expected_revision:1,record:record(project,{content:'更新后核对稳定签名，再授予屏幕录制权限。'})});
+  await call(b,'memory_commit',{request_id:randomUUID(),proposal_id:p.proposal_id,expected_revision:1});
+  await denied(a,{cursor:first.next_cursor},'CURSOR_STALE');
+  const updated=await call(a,'memory_recall',{ids:[saved[0].memory_id]});assert.equal(updated.items[0].revision,2);assert.equal(updated.items[0].written_by,'test:writer:b');
+ }finally{await a.close();await b.close();}
 });

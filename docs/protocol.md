@@ -146,3 +146,12 @@ Focused 中的 `recall_reason` 可包含 `background_only`，表示命中片段�
 `diagnostics`提供elapsed_ms、candidate_ids、candidates_ranked、full_body_records_read/full_body_bytes_read、json_parses/metadata_json_parses、chunk_text_rows_read、query_embeddings、vector_queries/vector_rows_returned、response_bytes、estimated_tokens。JSON解析数包含检索与查询缓存的显式解析，不涵盖模型库初始化；基准另用全局JSON.parse观测作交叉验证。普通查询的完整正文读取应为0。
 
 sqlite-vec内部的向量扫描量、距离计算次数没有公开计数接口，`vector_internal_scanned`和`vector_distance_computations`为null。vector_rows_returned只表示KNN返回Node的候选行，不能解释为内部扫描量。候选通道在同一个SQLite读快照内独立检索，SQL按顺序执行，保持一致性；没有伪称同步SQLite调用在多核上并行。
+
+
+## 0.4.6 完整展开与具体主题
+
+按 `ids` 展开受预算或 limit 限制时，仅对已通过权限及适用性过滤、尚未返回的记录提供 `remaining_ids`，并提示 `PARTIAL_ID_EXPANSION`。继续以 `{"ids":[返回的 remaining_ids]}` 请求；需要的项目、global 和 context 过滤也应保留。`has_more` 和 `next_cursor` 只用于 query 分页，不代表 ID 列表已经全部返回。`retrieval.stop_reason` 可为 `page_budget`、`item_exceeds_budget` 或 `exhausted`。不存在、无权限或过期的 ID 不会被枚举。已返回条目若 `truncated=true`，应单独提高预算重读；它不属于 remaining_ids。mandatory source metadata 过大时仍返回 blocked_ids，不会隐去来源。
+
+Auto 对包含具体斜杠路径且只有弱偏好线索的查询优先 Focused；显式 Broad、明确的长期/跨项目综合意图和原有分布启发式仍可扩大范围。公共来源目录命中不能单独支持路径以外的主题。Focused 在事实状态意图未知时，高覆盖、主题明确且具有局部显著词匹配的强语义证据也可优先于弱背景；不更改 requires_check、已知环境冲突过滤、核验状态或采用/否决事实状态排序。规则是相关性启发式，不是事实证明。
+
+`adaptive-v046` 令旧排序游标需要按原 query 重启。工具名称、输入参数、Schema 5、Memory ID/Revision、权限和累计 Broad 分页能力不变。详见 [0.4.6 报告](retrieval-v046.md)。

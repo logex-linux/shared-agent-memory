@@ -74,3 +74,24 @@ test('MCP reports the actual query/cursor constraint without changing the error 
  const c=new Client({name:'cursor-guidance',version:'1'});await c.connect(new StdioClientTransport({command:process.execPath,args:[resolve('dist/mcp/server.js')],env:{SHARED_MEMORY_CONFIG:path},stderr:'pipe'}));
  try{const r=await c.callTool({name:'memory_recall',arguments:{query:'topic',cursor:'am4:invalid:1'}});assert.ok(r.isError);const error=JSON.parse(r.content[0].text).error;assert.equal(error.code,'INVALID_INPUT');assert.ok(error.fields.some(f=>f.message==='exactly one of query, ids or cursor required'));}finally{await c.close();}
 });
+test('auto treats a concrete path as focused unless synthesis is requested; provenance paths alone are background',async()=>{
+ const {service:s,project}=await setup();s.encoder=encoder;
+ try{
+  const old=[];for(let i=0;i<4;i++)old.push((await publish(s,record(project,{title:'Imported work at /workspace/atlas '+i,content:'cwd: /workspace/atlas\nInstalled a local runtime and tested startup.',tags:['historical','raw_memories'],sources:[{source_type:'test',uri:'test://fixtures/raw_memories.md',locator:'synthetic '+i,revision_ref:'1',checked_at:'2025-01-01T00:00:00.000Z'}]}))).memory_id);
+  const saved=await publish(s,record(project,{title:'目录分类决定',content:'/workspace/atlas 的目录结构按用途分类整理，收纳习惯是应用、工具和研究分开保存。'}));
+  const input={query:'/workspace/atlas 目录结构 分类整理 收纳习惯',mode:'auto',view:'evidence',limit:5,debug:true};
+  const r=await s.recall(input);assert.equal(r.retrieval.mode,'focused');assert.equal(r.items[0].id,saved.memory_id);assert.equal(r.diagnostics.full_body_records_read,0);assert.ok(r.items.filter(i=>old.includes(i.id)).every(i=>i.evidence_strength==='weak'&&i.recall_reason.includes('background_only')));
+  const explicit=await s.recall({...input,mode:'broad'});assert.equal(explicit.retrieval.mode,'broad');assert.ok(!explicit.warnings.includes('REFERENCE_EVIDENCE_MISSING'));
+  const synthesis=await s.recall({...input,query:'跨项目总结长期收纳习惯，包括 /workspace/atlas'});assert.equal(synthesis.retrieval.mode,'broad');
+ }finally{s.close();}
+});
+test('specific semantic evidence requiring context can lead without a code identifier',async()=>{
+ const {service:s,project}=await setup();s.encoder=encoder;
+ try{
+  await publish(s,record(project,{title:'旧阅读资料索引',content:'已有其他阅读材料与历史学习计划。'}));
+  const saved=await publish(s,record(project,{title:'全书拆解稿',content:'课程文稿的全书拆解笔记按章节定位，保留来源图版说明，继续阅读时核对当前文件版本。',valid_for:{environment:'local-reading-workspace'}}));
+  const input={query:'课程文稿 全书拆解 笔记 来源图版 章节定位 阅读版本',mode:'focused',view:'evidence',limit:1,debug:true};
+  const r=await s.recall(input);assert.equal(r.items[0].id,saved.memory_id);assert.equal(r.items[0].applicability,'requires_check');assert.equal(r.diagnostics.full_body_records_read,0);
+  const excluded=await s.recall({...input,context:{environment:'another-workspace'}});assert.ok(!excluded.items.some(i=>i.id===saved.memory_id));
+ }finally{s.close();}
+});
