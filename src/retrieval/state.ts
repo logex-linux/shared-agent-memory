@@ -11,7 +11,7 @@ export function authority(config: Config, db: DatabaseSync) {
 // A separate WAL writer serializes page creation without locking canonical memory writes.
 export class QueryState {
     private static instances=new WeakMap<DatabaseSync,QueryState>();private pooled=false;
-    static open(main:DatabaseSync,config:Config){let state=this.instances.get(main);if(!state){state=new QueryState(main,config);state.pooled=true;this.instances.set(main,state);}state.constructorConfig=config;state.timing={wait_ms:0,held_ms:0,transactions:0};return state;}
+    static open(main:DatabaseSync,config:Config){let state=this.instances.get(main);if(!state){state=new QueryState(main,config);state.pooled=true;this.instances.set(main,state);}else state.attach(main);state.constructorConfig=config;state.timing={wait_ms:0,held_ms:0,transactions:0};return state;}
     static dispose(main:DatabaseSync){const state=this.instances.get(main);if(state){state.db.close();this.instances.delete(main);}}
     cleanupIfExpired(){if(!this.db.prepare('SELECT 1 FROM queries WHERE expires<? LIMIT 1').get(Date.now()))return false;this.begin();try{this.cleanup();this.commit();return true;}catch(e){this.rollback();throw e;}}
 
@@ -57,8 +57,11 @@ export class QueryState {
         const pageSize=Number((this.db.prepare('PRAGMA page_size').get() as any).page_size);
         // Caps allocated DB pages, including freelist. WAL is separately checkpointed/reused.
         this.db.exec('PRAGMA max_page_count='+Math.max(1,Math.floor(config.cache_disk_max_bytes/pageSize)));
-        if (!(main.prepare('PRAGMA database_list').all() as any[]).some(r => r.name === 'retrieval_state'))
-            main.prepare('ATTACH DATABASE ? AS retrieval_state').run(path);
+        this.attach(main);
+    }
+    private attach(main:DatabaseSync){
+        if(!(main.prepare('PRAGMA database_list').all() as any[]).some(r=>r.name==='retrieval_state'))
+            main.prepare('ATTACH DATABASE ? AS retrieval_state').run(this.path);
     }
     begin() { try {
         const start=performance.now();this.db.exec('BEGIN IMMEDIATE');this.timing.wait_ms+=performance.now()-start;this.heldAt=performance.now();this.timing.transactions++;

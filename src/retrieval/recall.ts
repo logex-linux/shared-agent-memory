@@ -10,6 +10,7 @@ type Context = {
     config: Config;
     encoder: Encoder;
     generation: () => number;
+    checkpoint?: (point: string) => void;
 };
 type Candidate = {
     specificTopic?: boolean;
@@ -84,6 +85,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
     const { config, encoder } = ctx, profileTrace=(request.debug||config.diagnostics)?new RetrievalProfile():undefined, db=profileTrace?.database(prepared(ctx.db))??prepared(ctx.db), start = performance.now(), debug = request.debug || config.diagnostics;
     const d = { elapsed_ms: 0, candidate_ids: 0, candidates_ranked: 0, full_body_records_read: 0, full_body_bytes_read: 0, json_parses: 0, metadata_json_parses: 0, chunk_text_rows_read: 0, vector_queries: 0, vector_rows_returned: 0, vector_internal_scanned: null, vector_distance_computations: null, query_embeddings: 0, response_bytes: 0, estimated_tokens: 0, content_estimated_tokens: 0, token_estimator: 'ceil(utf8_bytes/3)', cache_replay: false, ranking_chunk_rows_read: 0 };
     let traceResponse:any,traceBudget=config.page_response_bytes;
+    let preflightEligibility:ReturnType<typeof eligibility>|undefined,preflightAuthority:string|undefined,indexProblem:string|null|undefined;
+    const validateIndex=(eligible:ReturnType<typeof eligibility>)=>{
+        const profiles=(db.prepare(`SELECT DISTINCT s.profile_id FROM memory_search s WHERE ${eligible.sql}`).all(...eligible.params) as any[]).map(r=>r.profile_id);
+        const incomplete=db.prepare(`SELECT 1 FROM memory_search s WHERE ${eligible.sql} AND (NOT EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=s.memory_id) OR EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=s.memory_id AND (c.revision!=s.revision OR c.profile_id!=s.profile_id OR c.id NOT IN (SELECT chunk_id FROM memory_vec)))) LIMIT 1`).get(...eligible.params);
+        return incomplete?'INDEX_INCOMPLETE':profiles.some(p=>p!==profile)?'INDEX_PROFILE_MISMATCH':null;
+    };
     const parse = (s: string, metadata = false) => { d.json_parses++; if (metadata)
         d.metadata_json_parses++; return JSON.parse(s); };
     let input = request, queryVector: Buffer | null = null, profile: string | null = null, retrievalMode: string = request.ids ? 'ids' : channel, warnings: string[] = [], state: QueryState | undefined, q = '', page = 0, resolved = 'focused', progress: any = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage: any;
@@ -107,7 +114,16 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             state = QueryState.open(ctx.db, config);
             profileTrace?.add('state_open',performance.now()-opened);
             const cleaning=performance.now();state.cleanupIfExpired();profileTrace?.add('cleanup',performance.now()-cleaning);
+            // New-query validation needs only canonical data. Keep the same WAL
+            // read snapshot through computation; do not occupy the sidecar writer.
+            if(!request.cursor){
+                db.exec('BEGIN');ctx.generation();preflightAuthority=authority(config,db);preflightEligibility=eligibility(input,config);
+                if(queryVector&&retrievalMode!=='lexical_degraded')indexProblem=profileTrace?profileTrace.stage('index_validation',()=>validateIndex(preflightEligibility!)):validateIndex(preflightEligibility);
+                ctx.checkpoint?.('recall:read_snapshot');
+            }
+            ctx.checkpoint?.('recall:before_state_lock');
             const lockStarted=performance.now();state.begin();profileTrace?.add('state_wait',performance.now()-lockStarted);
+            ctx.checkpoint?.('recall:state_locked');
             if (request.cursor) {
                 const found = state.lookup(request.cursor);
                 q = found.row.id;
@@ -127,8 +143,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
         }
         // Freeze expiry after query encoding; all channels and materialization share this snapshot.
-        const candidateStarted=performance.now();db.exec('BEGIN');
-        const gen = ctx.generation(), auth = authority(config, db), eligible = eligibility(input, config);
+        const candidateStarted=performance.now();if(!preflightEligibility)db.exec('BEGIN');
+        const gen = ctx.generation(), auth = authority(config, db), eligible = preflightEligibility??eligibility(input, config);
+        if(preflightAuthority&&preflightAuthority!==auth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
         if (state) {
             if (request.cursor) {
                 const row = state.db.prepare('SELECT authority,generation FROM queries WHERE id=?').get(q) as any;
@@ -150,12 +167,11 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
         }
         if (queryVector && retrievalMode !== 'lexical_degraded' && !savedPage) {
-            const profiles = (db.prepare(`SELECT DISTINCT s.profile_id FROM memory_search s WHERE ${eligible.sql}`).all(...eligible.params) as any[]).map(r => r.profile_id);
-            const incomplete = db.prepare(`SELECT 1 FROM memory_search s WHERE ${eligible.sql} AND (NOT EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=s.memory_id) OR EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=s.memory_id AND (c.revision!=s.revision OR c.profile_id!=s.profile_id OR c.id NOT IN (SELECT chunk_id FROM memory_vec)))) LIMIT 1`).get(...eligible.params);
-            if (profiles.some(p => p !== profile) || incomplete) {
+            const problem=indexProblem===undefined?validateIndex(eligible):indexProblem;
+            if (problem) {
                 if (request.cursor)
                     throw new MemoryError('CURSOR_INDEX_CHANGED');
-                warnings.push(incomplete ? 'INDEX_INCOMPLETE' : 'INDEX_PROFILE_MISMATCH');
+                warnings.push(problem);
                 retrievalMode = 'lexical_degraded';
                 progress.vectorDone = true;
                 progress.ftsDone = false;
@@ -164,7 +180,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         const local = { vector: new Set<string>(), fts: new Set<string>(), identifier: new Set<string>() }, candidates = new Map<string, Candidate>();
         let work = 0, lowGain = false;
-        const seen = (ch: keyof typeof local, id: string) => { local[ch].add(id); state!.db.prepare('INSERT OR IGNORE INTO seen VALUES(?,?,?)').run(q, ch, id); };
+        // Local exclusion already covers this request; persist each channel once.
+        const seen = (ch: keyof typeof local, id: string) => { local[ch].add(id); };
         const exclusion = (ch: keyof typeof local) => `s.memory_id NOT IN (SELECT id FROM retrieval_state.seen WHERE q=? AND channel='${ch}') AND s.memory_id NOT IN (SELECT value FROM json_each(?))`;
         const analysisMetadata=new Map<string,any>(),topicCounts=new Map<string,number>();
         const candidate = (id: string) => {
@@ -233,10 +250,13 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             c.answer={state,coverage,alignment,checked:signature,salient:salientMatches>0,subjectMatches:salient.filter(t=>words.has(t)).length,referenceBackground};
             if(profileTrace){profileTrace.current=previousStage!;profileTrace.add('ranking',performance.now()-rankingStarted);}
         };
+        const persisted=new Map<string,string>();
         const persist = () => { for (const c of candidates.values()) {
             analyze(c);
             assess(c, config, resolved === 'broad', progress);
-            state!.db.prepare(`INSERT INTO candidates(q,id,data,base,admitted,project,topic,period,source) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(q,id) DO UPDATE SET data=excluded.data,base=excluded.base,admitted=excluded.admitted`).run(q, c.id, JSON.stringify(c), c.base, Number(c.admitted), c.project, c.topic, c.period, c.source);
+            const data=JSON.stringify(c);if(persisted.get(c.id)===data)continue;
+            state!.db.prepare(`INSERT INTO candidates(q,id,data,base,admitted,project,topic,period,source) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(q,id) DO UPDATE SET data=excluded.data,base=excluded.base,admitted=excluded.admitted`).run(q, c.id, data, c.base, Number(c.admitted), c.project, c.topic, c.period, c.source);
+            persisted.set(c.id,data);
         } };
         if (state && !savedPage) {
             do {
@@ -357,7 +377,6 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     break;
             } while (!(progress.vectorDone && progress.ftsDone && progress.idDone) && work < config.page_candidate_budget && performance.now() - start < config.page_time_budget_ms);
             progress.warnings = [...new Set(warnings)];
-            state.db.prepare('UPDATE queries SET progress=?,resolved=?,retrieval_mode=?,expires=? WHERE id=?').run(JSON.stringify(progress), resolved, retrievalMode, Date.now() + config.query_ttl_seconds * 1000, q);
         }
         let options = { limit: request.limit ?? input.limit ?? (resolved === 'focused' ? 8 : config.page_item_limit), token_budget: Math.min(request.token_budget ?? input.token_budget ?? config.response_token_budget, config.response_token_budget), max_bytes: Math.min(request.max_bytes ?? input.max_bytes ?? config.page_response_bytes, config.page_response_bytes), view: request.view ?? input.view ?? 'chunks' };
         if (savedPage) {
@@ -540,11 +559,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         profileTrace?.add('materialization',performance.now()-materializeStarted);
         const persistStarted=performance.now();
         if (state) {
-            state.db.prepare('UPDATE queries SET expires=? WHERE id=?').run(Date.now() + config.query_ttl_seconds * 1000, q);
+            if(savedPage)state.db.prepare('UPDATE queries SET expires=? WHERE id=?').run(Date.now() + config.query_ttl_seconds * 1000, q);
+            else state.db.prepare('UPDATE queries SET progress=?,resolved=?,retrieval_mode=?,expires=? WHERE id=?').run(JSON.stringify(progress),resolved,retrievalMode,Date.now() + config.query_ttl_seconds * 1000,q);
             const done = progress.vectorDone && progress.ftsDone && progress.idDone;
             if (!savedPage) {
-                for (const id of fitted)
-                    state.db.prepare('UPDATE candidates SET emitted=? WHERE q=? AND id=?').run(page, q, id);
+                for(const[ch,ids]of Object.entries(local))if(ids.size)state.db.prepare('INSERT OR IGNORE INTO seen SELECT ?,?,value FROM json_each(?)').run(q,ch,JSON.stringify([...ids]));
+                if(fitted.length)state.db.prepare('UPDATE candidates SET emitted=? WHERE q=? AND id IN (SELECT value FROM json_each(?))').run(page,q,JSON.stringify(fitted));
                 const pending = Number((state.db.prepare(`SELECT count(*) n FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${input.exact_only ? "AND json_extract(data,'$.exact')>0" : ''}`).get(q) as any).n);
                 const more = pending > 0 || !done;
                 plan.stop_reason = blocked ? 'item_exceeds_budget' : !result.items.length ? 'insufficient' : !more ? 'exhausted' : lowGain ? 'low_marginal_gain' : !done && work >= config.page_candidate_budget ? 'candidate_budget' : !done && performance.now() - start >= config.page_time_budget_ms ? 'time_budget' : resolved === 'focused' && fitted.length === 1 ? 'low_marginal_gain' : 'page_budget';
@@ -563,6 +583,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
         }
         profileTrace?.add('state_persist',performance.now()-persistStarted);
+        ctx.checkpoint?.('recall:state_updated');
         const serializationStarted=performance.now();
         result.evidence_status = result.items.some((i: any) => i.evidence_strength === 'supported') ? 'related_evidence' : 'insufficient';
         result.empty_reason = result.items.length ? null : blocked ? 'item_exceeds_budget' : 'no_relevant_evidence';
@@ -579,8 +600,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             throw new MemoryError('PAGE_BUDGET_TOO_SMALL');
         profileTrace?.add('serialization',performance.now()-serializationStarted);
         if(state)state.enforce(q);
+        if(authority(config,db)!==auth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
+        ctx.checkpoint?.('recall:before_commit');
         db.exec('COMMIT');
+        ctx.checkpoint?.('recall:canonical_released');
         const committing=performance.now();state?.commit();profileTrace?.add('state_persist',performance.now()-committing);
+        ctx.checkpoint?.('recall:committed');
         if(profileTrace&&debug){profileTrace.add('total',performance.now()-start);Object.assign(d,{stages_ms:profileTrace.times,state_lock:state?.timing,memory:process.memoryUsage()});
             if(Buffer.byteLength(JSON.stringify(result))>options.max_bytes){delete (d as any).stages_ms;delete (d as any).state_lock;delete (d as any).memory;}
             for(let i=0;i<4;i++){d.response_bytes=Buffer.byteLength(JSON.stringify(result));d.estimated_tokens=estimateTokens(d.response_bytes);}

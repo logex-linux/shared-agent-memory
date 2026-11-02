@@ -155,3 +155,10 @@ sqlite-vec内部的向量扫描量、距离计算次数没有公开计数接口�
 Auto 对包含具体斜杠路径且只有弱偏好线索的查询优先 Focused；显式 Broad、明确的长期/跨项目综合意图和原有分布启发式仍可扩大范围。公共来源目录命中不能单独支持路径以外的主题。Focused 在事实状态意图未知时，高覆盖、主题明确且具有局部显著词匹配的强语义证据也可优先于弱背景；不更改 requires_check、已知环境冲突过滤、核验状态或采用/否决事实状态排序。规则是相关性启发式，不是事实证明。
 
 `adaptive-v046` 令旧排序游标需要按原 query 重启。工具名称、输入参数、Schema 5、Memory ID/Revision、权限和累计 Broad 分页能力不变。详见 [0.4.6 报告](retrieval-v046.md)。
+
+
+## 0.4.7 事务优化
+
+工具参数、普通响应、排序和 `adaptive-v046` 指纹保持不变。新查询的索引完整性检查移到 sidecar 写锁前，但与后续 KNN、过滤、Chunk 读取共享一个主库只读快照。响应代表读取 Generation 时点 S 的一致结果，不能承诺包含 S 之后并发完成的写入。后续请求打开新快照，旧 Generation 游标仍返回 CURSOR_STALE；权限变化、过期和容量错误照常显式返回。
+
+查询 Seen/Candidates/Pages 仍在同一个 sidecar 写事务中原子更新。批量状态更新不改变去重、预算、remaining_ids 或确定性重放。两份 WAL 数据库不构成跨库原子提交；主库读事务释放与 sidecar COMMIT 的两个崩溃边界分别验证。模型与索引安全检查未按 Generation 缓存；直接数据库破坏即使不更新 Generation，也不能被该优化掩盖。详见 [v0.4.7](retrieval-v047.md)。

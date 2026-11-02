@@ -221,7 +221,7 @@ export class MemoryService {
     if(input.exact_only && (!input.query || identifiers(input.query).length===0))throw new MemoryError('EXACT_IDENTIFIER_REQUIRED');
     if(input.project_id)this.scope(input.project_id,'project');
     if(input.include_global??(!input.project_id&&this.config.allow_global))this.scope(null,'global');
-    return retrieve({db:this.db,config:this.config,encoder:this.encoder,generation:()=>this.storage.generation()},input,mode);
+    return retrieve({db:this.db,config:this.config,encoder:this.encoder,generation:()=>this.storage.generation(),checkpoint:this.checkpoint},input,mode);
   }
   async forget(raw:unknown) {
     this.permission('forget');const input=forgetSchema.parse(raw);

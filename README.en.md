@@ -160,3 +160,19 @@ Audited Codex and StepCode calls revealed concrete-path questions incorrectly ro
 Budget-limited ID expansion returns `remaining_ids` with `PARTIAL_ID_EXPANSION`. Continue with `{"ids":[the remaining IDs]}`, without a query cursor. Increase the page budget for `blocked_ids`; reread returned `truncated` items separately when complete content is needed.
 
 Keep client launch paths pointed at the stable installed `~/.agents/shared-agent-memory/dist/mcp/server.js`, with independent stable absolute database/model paths. Moving source code does not migrate memories or rewrite historical sources. Schema 5, permissions and stored embeddings are unchanged. See the [audit, quality, performance and rollback report](docs/retrieval-v046.md).
+
+## v0.4.7 concurrency and transaction optimization
+
+Warmed canonical writers detach the idle sidecar attachment before their immediate
+transaction; the next recall reattaches it. This avoids reserving the unused cache
+writer while preserving revision isolation. New queries validate index integrity
+in the same canonical snapshot before taking
+the sidecar writer. Seen/emitted writes are batched, progress/expiry updates are
+combined, and unchanged candidate state is not persisted repeatedly. Mutable query
+computation and page commit retain the serialized transaction; no leases, service,
+or new memory features are introduced.
+
+Ranking, sources, `remaining_ids`, cumulative Broad paging and Schema 5 remain
+compatible. Valid v0.4.6 cursors support bidirectional replay. Model, default threads
+and permissions are unchanged. See the [locking, cross-database consistency,
+concurrency results and rollback guide](docs/retrieval-v047.md).

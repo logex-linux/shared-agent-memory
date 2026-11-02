@@ -18,3 +18,9 @@ test('disk quota failure is explicit and preserves the canonical database with a
  const {service:s,project}=await setup({cache_disk_max_bytes:1048576,page_candidate_budget:64});s.encoder=fake;seed(s,[project],200);const gen=s.storage.generation();let capacity=false;
  try{for(let i=0;i<80;i++){try{await s.recall({query:'设计偏好',mode:'broad',limit:7});}catch(e){assert.equal(e.code,'QUERY_CACHE_DISK_CAPACITY');capacity=true;break;}}assert.ok(capacity);assert.equal(s.storage.generation(),gen);assert.equal(s.db.prepare('SELECT count(*) n FROM memories').get().n,200);assert.equal(s.check().integrity[0].integrity_check,'ok');}finally{s.close();}
 });
+
+test('multi-batch retrieval writes each unchanged candidate once and batches Seen/emitted updates',async()=>{
+ const{service:s,project}=await setup();s.encoder=fake;seed(s,[project],240);const prepare=DatabaseSync.prototype.prepare,wrapped=new WeakSet(),counts={candidate:0,seen:0,emitted:0,query:0};
+ DatabaseSync.prototype.prepare=function(sql){const st=prepare.call(this,sql);if(!wrapped.has(st)){wrapped.add(st);const key=/INSERT INTO candidates/.test(sql)?'candidate':/INSERT OR IGNORE INTO seen/.test(sql)?'seen':/UPDATE candidates SET emitted/.test(sql)?'emitted':/UPDATE queries/.test(sql)?'query':null;if(key){const run=st.run;st.run=function(...args){counts[key]++;return run.apply(this,args);};}}return st;};
+ try{const r=await s.recall({query:'设计偏好',mode:'focused',limit:100,debug:true});assert.equal(r.diagnostics.full_body_records_read,0);assert.ok(r.diagnostics.candidate_ids>64);assert.ok(counts.candidate<=r.diagnostics.candidate_ids);assert.ok(counts.seen<=3);assert.equal(counts.emitted,1);assert.equal(counts.query,1);}finally{DatabaseSync.prototype.prepare=prepare;s.close();}
+});

@@ -61,6 +61,10 @@ export class Storage {
   }
   transaction<T>(fn:()=>T):T {
     try {
+      // BEGIN IMMEDIATE reserves every attached database, even when only main is
+      // written. A warmed recall connection must not reserve the sidecar writer.
+      if((this.db.prepare('PRAGMA database_list').all() as any[]).some(r=>r.name==='retrieval_state'))
+        this.db.exec('DETACH DATABASE retrieval_state');
       this.db.exec('BEGIN IMMEDIATE');
       try { const result=fn(); this.db.exec('COMMIT'); return result; }
       catch(error) { this.db.exec('ROLLBACK'); throw error; }

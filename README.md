@@ -245,3 +245,9 @@ Focused 区分具体引用证据与语义背景，英文精排忽略常用虚词
 按 ID 展开受单页预算或 limit 限制时，返回 `remaining_ids` 和 `PARTIAL_ID_EXPANSION`。继续传 `{"ids":[返回的 remaining_ids]}`；该模式不使用查询游标。来源过大导致 `blocked_ids` 时提高单页预算；已返回但标记 `truncated` 的条目需要单独提高预算重读。
 
 代码位置可以移动；客户端应指向安装后的稳定 `~/.agents/shared-agent-memory/dist/mcp/server.js`，数据库和模型使用各自配置的稳定绝对路径。移动源码不会自动迁移真实记忆或重写历史来源。Schema 5 和连接权限不变，无须重新向量化。详见[多轮审计、质量、性能与回滚报告](docs/retrieval-v046.md)。
+
+## v0.4.7 并发与事务优化
+
+已调用 recall 的写入连接在 canonical 事务前解除闲置 sidecar 附件，下次 recall 自动重挂，避免 BEGIN IMMEDIATE 额外争抢缓存库写锁。新查询在同一主库快照内、取得 sidecar 写锁前完成索引完整性预检；Seen 和 emitted 状态批量写入，查询进度与过期时间合并更新，未变化的候选不重复持久化。候选计算和页面提交继续使用原串行事务，不增加 lease、后台服务或新的记忆功能。
+
+排序与来源不变，保留 `remaining_ids`、无限累计 Broad 分页和 Schema 5。已有合法游标与 v0.4.6 双向重放兼容；模型、默认线程数和权限不变。详见[锁模型、跨库一致性、并发数据与回滚指南](docs/retrieval-v047.md)。

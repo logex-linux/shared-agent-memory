@@ -1,0 +1,5 @@
+// Opt-in diagnostic cohort only: SDK JSON decoding/schema validation and STDIO send.
+import{ReadBuffer}from'@modelcontextprotocol/sdk/shared/stdio.js';import{StdioServerTransport}from'@modelcontextprotocol/sdk/server/stdio.js';import{writeSync}from'node:fs';
+const requests=new Map(),read=ReadBuffer.prototype.readMessage,send=StdioServerTransport.prototype.send;
+ReadBuffer.prototype.readMessage=function(...args){const start=performance.now(),message=read.apply(this,args);if(message?.method==='tools/call'&&message.params?.name==='memory_recall')requests.set(message.id,{received:performance.now(),decode_schema_ms:performance.now()-start});return message;};
+StdioServerTransport.prototype.send=async function(message){const item=requests.get(message.id),start=performance.now();try{return await send.call(this,message);}finally{if(item){requests.delete(message.id);try{writeSync(2,JSON.stringify({sam_wire:{pid:process.pid,decode_schema_ms:item.decode_schema_ms,handler_ms:start-item.received,send_serialize_ms:performance.now()-start}})+'\n');}catch{}}}};
