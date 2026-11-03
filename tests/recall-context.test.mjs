@@ -1,6 +1,6 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {randomUUID}from'node:crypto';import{writeFile}from'node:fs/promises';import{resolve}from'node:path';
 import{Client}from'@modelcontextprotocol/sdk/client/index.js';import{StdioClientTransport}from'@modelcontextprotocol/sdk/client/stdio.js';
-import{referenceEvidence,evidenceWindow,focusTerms}from'../dist/retrieval/evidence.js';import{setup,record,publish}from'./helpers.mjs';
+import{referenceEvidence,evidenceWindow,focusTerms}from'../dist/retrieval/evidence.js';import{setup,record,publish}from'./helpers.mjs';import{vector}from'./adaptive-helpers.mjs';
 const v=new Float32Array(512);v[0]=1;const encoder={profile:async()=>({id:'context-test',manifest:{synthetic:true}}),query:async()=>v,chunks:async(_,text)=>[{text,start:0,end:text.length,tokens:text.length,vector:v}]};
 test('focused reference evidence distinguishes dates, code symbols, mixed project names and absolute path suffixes',()=>{
  assert.equal(referenceEvidence('2026 20261027 2026-10-27')('记录于2026年。').count,0);
@@ -94,4 +94,40 @@ test('specific semantic evidence requiring context can lead without a code ident
   const r=await s.recall(input);assert.equal(r.items[0].id,saved.memory_id);assert.equal(r.items[0].applicability,'requires_check');assert.equal(r.diagnostics.full_body_records_read,0);
   const excluded=await s.recall({...input,context:{environment:'another-workspace'}});assert.ok(!excluded.items.some(i=>i.id===saved.memory_id));
  }finally{s.close();}
+});
+
+test('strong local and indexed coverage can replace a weak focused first result', async () => {
+ const {service:s,project}=await setup();
+ s.encoder={...encoder,chunks:async(title,text)=>[{text,start:0,end:text.length,tokens:text.length,vector:title==='Browser runtime notes'?v:vector(.5,Math.sqrt(.75))}]};
+ try {
+  const neighbor=await publish(s,record(project,{title:'Browser runtime notes',content:'Browser background tasks use a separate process.',tags:['runtime']}));
+  const direct=await publish(s,record(project,{title:'Login profile lock',content:'A busy browser session can block login. Stop the old browser and release its profile lock.',tags:['login'],valid_for:{environment:'desktop'}}));
+  const input={query:'browser session login busy profile lock',mode:'focused',view:'evidence',limit:1,debug:true};
+  const first=await s.recall(input);
+  assert.equal(first.items[0].id,direct.memory_id);
+  assert.equal(first.items[0].applicability,'requires_check');
+  assert.equal(first.diagnostics.full_body_records_read,0);
+  const next=await s.recall({cursor:first.next_cursor});
+  assert.deepEqual(next.items.map(i=>i.id),[neighbor.memory_id]);
+  assert.deepEqual((await s.recall({cursor:first.next_cursor})).items,next.items);
+  const excluded=await s.recall({...input,context:{environment:'web'}});
+  assert.ok(excluded.items.every(i=>i.id!==direct.memory_id));
+ } finally {s.close();}
+});
+
+test('mixed-case names distinguish the requested system from similar failures', async () => {
+ const {service:s,project}=await setup();s.encoder=encoder;
+ try {
+  const input={query:'AtlasBridge 本地启动路径和故障排查',mode:'focused',view:'evidence'};
+  const neighbor=await publish(s,record(project,{title:'Other launcher',content:'应用升级后启动失败，重建缓存后恢复。',tags:['launcher']}));
+  const missing=await s.recall(input);
+  assert.equal(missing.items[0].id,neighbor.memory_id);
+  assert.equal(missing.evidence_status,'insufficient');
+  assert.ok(missing.items[0].recall_reason.includes('background_only'));
+  assert.equal(referenceEvidence(input.query)('AtlasBridgeNext 的启动脚本。').coverage,0);
+  const direct=await publish(s,record(project,{title:'AtlasBridge 启动路径',content:'AtlasBridge 本地启动路径是 ./bin/launch，故障排查先看应用日志。',tags:['atlas']}));
+  const found=await s.recall(input);
+  assert.equal(found.items[0].id,direct.memory_id);
+  assert.equal(found.items[0].evidence_strength,'supported');
+ } finally {s.close();}
 });

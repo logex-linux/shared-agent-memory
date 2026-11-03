@@ -58,6 +58,9 @@ const broadIntent = (q: string) => /(长期|稳定.*偏好|归纳|总结|跨项�
 const directEvidence = (c: Candidate | undefined, threshold: number) => Boolean(c && !c.answer?.referenceBackground &&
     (c.exact>0&&Math.max(c.coverage,c.answer?.coverage??0)>=.6
     || c.specificTopic&&c.answer?.salient&&(c.answer.coverage>=.6)&&(c.cosine??0)>=threshold));
+// Agreement between indexed and local subject terms can override a legacy
+// anchor. A lone identifier, generic vocabulary or semantic score cannot.
+const subjectCoverage = (c: Candidate) => Math.min(c.coverage, c.answer?.coverage ?? 0);
 function assess(c: Candidate, config: Config, broad: boolean, progress: any) {
     const semantic = (c.cosine ?? 0) >= config.semantic_threshold, strong = (c.cosine ?? 0) >= config.evidence_threshold;
     const core = c.exact > 0 || c.coverage >= .6 || semantic && (c.coverage >= .2 || strong);
@@ -391,6 +394,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         traceBudget=options.max_bytes;
         let pool: Candidate[] = [], selected: string[] = [], contextPriority=false;
+        let subjectLeader: string | undefined;
         if (request.ids)
             selected = request.ids;
         else if (savedPage) {
@@ -436,6 +440,16 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             // Do not override fact-state ranking or reorder ordinary current evidence.
             contextPriority=resolved==='focused'&&answerIntent(input.query??'')==='unknown'&&pool.some(c=>c.requiresCheck&&directEvidence(c,config.evidence_threshold));
             if(resolved==='focused')pool.sort((a,b)=>(contextPriority?Number(directEvidence(b,config.evidence_threshold))-Number(directEvidence(a,config.evidence_threshold)):0)||Number(Boolean(a.answer?.referenceBackground))-Number(Boolean(b.answer?.referenceBackground)));
+            if (resolved === 'focused' && page === 0 && !input.exact_only && answerIntent(input.query!) === 'unknown' && pool.length > 1) {
+                const first = pool[0];
+                const minimumCoverage = Math.max(.7, Math.max(first.coverage, first.answer?.coverage ?? 0) + .2);
+                const index = pool.findIndex(c => !c.answer?.referenceBackground && c.answer?.salient && subjectCoverage(c) >= minimumCoverage);
+                if (index > 0) {
+                    const [stronger] = pool.splice(index, 1);
+                    subjectLeader = stronger.id;
+                    pool.unshift(stronger);
+                }
+            }
             selected = pool.map(c => c.id);
             if (resolved === 'focused' && !(request.limit ?? input.limit) && pool.length > 1) {
                 const a = pool[0], b = pool[1], gap = a.base > 0 ? (a.base - b.base) / a.base : 0;
@@ -453,7 +467,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         selected = selected.filter(id => flags.has(id));
         if (!savedPage) {
             const ranked=contextPriority?new Map(pool.map(c=>[c.id,c])):null;
-            selected.sort((a, b) => (ranked ? Number(directEvidence(ranked.get(b),config.evidence_threshold))-Number(directEvidence(ranked.get(a),config.evidence_threshold)) : 0) || Number(flags.get(a)) - Number(flags.get(b)));
+            selected.sort((a, b) => Number(b === subjectLeader) - Number(a === subjectLeader)
+                || (ranked ? Number(directEvidence(ranked.get(b),config.evidence_threshold))-Number(directEvidence(ranked.get(a),config.evidence_threshold)) : 0) || Number(flags.get(a)) - Number(flags.get(b)));
         }
         d.candidate_ids = state ? Number((state.db.prepare('SELECT count(*) n FROM candidates WHERE q=?').get(q) as any).n) : selected.length;
         d.candidates_ranked = selected.length;

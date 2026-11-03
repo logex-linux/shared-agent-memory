@@ -176,3 +176,10 @@ Ranking, sources, `remaining_ids`, cumulative Broad paging and Schema 5 remain
 compatible. Valid v0.4.6 cursors support bidirectional replay. Model, default threads
 and permissions are unchanged. See the [locking, cross-database consistency,
 concurrency results and rollback guide](docs/retrieval-v047.md).
+
+## v0.4.8 Focused retrieval
+
+Direct evidence can lead the first Focused page when both indexed and local
+subject coverage are substantially stronger. Mixed-case names help distinguish
+similar failures in different systems. Restart old cursors with the original
+query after upgrading. See the [call-log audit and replay](docs/retrieval-v048.md).

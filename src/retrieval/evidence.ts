@@ -36,7 +36,7 @@ function identifierAt(text:string,id:string) {
     const m=referencePattern(id).exec(text);
     return m?m.index+m[1].length:-1;
 }
-const namedReferences=(query:string)=>[...new Set([...identifiers(query),...(query.match(/[\p{L}\p{N}]+(?:[_-][\p{L}\p{N}]+)+|\b[A-Z]{2,}\d*\b/gu)??[]).map(x=>x.toLowerCase())])];
+const namedReferences=(query:string)=>[...new Set([...identifiers(query),...(query.match(/[\p{L}\p{N}]+(?:[_-][\p{L}\p{N}]+)+|\b[A-Z]{2,}\d*\b|\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b/gu)??[]).map(x=>x.toLowerCase())])];
 // References constrain what a hit can support, not what the semantic channel may find.
 // Calendar dates are context; numeric error codes and named code/path references remain evidence.
 export function referenceEvidence(query:string) {
