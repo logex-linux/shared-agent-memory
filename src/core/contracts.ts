@@ -36,6 +36,19 @@ const effectiveTimeSchema = z.object({ valid_from:eventTime, valid_to:eventTime 
   {message:'valid_from must precede valid_to'}
 );
 export const versionRefSchema = z.object({memory_id:z.string().uuid(),revision:z.number().int().positive().safe()}).strict();
+const citationSchema=versionRefSchema.extend({
+  start:z.number().int().min(0).max(4000),end:z.number().int().min(1).max(4000),
+  role:z.enum(['support','counterexample']).default('support')
+}).strict();
+const consolidationSchema=z.object({
+  mode:z.enum(['multi_source','direct_statement']).default('multi_source'),
+  citations:z.array(citationSchema).min(1).max(20)
+}).strict().superRefine((spec,ctx)=>{
+  if(new Set(spec.citations.map(c=>c.memory_id)).size!==spec.citations.length)
+    ctx.addIssue({code:'custom',path:['citations'],message:'Use distinct memory IDs'});
+  if(spec.citations.some(c=>c.end<=c.start||c.end-c.start>500))
+    ctx.addIssue({code:'custom',path:['citations'],message:'Use a nonempty source span of at most 500 UTF-16 units'});
+});
 export const decisionStateSchema = z.enum(['unknown','proposed','adopted','rejected']);
 export const lifecycleSchema = z.enum(['current','historical','quarantined']);
 export const relationTypeSchema = z.enum(['supports','contradicts','supersedes','context_variant','related_to']);
@@ -57,11 +70,16 @@ export const recordSchema = z.object({
   memory_form:z.enum(['legacy','episodic','semantic','procedural']).optional(),
   episode:episodeSchema.nullable().optional(), valid_time:effectiveTimeSchema.nullable().optional(),
   decision_state:decisionStateSchema.optional(), lifecycle:lifecycleSchema.optional(),
-  subject_id:text(256).optional(), context_key:text(256).optional()
+  subject_id:text(256).optional(), context_key:text(256).optional(), consolidation:consolidationSchema.optional()
 }).strict().superRefine((r, ctx) => {
   if ((r.scope === 'global') !== (r.project_id === null)) ctx.addIssue({code:'custom', message:'global requires null project_id; project requires UUID'});
 });
 export type MemoryRecord = z.infer<typeof recordSchema>;
+export const consolidationPreviewSchema=z.object({
+  project_id:z.string().uuid().nullable(),scope:z.enum(['project','global']),
+  title:text(180),claim:text(1000),kind:z.enum(['preference','fact','decision','procedure','lesson']),
+  context:validSchema.omit({expires_at:true}).default({}),evidence:consolidationSchema
+}).strict();
 const request = z.string().uuid().describe('A fresh real UUID per tool operation; propose and commit need different UUIDs. Reuse only for an identical retry of the same operation, never send a placeholder.');
 export const proposeSchema = z.object({ request_id: request, record: recordSchema,
   target_id: z.string().uuid().optional(), expected_revision: z.number().int().positive().optional().describe('Updates only: current positive revision, together with target_id. For a new proposal omit both fields; revision 0 belongs to memory_commit.'),
@@ -129,6 +147,7 @@ export const configSchema = z.object({
   cache_cleanup_rows:z.number().int().min(1).max(4096).default(256),
   diagnostics:z.boolean().default(false),
   graph_enabled:z.boolean().default(false),
+  learned_graph_enabled:z.boolean().default(false),
   feedback_policy:z.enum(['observe','trusted_outcomes']).default('observe')
 }).strict();
 export type Config = z.infer<typeof configSchema>;

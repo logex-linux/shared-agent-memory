@@ -71,3 +71,19 @@ SQLite backups retain them. The logical version archive remains a record
 archive. Query receipts stay in the disposable sidecar and should be
 regenerated after a restore. Existing connection configurations gain no
 feedback permission.
+
+Schema 10 adds the derived-revision erasure index, aliases for revoked import
+keys and explicit source digests, and learned edge indexes. The erasure index
+is populated from retained version bodies in the migration transaction.
+Forgetting traverses current and retained historical derivations and exact
+record-hash copies. Canonical endpoint deletion cascades to relation,
+learning-event, projection-job and association rows. Older cursors fail on
+generation change.
+
+The external ledger may include `version_hashes`, `import_keys` and
+`source_hashes`. Restore applies the ledger before reading the copy or
+importing its content. A source digest blocks future ingestion carrying that
+exact value. Matching a digest does not erase separate existing statements
+that merely cite the same source, and hashes cannot identify paraphrases.
+Managed exports are removed through the existing cleanup path. Previous chat
+results and unmanaged backups remain outside the service's control.

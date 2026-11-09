@@ -1,8 +1,10 @@
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import { z } from 'zod';
 import { MemoryError, sourceSchema, versionRefSchema, type RecallInput } from '../core/contracts.js';
+import { decayWeight, LEARNING_VERSION } from '../memory/feedback.js';
 
 export const GRAPH_VERSION = 'explicit-relations-v1';
+export const graphVersion=(learned:boolean)=>learned?GRAPH_VERSION+'+'+LEARNING_VERSION:GRAPH_VERSION;
 export const GRAPH_SEEDS = 8;
 export const GRAPH_NEIGHBORS = 16;
 export const GRAPH_PAGE_WORK = 128;
@@ -10,12 +12,13 @@ const DEPENDENCY_LIMIT = 128;
 const MAX_DEPTH = 2;
 type Ref = z.infer<typeof versionRefSchema>;
 type Direction = 'outgoing'|'incoming';
-type EdgeType = 'supports'|'related_to'|'context_variant';
-type Step = {id:string; revision:number; type:EdgeType; from:Ref; to:Ref; direction:Direction};
+type EdgeType = 'supports'|'related_to'|'context_variant'|'learned_association';
+type Step = {id:string; revision:number; type:EdgeType; from:Ref; to:Ref; direction:Direction; learned_weight?:number};
 export type GraphPath = {seed:Ref; steps:Step[]};
-type Frontier = {node:Ref; path:GraphPath; direction:Direction; after:string; examined:number};
+type Frontier = {node:Ref; path:GraphPath; direction:Direction; after:string; examined:number; learned?:boolean};
 export type GraphProgress = {
     epoch:number; version:string; profile:string|null;
+    learnedAt?:number;
     seeded:boolean; frontier:Frontier[]; seen:string[];
     neighborLimited:boolean; dependencyLimited:boolean; stale:boolean;
 };
@@ -23,6 +26,7 @@ type Node = Ref & {scope:string; project:string|null};
 type EdgeRow = {
     id:string; revision:number; from_id:string; from_revision:number; to_id:string; to_revision:number;
     scope:string; project_id:string|null; type:string; valid_sources:number;
+    weight?:number; updated_ms?:number; policy?:string;
 };
 const validSources = z.array(sourceSchema).min(1).max(12);
 
@@ -35,30 +39,32 @@ export function migrateGraph(db:DatabaseSync) {
     `);
 }
 
-export function graphEpoch(db:DatabaseSync) {
+export function graphEpoch(db:DatabaseSync,learned=false) {
     const row=db.prepare(`SELECT value FROM meta WHERE key='graph_epoch'
-      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_relations')`).get();
+      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_relations')
+      AND (?=0 OR EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='association_edges'))`).get(Number(learned));
     if(!row || typeof row.value!=='number' || !Number.isSafeInteger(row.value) || row.value<0)
         throw new MemoryError('GRAPH_UNAVAILABLE');
     return row.value;
 }
 
-export function startGraph(epoch:number,profile:string|null):GraphProgress {
-    return {epoch,version:GRAPH_VERSION,profile,seeded:false,frontier:[],seen:[],neighborLimited:false,dependencyLimited:false,stale:false};
+export function startGraph(epoch:number,profile:string|null,learned:boolean):GraphProgress {
+    return {epoch,version:graphVersion(learned),profile,...(learned&&{learnedAt:Date.now()}),
+        seeded:false,frontier:[],seen:[],neighborLimited:false,dependencyLimited:false,stale:false};
 }
 
 export function graphBonus(path:GraphPath) {
     // Association affects opportunity. It does not supply claim evidence.
     return path.steps.reduce((weight,step)=>weight * (step.type==='supports'
         ? step.direction==='incoming'?1:.65
-        : step.type==='context_variant'?.45:.7),.023/path.steps.length);
+        : step.type==='context_variant'?.45:step.type==='learned_association'?.4*step.learned_weight!:.7),.023/path.steps.length);
 }
 
 export class GraphReader {
     private nodes = new Map<string,Node|null>();
     private checks = new Map<string,'valid'|'stale'|'limited'>();
     private readonly visible;
-    constructor(private db:DatabaseSync, eligible:{sql:string;params:SQLInputValue[]}, input:RecallInput) {
+    constructor(private db:DatabaseSync, eligible:{sql:string;params:SQLInputValue[]}, input:RecallInput, private learnedAt?:number) {
         const knownTime=input.as_of? ` AND json_extract(s.metadata,'$.valid_time.valid_from') IS NOT NULL
             AND json_extract(s.metadata,'$.valid_time.valid_to') IS NOT NULL`:'';
         const statement=db.prepare(`SELECT s.memory_id,s.revision,s.scope,s.project_id FROM memory_search s
@@ -110,14 +116,32 @@ export class GraphReader {
     private frontier(node:Ref,path:GraphPath):Frontier {
         return {node,path,direction:'outgoing',after:'',examined:0};
     }
-    private next(node:string,direction:Direction,after:string) {
+    private projected(where:string,...params:SQLInputValue[]) {
+        return this.db.prepare(`SELECT 'learned:'||last_seq id,last_seq revision,'learned_association' type,
+          a from_id,a_revision from_revision,b to_id,b_revision to_revision,scope,project_id,1 valid_sources,weight,updated_ms,policy
+          FROM association_edges WHERE ${where}`).get(...params) as EdgeRow|undefined;
+    }
+    private next(entry:Frontier) {
+        const {node,direction,after,learned}=entry;
+        if(learned) {
+            const column=direction==='outgoing'?'a':'b';
+            return this.projected(`${column}=? AND last_seq>? AND weight>=0.05 ORDER BY last_seq LIMIT 1`,
+                node.memory_id,after?Number(after.slice('learned:'.length)):0);
+        }
         const column=direction==='outgoing'?'from_id':'to_id';
         return this.db.prepare(`SELECT id,revision,type,from_id,from_revision,to_id,to_revision,scope,project_id,
           json_valid(sources) valid_sources FROM memory_relations WHERE ${column}=? AND id>? ORDER BY id LIMIT 1`)
-            .get(node,after) as EdgeRow|undefined;
+            .get(node.memory_id,after) as EdgeRow|undefined;
+    }
+    private advance(entry:Frontier) {
+        if(entry.direction==='outgoing')entry.direction='incoming';
+        else if(!entry.learned&&this.learnedAt!==undefined){entry.learned=true;entry.direction='outgoing';}
+        else return false;
+        entry.after='';
+        return true;
     }
     private step(row:EdgeRow,direction:Direction,state?:GraphProgress):Step|null {
-        if(row.type!=='supports' && row.type!=='related_to' && row.type!=='context_variant')return null;
+        if(row.type!=='supports' && row.type!=='related_to' && row.type!=='context_variant' && row.type!=='learned_association')return null;
         const from={memory_id:row.from_id,revision:row.from_revision},to={memory_id:row.to_id,revision:row.to_revision};
         const visibleFrom=this.node(row.from_id),visibleTo=this.node(row.to_id);
         if(state&&visibleFrom&&visibleTo&&visibleFrom.project===row.project_id&&visibleTo.project===row.project_id&&
@@ -126,7 +150,12 @@ export class GraphReader {
         if(!left || !right || left.scope!==row.scope || right.scope!==row.scope ||
             left.project!==row.project_id || right.project!==row.project_id)return null;
         if(!row.valid_sources)throw new MemoryError('GRAPH_UNAVAILABLE');
-        return {id:row.id,revision:row.revision,type:row.type,from,to,direction};
+        const step:Step={id:row.id,revision:row.revision,type:row.type,from,to,direction};
+        if(row.type!=='learned_association')return step;
+        if(this.learnedAt===undefined || row.policy!==LEARNING_VERSION || !Number.isFinite(row.weight) ||
+           row.weight!<0 || row.weight!>1 || !Number.isSafeInteger(row.updated_ms))throw new MemoryError('GRAPH_UNAVAILABLE');
+        const learned_weight=decayWeight(row.weight!,this.learnedAt-row.updated_ms!);
+        return learned_weight>=.05?{...step,learned_weight}:null;
     }
     walk(state:GraphProgress,budget:number,deadline:number,visit:(path:GraphPath)=>void) {
         const seen=new Set(state.seen);
@@ -137,16 +166,17 @@ export class GraphReader {
                 state.frontier.shift();
                 continue;
             }
-            const row=this.next(entry.node.memory_id,entry.direction,entry.after);
+            const row=this.next(entry);
             if(entry.examined===GRAPH_NEIGHBORS) {
-                const extra=row || entry.direction==='outgoing' && this.next(entry.node.memory_id,'incoming','');
+                const probe={...entry};
+                let extra=row;
+                while(!extra&&this.advance(probe))extra=this.next(probe);
                 if(extra)state.neighborLimited=true;
                 state.frontier.shift();
                 continue;
             }
             if(!row) {
-                if(entry.direction==='incoming')state.frontier.shift();
-                else {entry.direction='incoming';entry.after='';}
+                if(!this.advance(entry))state.frontier.shift();
                 continue;
             }
             entry.after=row.id;
@@ -168,6 +198,15 @@ export class GraphReader {
         const statement=this.db.prepare(`SELECT *,json_valid(sources) valid_sources
             FROM memory_relations WHERE id=?`);
         const steps=path.steps.map(step=>{
+            if(step.type==='learned_association') {
+                const projected=this.projected('last_seq=?',step.revision);
+                const current=projected&&this.step(projected,step.direction);
+                if(!current || JSON.stringify(current)!==JSON.stringify(step))throw new MemoryError('GRAPH_STALE');
+                const source=this.db.prepare("SELECT json_extract(metadata,'$.sources[0]') AS source FROM memory_search WHERE memory_id=?");
+                const sources=validSources.safeParse([step.from,step.to].map(ref=>JSON.parse(String(source.get(ref.memory_id)?.source??'null'))));
+                if(!sources.success)throw new MemoryError('GRAPH_UNAVAILABLE');
+                return {...current,sources:sources.data,association_policy:LEARNING_VERSION};
+            }
             const row=statement.get(step.id) as (EdgeRow & {sources:string})|undefined;
             const current=row&&this.step(row,step.direction);
             if(!current || JSON.stringify(current)!==JSON.stringify(step))throw new MemoryError('GRAPH_STALE');

@@ -64,6 +64,12 @@ export function decayWeight(weight:number, elapsed:number) {
   return weight*Math.exp(-Math.LN2*Math.max(0,elapsed)/HALF_LIFE);
 }
 
+export function indexAssociationWalk(db:DatabaseSync) {
+  db.exec(`CREATE UNIQUE INDEX association_seq ON association_edges(last_seq);
+    CREATE INDEX association_a_walk ON association_edges(a,last_seq);
+    CREATE INDEX association_b_walk ON association_edges(b,last_seq);`);
+}
+
 export function projectFeedback(db:DatabaseSync, limit:number, rebuild:boolean) {
   if(rebuild) db.exec(`DELETE FROM association_edges; DELETE FROM projection_jobs;
     INSERT INTO projection_jobs SELECT seq FROM learning_events;

@@ -9,7 +9,7 @@ stage adds its executable examples here after its acceptance checks.
 | Exact version expansion and event metadata | P1 | Implemented and tested |
 | Effective time, decision state and atomic transitions | P2 | Implemented and tested |
 | Bounded related-evidence paths | P3 | Implemented, experimental and off by default |
-| Authorized feedback and dry-run consolidation | P4 | Feedback ingestion and projection implemented. Graph consumption and consolidation pending. |
+| Authorized feedback and dry-run consolidation | P4 | Implemented. Learned graph expansion is experimental and off by default. |
 
 A record may include `memory_form` of `legacy`, `episodic`, `semantic` or
 `procedural`. This leaves its existing `kind` intact. Optional `episode`
@@ -163,3 +163,38 @@ batches until `pending` reaches zero. The initial weights use a 30-day
 half-life, increments of 0.2 for useful pairs, decrements of 0.1 or 0.3 for
 irrelevant or misleading pairs and a range of [0, 1]. The policy is versioned.
 Neither observation nor projection changes memory verification.
+
+`learned_graph_enabled` also defaults to `false`. Enabling it allows a request
+with `graph: true` to consider projected association edges after explicit
+edges within the same traversal budget. The first page pins the weight
+evaluation time. Edges decay out of consideration below 0.05. Returned
+`learned_association` steps identify the exact endpoint versions, the
+association policy and the decayed weight. Their sources are the endpoint
+sources. They establish neither the truth of feedback nor the truth of the
+claim. Historical `as_of` requests do not use learned weights. A changed
+projection epoch invalidates graph cursors.
+
+To prepare a synthesis, use an authorized CLI configuration.
+
+```sh
+node dist/cli/main.js consolidate --dry-run --config "$CONFIG" --input "$INPUT"
+```
+
+The input includes `project_id`, `scope`, `title`, `kind`, one `claim`,
+optional `context`, and `evidence` containing `mode` and `citations`. A citation
+contains `memory_id`, `revision`, `start`, `end` and optional `role` of
+`support` or `counterexample`. Offsets are UTF-16 source offsets and each
+excerpt is at most 500 units. The dry run follows existing derivations to
+their originals, groups overlapping source identities, and computes the
+shared applicability interval. Independent sources require two distinct
+support groups. `direct_statement` instead requires a literal excerpt of an
+explicitly attributed user statement.
+
+The package returns the cited excerpts, origin versions, explicit conflicts and
+an optional `candidate`. A conflict candidate is quarantined. An insufficient
+package has no candidate. An operator may review and add `author_client` and
+`author_session` to a candidate for normal propose and commit. The service
+rechecks every source, span, scope, applicability and revision. Split a
+candidate when the source limits are exceeded. Inferred claims retain
+`model_inference` and `unverified`. Source independence is a provenance check,
+so the caller still reviews whether the text supports the proposed claim.

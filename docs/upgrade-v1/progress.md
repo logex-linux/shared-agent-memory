@@ -11,7 +11,7 @@ lockfile. Production inspection uses SQLite read-only access and existing MCP.
 | P1 versions and events | Passed | Schema 6, versioned archive, 101 tests, 607 identical frozen pages and 53 identical private replays |
 | P2 explicit state and relations | Passed | Schema 7, 107 tests, atomic predecessor updates, scoped relation revisions, 607 matching frozen pages and 53 matching private replays |
 | P3 bounded graph recall | Implemented, experimental | Schema 8, 111 tests, 607 matching frozen pages, 53 matching private pages, no gain on frozen cross-event subset |
-| P4 feedback, consolidation and forget | In progress | Schema 9 receipt-bound feedback, transactional projection and current endpoint erasure. 114 tests and 607 matching compatibility pages. |
+| P4 feedback, consolidation and forget | Implemented and tested | Schema 10, receipt-bound learning and projection, bounded learned expansion, consolidation preview and historical erasure. 119 tests and 607 matching compatibility pages. |
 | P5 evaluation and recovery | Pending | All stage gates and release evaluation |
 
 P0 artifacts are under `.local/upgrade-v1/p0/`. `build.log` and `tests.log`
@@ -66,6 +66,15 @@ frozen corpora rerun with `BENCH_LABEL=v1-p4-feedback` matched all 607 pages
 with zero full-body reads under the old permissions and graph-off requests.
 See `feedback-full-suite.log` and `feedback-compatibility.json`.
 
-P4 still needs opt-in learned-edge consumption, dry-run consolidation and
-historical derivation and revocation coverage. P5 still needs full A/B/C/D/E
-trajectory scoring, the scale matrix and complete recovery rehearsals.
+P4 closes with `final-build.log`, `final-tests.log` and `compatibility.json`
+under `.local/upgrade-v1/p4/`. The 119-test suite checks same-origin retellings,
+conflicts, direct statements, a parent update during encoding, and source
+scope. It also checks weight decay, projection epoch and historical erasure.
+The erasure rehearsal applied the latest ledger to a pre-forget backup. A
+derived record with a changed latest source list and an exact reimport were
+removed along with the root. The unrelated association neighbor survived.
+The compatibility rerun again matched 607 pages with zero full-body reads.
+
+P5 evaluates the complete A/B/C/D/E trajectory set, the multi-client scale
+matrix and migration and recovery. No installed runtime or canonical user
+data has been changed by this development branch.

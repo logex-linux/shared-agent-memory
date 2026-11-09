@@ -15,7 +15,8 @@ export function extendedMetadata(record: MemoryRecord) {
     ...(record.decision_state !== undefined && { decision_state: record.decision_state }),
     ...(record.lifecycle !== undefined && { lifecycle: record.lifecycle }),
     ...(record.subject_id !== undefined && { subject_id: record.subject_id }),
-    ...(record.context_key !== undefined && { context_key: record.context_key })
+    ...(record.context_key !== undefined && { context_key: record.context_key }),
+    ...(record.consolidation !== undefined && { consolidation: record.consolidation })
   };
 }
 

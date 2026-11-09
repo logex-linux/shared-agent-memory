@@ -173,3 +173,38 @@ test('high-degree graph persists a bounded frontier and concurrent readers repla
     assert.deepEqual({...replayed,diagnostics:null},{...a,diagnostics:null});
   } finally {s.close();}
 });
+
+test('learned graph admits independently relevant evidence and expires weights without deleting facts',async()=>{
+  const {service:s,seed,answer}=await graphFixture({all_projects:true,learned_graph_enabled:true,
+    response_token_budget:12000,feedback_policy:'trusted_outcomes',operations:['recall','propose','commit','manage','feedback']});
+  const linked=(result)=>result.items.find(item=>item.id===answer.memory_id)?.graph_path?.steps[0];
+  try {
+    const read=await s.recall(request);
+    const used=[seed,answer].map(ref=>({memory_id:ref.memory_id,revision:ref.revision}));
+    assert.ok(used.every(ref=>read.items.some(i=>i.id===ref.memory_id)));
+    const page=await s.recall({...request,graph:true,limit:1});
+    const off=await s.recall({...request,limit:1});
+    assert.ok(page.next_cursor&&off.next_cursor);
+    const submit=()=>s.feedback({request_id:randomUUID(),task_id:randomUUID(),page_receipt:read.feedback_receipt,
+      used,outcome:'useful',basis:'test_result',evidence_ref:'test://consolidated/independent-evidence'});
+    await submit();
+    assert.equal(linked(await s.recall({...request,graph:true})),undefined);
+    assert.equal(s.projectFeedback().changed_edges,1);
+    await assert.rejects(s.recall({cursor:page.next_cursor}),{code:'CURSOR_GRAPH_CHANGED'});
+    assert.ok((await s.recall({cursor:off.next_cursor})).items.length);
+    const trained=await s.recall({...request,graph:true});
+    const association=linked(trained);
+    assert.equal(association.type,'learned_association');
+    assert.equal(association.association_policy,'scoped-outcomes-v1');
+    assert.ok(association.learned_weight>=0.19);
+    assert.equal(association.sources.length,2);
+    assert.equal(trained.items.find(i=>i.id===answer.memory_id).verification.status,'unverified');
+    s.config.learned_graph_enabled=false;
+    assert.equal(linked(await s.recall({...request,graph:true})),undefined);
+    s.config.learned_graph_enabled=true;
+    assert.equal((await s.recall({...request,graph:true,as_of:'2026-01-01T00:00:00.000Z'})).retrieval.graph.learned,undefined);
+    s.db.prepare('UPDATE association_edges SET updated_ms=?').run(Date.now()-300*86400000);
+    assert.equal(linked(await s.recall({...request,graph:true})),undefined);
+    assert.equal((await s.recall({ids:[answer.memory_id]})).items[0].verification.status,'unverified');
+  } finally {s.close();}
+});

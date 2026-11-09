@@ -8,7 +8,7 @@ import { RetrievalProfile } from './profile.js';
 import { QueryState, authority } from './state.js';
 import { extendedMetadata } from '../memory/versions.js';
 import { coversEffectiveTime, declaredFactState, decisionIntent, temporalPredicate } from '../memory/temporal.js';
-import { destination, graphBonus, graphEpoch, GraphReader, GRAPH_PAGE_WORK, GRAPH_SEEDS, GRAPH_VERSION, readGraph, startGraph,
+import { destination, graphBonus, graphEpoch, graphVersion, GraphReader, GRAPH_PAGE_WORK, GRAPH_SEEDS, readGraph, startGraph,
     type GraphPath, type GraphProgress } from './graph.js';
 type Context = {
     db: DatabaseSync;
@@ -187,9 +187,10 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     throw new MemoryError('CURSOR_STALE');
                 if(progress.graph) {
                     graphState=progress.graph;
-                    if(!config.graph_enabled || graphState!.version!==GRAPH_VERSION ||
+                    const learned=config.learned_graph_enabled&&!input.as_of;
+                    if(!config.graph_enabled || graphState!.version!==graphVersion(learned) ||
                        graphState!.profile!==profile || profile!==null&&runtimeProfile!==profile ||
-                       graphState!.epoch!==readGraph(()=>graphEpoch(db)))throw new MemoryError('CURSOR_GRAPH_CHANGED');
+                       graphState!.epoch!==readGraph(()=>graphEpoch(db,learned)))throw new MemoryError('CURSOR_GRAPH_CHANGED');
                 }
                 savedPage = state.db.prepare('SELECT * FROM pages WHERE q=? AND n=?').get(q, page);
                 if (!savedPage && page !== Number((state.db.prepare('SELECT coalesce(max(n),-1)+1 n FROM pages WHERE q=?').get(q) as any).n))
@@ -206,7 +207,10 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     if(graphFallback)progress.graphReason=graphFallback;
                     else if(!config.graph_enabled)progress.graphReason='GRAPH_DISABLED';
                     else if(input.exact_only)progress.graphReason='GRAPH_EXACT_ONLY';
-                    else graphState=progress.graph=startGraph(readGraph(()=>graphEpoch(db)),profile);
+                    else {
+                        const learned=config.learned_graph_enabled&&!input.as_of;
+                        graphState=progress.graph=startGraph(readGraph(()=>graphEpoch(db,learned)),profile,learned);
+                    }
                     if(progress.graphReason)warnings.push(progress.graphReason);
                 }
                 q = state.create({ authority: auth, generation: gen, input: JSON.stringify(input), vector: queryVector, profile, retrieval_mode: retrievalMode, resolved, progress: JSON.stringify(progress), expires: Date.now() + config.query_ttl_seconds * 1000 });
@@ -224,7 +228,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 progress.idDone = !identifiers(input.query!).length;
             }
         }
-        if(graphState)graphReader=readGraph(()=>new GraphReader(db,eligible,input));
+        if(graphState)graphReader=readGraph(()=>new GraphReader(db,eligible,input,graphState!.learnedAt));
         const local = { vector: new Set<string>(), fts: new Set<string>(), identifier: new Set<string>() }, candidates = new Map<string, Candidate>();
         let work = 0, lowGain = false;
         // Local exclusion already covers this request; persist each channel once.
@@ -604,6 +608,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         delete plan.feedback;
         if(!savedPage && input.graph)
             plan.graph=graphState?{state:'active',epoch:graphState.epoch,frontier:graphState.frontier.length,
+                ...(graphState.learnedAt!==undefined&&{learned:true}),
                 limited:graphState.neighborLimited||graphState.dependencyLimited}
                 :{state:['GRAPH_DISABLED','GRAPH_EXACT_ONLY'].includes(progress.graphReason)?'disabled':'degraded',reason:progress.graphReason};
         const pageWarnings = cachedWarnings?.initial ?? [...new Set(warnings)];

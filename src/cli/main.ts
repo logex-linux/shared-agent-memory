@@ -45,6 +45,10 @@ async function main() {
       case 'recall':return await service.recall(await input());
       case 'feedback':return await service.feedback(await input());
       case 'project-feedback':return service.projectFeedback(Number(flag('limit','100')),args.includes('--rebuild'));
+      case 'consolidate': {
+        if(!args.includes('--dry-run')||args.includes('--commit'))throw new MemoryError('CONSOLIDATION_DRY_RUN_REQUIRED');
+        return service.consolidate(await input());
+      }
       case 'propose':return await service.propose(await input());
       case 'commit':return await service.commit(await input());
       case 'forget':return await service.forget(await input());
@@ -80,7 +84,7 @@ async function main() {
         }
         return {dry_run:!commit,entries};
       }
-      default:throw new Error('Commands: cache-inspect cache-maintenance init project resolve-project inspect recall feedback project-feedback propose commit forget discard-proposal import export reindex check maintenance');
+      default:throw new Error('Commands: cache-inspect cache-maintenance init project resolve-project inspect recall feedback project-feedback consolidate propose commit forget discard-proposal import export reindex check maintenance');
     }
   } finally {service.close();}
 }
