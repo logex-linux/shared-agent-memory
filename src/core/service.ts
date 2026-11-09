@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs';
 import { Storage } from '../storage/database.js';
 import { indexChunk } from '../retrieval/indexes.js';
-import { QueryState } from '../retrieval/state.js';
+import { QueryState, authority } from '../retrieval/state.js';
 import { retrieve } from '../retrieval/recall.js';
 import { BgeEncoder } from '../embedding/bge.js';
 import { ftsQuery, terms, identifiers } from '../retrieval/lexical.js';
@@ -12,7 +12,8 @@ import { recordHash } from '../memory/versions.js';
 import { parseArchive, VERSION_ARCHIVE } from '../memory/archive.js';
 import { coversEffectiveTime } from '../memory/temporal.js';
 import { supersededRecord, validateTransition, type TransitionPlan } from '../memory/transitions.js';
-import { MemoryError, applicability, hash, stable, configSchema, proposeSchema, recallSchema, commitSchema, forgetSchema,
+import { projectFeedback, recordFeedback } from '../memory/feedback.js';
+import { MemoryError, applicability, hash, stable, configSchema, proposeSchema, recallSchema, commitSchema, forgetSchema, feedbackSchema,
   recordSchema, type Config, type Encoder, type MemoryRecord, type Chunk } from './contracts.js';
 
 type Row={id:string;project_id:string|null;scope:string;body:string;revision:number;status:string;created_at:string;verified_at:string;profile_id:string;content_hash:string;import_key:string|null;written_by:string};
@@ -319,6 +320,48 @@ export class MemoryService {
     if(input.project_id)this.scope(input.project_id,'project');
     if(input.include_global??(!input.project_id&&this.config.allow_global))this.scope(null,'global');
     return retrieve({db:this.db,config:this.config,encoder:this.encoder,generation:()=>this.storage.generation(),checkpoint:this.checkpoint},input,mode);
+  }
+  async feedback(raw:unknown) {
+    this.permission('feedback');this.permission('recall');
+    const input=feedbackSchema.parse(raw),cache=QueryState.open(this.db,this.config);
+    const receipt=cache.receipt(input.page_receipt);
+    return this.storage.transaction(()=>{
+      const retry=this.event(input.request_id,'feedback',input);
+      if(retry)return retry;
+      if(!receipt || receipt.authority!==authority(this.config,this.db))throw new MemoryError('FEEDBACK_RECEIPT_UNAVAILABLE');
+      if(Number(receipt.expires)<=Date.now())throw new MemoryError('FEEDBACK_RECEIPT_EXPIRED');
+      const used=JSON.parse(String(receipt.used)) as typeof input.used;
+      const context=recallSchema.parse(JSON.parse(String(receipt.input))).context;
+      const endpoints=input.used.map(ref=>{
+        if(!used.some(saved=>saved.memory_id===ref.memory_id&&saved.revision===ref.revision))
+          throw new MemoryError('FEEDBACK_EVIDENCE_NOT_RETURNED');
+        const row=this.db.prepare('SELECT * FROM memories WHERE id=?').get(ref.memory_id) as Row|undefined;
+        if(!row)throw new MemoryError('FEEDBACK_EVIDENCE_STALE');
+        this.scope(row.project_id,row.scope);
+        const record=JSON.parse(row.body) as MemoryRecord;
+        if(row.status!=='active' || row.revision!==ref.revision ||
+          (record.lifecycle??'current')!=='current' || !coversEffectiveTime(record.valid_time,now()) ||
+          applicability(record.valid_for,context)!=='current' || this.isRevoked(row.id,row.import_key??undefined,[row.content_hash]))
+          throw new MemoryError('FEEDBACK_EVIDENCE_STALE');
+        return row;
+      });
+      const scope=endpoints[0];
+      if(endpoints.some(row=>row.scope!==scope.scope||row.project_id!==scope.project_id))throw new MemoryError('FEEDBACK_SCOPE');
+      const result=recordFeedback(this.db,this.config,input,scope);
+      if(result.recorded)this.receipt(input.request_id,'feedback',input,scope.project_id,scope.scope,result);
+      this.checkpoint('feedback:queued');
+      return result;
+    });
+  }
+  projectFeedback(limit=100,rebuild=false) {
+    this.permission('manage');
+    if(!this.config.all_projects||!this.config.allow_global)throw new MemoryError('MAINTENANCE_SCOPE_DENIED');
+    if(!Number.isSafeInteger(limit)||limit<1||limit>1000)throw new MemoryError('PROJECTION_BATCH_INVALID');
+    return this.storage.transaction(()=>{
+      const result=projectFeedback(this.db,limit,rebuild);
+      this.checkpoint('feedback:projected');
+      return result;
+    });
   }
   async forget(raw:unknown) {
     this.permission('forget');const input=forgetSchema.parse(raw);

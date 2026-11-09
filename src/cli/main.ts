@@ -43,6 +43,8 @@ async function main() {
       case 'project':return await service.project(flag('id')!,flag('name')!,resolve(flag('alias')!));
       case 'resolve-project':return await service.resolveProject(resolve(flag('path',process.cwd())!));
       case 'recall':return await service.recall(await input());
+      case 'feedback':return await service.feedback(await input());
+      case 'project-feedback':return service.projectFeedback(Number(flag('limit','100')),args.includes('--rebuild'));
       case 'propose':return await service.propose(await input());
       case 'commit':return await service.commit(await input());
       case 'forget':return await service.forget(await input());
@@ -78,7 +80,7 @@ async function main() {
         }
         return {dry_run:!commit,entries};
       }
-      default:throw new Error('Commands: cache-inspect cache-maintenance init project resolve-project inspect recall propose commit forget discard-proposal import export reindex check maintenance');
+      default:throw new Error('Commands: cache-inspect cache-maintenance init project resolve-project inspect recall feedback project-feedback propose commit forget discard-proposal import export reindex check maintenance');
     }
   } finally {service.close();}
 }

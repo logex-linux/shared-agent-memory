@@ -33,9 +33,10 @@ Accepted for isolated implementation. Release baseline is v0.4.8 at
   the same domain. A graph query pins generation, graph epoch and the initial
   effective time. Graph-off continuations ignore graph-only epoch changes.
   Projection jobs and their watermark live in canonical SQLite.
-- The sidecar remains disposable and serialized. A page receipt attests to
-  what the named connection actually received. It does not attest to the
-  correctness of feedback. Repeated reads create no canonical learning event.
+- The sidecar remains disposable and serialized. An opaque page receipt
+  identifies the exact ID/revision pairs materialized for the named connection.
+  It does not attest to client delivery or the correctness of feedback.
+  Repeated reads create no canonical learning event.
 - Forget erases all available revisions and the dependent subtree, then revokes
   each deleted hash. Ordinary association neighbors retain their content.
   Restore must apply the latest external ledger before making results visible.

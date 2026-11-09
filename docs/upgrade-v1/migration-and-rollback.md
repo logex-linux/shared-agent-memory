@@ -64,3 +64,10 @@ P3 advances to Schema 8 in the same migration transaction. It adds a graph
 epoch and traversal and revocation indexes. The existing edge and record rows
 are unchanged. Set `graph_enabled` to `false` for compatibility retrieval on
 the upgraded database. A stored graph cursor must restart after this change.
+
+The feedback ingestion stage advances to Schema 9. Its event inputs,
+transactional projection jobs and association state are canonical tables.
+SQLite backups retain them. The logical version archive remains a record
+archive. Query receipts stay in the disposable sidecar and should be
+regenerated after a restore. Existing connection configurations gain no
+feedback permission.

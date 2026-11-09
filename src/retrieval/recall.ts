@@ -1,4 +1,5 @@
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { MemoryError, verificationSchema, hash, type Config, type Encoder, type RecallInput } from '../core/contracts.js';
 import { identifiers, ftsQuery, terms } from './lexical.js';
 import { answerIntent, factState, focusTerms, evidenceWindow, referenceEvidence, type FactState } from './evidence.js';
@@ -598,13 +599,17 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         const draftPlan = { mode: expansion ?? resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
         const plan: any = savedPage ? parse(savedPage.plan) : draftPlan;
         const cachedWarnings = plan.graph_page_warnings;
+        const cachedFeedback = plan.feedback;
         delete plan.graph_page_warnings;
+        delete plan.feedback;
         if(!savedPage && input.graph)
             plan.graph=graphState?{state:'active',epoch:graphState.epoch,frontier:graphState.frontier.length,
                 limited:graphState.neighborLimited||graphState.dependencyLimited}
                 :{state:['GRAPH_DISABLED','GRAPH_EXACT_ONLY'].includes(progress.graphReason)?'disabled':'degraded',reason:progress.graphReason};
         const pageWarnings = cachedWarnings?.initial ?? [...new Set(warnings)];
         const result: any = { items: [], generation: gen, retrieval_mode: retrievalMode, warnings: [...pageWarnings], empty_reason: null, evidence_status: 'none', has_more: false, next_cursor: null, retrieval: cachedWarnings ? {...draftPlan, graph:plan.graph} : plan };
+        if(state && config.operations.includes('feedback'))
+            result.feedback_receipt=savedPage?cachedFeedback?.token:randomUUID();
         // Explicit expansion has no query cursor. Account for continuation IDs in
         // the budget before reading bodies; filtered IDs never enter this list.
         const remainingKey = expansion==='versions'?'remaining_versions':'remaining_ids';
@@ -725,6 +730,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             result.warnings = cachedWarnings.final;
             result.retrieval = plan;
         }
+        if (!result.items.length || blocked) delete result.feedback_receipt;
         profileTrace?.add('materialization',performance.now()-materializeStarted);
         const persistStarted=performance.now();
         if (state) {
@@ -745,7 +751,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 result.next_cursor = more ? state.cursor(q, blocked ? page : page + 1) : null;
                 if (!blocked) {
                     const graphPage = plan.graph ? {graph_page_warnings:{initial:pageWarnings,final:result.warnings}} : {};
-                    state.db.prepare('INSERT INTO pages VALUES(?,?,?,?,?)').run(q, page, JSON.stringify(fitted.map(id => candidateMap.get(id))), JSON.stringify(options), JSON.stringify({ ...plan, has_more: more, ...graphPage }));
+                    const feedback = result.feedback_receipt ? {token:result.feedback_receipt,
+                        used:result.items.map((item:any)=>({memory_id:item.id,revision:item.revision}))} : undefined;
+                    state.db.prepare('INSERT INTO pages VALUES(?,?,?,?,?)').run(q, page, JSON.stringify(fitted.map(id => candidateMap.get(id))), JSON.stringify(options), JSON.stringify({ ...plan, has_more: more, ...graphPage, feedback }));
                 }
             }
             else {

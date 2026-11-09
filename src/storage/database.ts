@@ -7,8 +7,9 @@ import { migrateSearch } from '../retrieval/indexes.js';
 import { migrateVersions } from '../memory/versions.js';
 import { migrateRelations } from '../memory/transitions.js';
 import { migrateGraph } from '../retrieval/graph.js';
+import { migrateFeedback } from '../memory/feedback.js';
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export class Storage {
   db: DatabaseSync;
@@ -88,6 +89,10 @@ export class Storage {
     if(version<8){
       migrateGraph(this.db);
       this.db.exec('PRAGMA user_version=8;');
+    }
+    if(version<9){
+      migrateFeedback(this.db);
+      this.db.exec('PRAGMA user_version=9;');
     }
   }
   transaction<T>(fn:()=>T):T {

@@ -9,7 +9,7 @@ stage adds its executable examples here after its acceptance checks.
 | Exact version expansion and event metadata | P1 | Implemented and tested |
 | Effective time, decision state and atomic transitions | P2 | Implemented and tested |
 | Bounded related-evidence paths | P3 | Implemented, experimental and off by default |
-| Authorized feedback and dry-run consolidation | P4 | Planned |
+| Authorized feedback and dry-run consolidation | P4 | Feedback ingestion and projection implemented. Graph consumption and consolidation pending. |
 
 A record may include `memory_form` of `legacy`, `episodic`, `semantic` or
 `procedural`. This leaves its existing `kind` intact. Optional `episode`
@@ -125,3 +125,41 @@ The cursor pins the initial effective time, algorithm and model profile as
 well as scope, canonical generation and graph epoch. Restart on
 `CURSOR_GRAPH_CHANGED`. Ordinary graph-off cursors ignore a graph-only epoch
 change. Pages save paths and warnings so the same cursor can be replayed.
+
+An operator may explicitly grant the `feedback` operation. That connection
+receives an opaque `feedback_receipt` on nonempty query pages and can call
+`memory_feedback`. A receipt binds the generated page to its connection,
+authority and exact returned ID/revision pairs. It expires with the query
+cache. Use a fresh query for `FEEDBACK_RECEIPT_EXPIRED` or
+`FEEDBACK_RECEIPT_UNAVAILABLE`. A missing, obsolete or inapplicable revision
+cannot be used. Both endpoints of a pair must share the same project or the
+global scope. There is no receipt on explicit ID or revision expansion.
+
+```json
+{
+  "request_id":"8ec2ef11-4fe1-48e2-abba-93df7f8d1493",
+  "task_id":"a7f4bc15-ec87-4d3c-95ad-47f88ec1926a",
+  "page_receipt":"adbfdb6c-8dfb-4de4-98ec-b1cd229e5d70",
+  "used":[{"memory_id":"31dbd102-1990-4891-87a4-080d74d64b13","revision":2}],
+  "outcome":"useful",
+  "basis":"agent_report"
+}
+```
+
+These are example IDs. Send only one or two evidence versions actually used.
+Use the same `task_id` across that task's feedback. `outcome` also accepts
+`irrelevant` and `misleading`. `test_result` and `user_evaluation` require
+an `evidence_ref`, which the server stores as a digest. The default
+`feedback_policy: "observe"` queues observations with zero weight.
+`trusted_outcomes` is an operator trust decision. It permits weighted test
+and user outcome reports from that connection. The fields alone do not
+verify those reports. Agent reports always have zero weight.
+
+`feedback --config FILE --input FILE` uses the same contract. An operator
+with `manage` and full scope can run `project-feedback --config FILE` to
+apply queued inputs in order. `--limit` accepts 1 to 1000 jobs. `--rebuild`
+clears the projection and restarts from retained events. Continue regular
+batches until `pending` reaches zero. The initial weights use a 30-day
+half-life, increments of 0.2 for useful pairs, decrements of 0.1 or 0.3 for
+irrelevant or misleading pairs and a range of [0, 1]. The policy is versioned.
+Neither observation nor projection changes memory verification.

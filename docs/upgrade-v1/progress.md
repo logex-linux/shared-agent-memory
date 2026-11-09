@@ -11,7 +11,7 @@ lockfile. Production inspection uses SQLite read-only access and existing MCP.
 | P1 versions and events | Passed | Schema 6, versioned archive, 101 tests, 607 identical frozen pages and 53 identical private replays |
 | P2 explicit state and relations | Passed | Schema 7, 107 tests, atomic predecessor updates, scoped relation revisions, 607 matching frozen pages and 53 matching private replays |
 | P3 bounded graph recall | Implemented, experimental | Schema 8, 111 tests, 607 matching frozen pages, 53 matching private pages, no gain on frozen cross-event subset |
-| P4 feedback, consolidation and forget | Pending | P3 and receipt authorization |
+| P4 feedback, consolidation and forget | In progress | Schema 9 receipt-bound feedback, transactional projection and current endpoint erasure. 114 tests and 607 matching compatibility pages. |
 | P5 evaluation and recovery | Pending | All stage gates and release evaluation |
 
 P0 artifacts are under `.local/upgrade-v1/p0/`. `build.log` and `tests.log`
@@ -56,6 +56,16 @@ and shared work budgets. The full suite covers Schema 5 migration through Schema
 matches 53 private pages. The real-BGE B/C cross-event comparison reached the
 Recall@5 ceiling in both arms. Keep graph disabled by default.
 
-Next P4 adds authorized page receipts, feedback and its projection, dry-run
-consolidation and broader forgetting coverage. P5 still needs full A/B/C/D/E
+P4 feedback ingestion records only authorized, current ID/revision pairs from
+opaque page receipts. It queues events and supports a bounded projection batch
+and replay. Observations do not change association weights. The first P4 tests
+cover permission and expiry, canonical write isolation on recall, concurrent
+retry and SIGKILL rollback of projection. Result files are under
+`.local/upgrade-v1/p4/`. `npm run build` and all 114 tests passed. The three
+frozen corpora rerun with `BENCH_LABEL=v1-p4-feedback` matched all 607 pages
+with zero full-body reads under the old permissions and graph-off requests.
+See `feedback-full-suite.log` and `feedback-compatibility.json`.
+
+P4 still needs opt-in learned-edge consumption, dry-run consolidation and
+historical derivation and revocation coverage. P5 still needs full A/B/C/D/E
 trajectory scoring, the scale matrix and complete recovery rehearsals.

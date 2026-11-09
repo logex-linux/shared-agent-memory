@@ -82,6 +82,17 @@ export const proposeSchema = z.object({ request_id: request, record: recordSchem
 });
 export const commitSchema = z.object({ request_id: request, proposal_id: z.string().uuid(), expected_revision: z.number().int().nonnegative() }).strict();
 export const forgetSchema = z.object({ request_id: request, memory_id: z.string().uuid(), expected_revision: z.number().int().positive() }).strict();
+export const feedbackSchema = z.object({
+  request_id:request, task_id:z.string().uuid(), page_receipt:z.string().uuid(),
+  used:z.array(versionRefSchema).min(1).max(2),
+  outcome:z.enum(['useful','irrelevant','misleading']),
+  basis:z.enum(['agent_report','test_result','user_evaluation']), evidence_ref:text(500).optional()
+}).strict().superRefine((input,ctx)=>{
+  if(new Set(input.used.map(ref=>ref.memory_id)).size!==input.used.length)
+    ctx.addIssue({code:'custom',path:['used'],message:'Use distinct memory IDs'});
+  if(input.basis!=='agent_report'&&!input.evidence_ref)
+    ctx.addIssue({code:'custom',path:['evidence_ref'],message:'An outcome reference is required for this basis'});
+});
 export const recallSchema = z.object({
   query: text(512).optional(), ids: z.array(z.string().uuid()).min(1).max(10).optional(),
   versions:z.array(versionRefSchema).min(1).max(10).optional(),
@@ -101,7 +112,7 @@ export const recallSchema = z.object({
 export const configSchema = z.object({
   database: z.string().startsWith('/'), model_dir: z.string().startsWith('/'),
   allowed_projects: z.array(z.string().uuid()).min(1), all_projects: z.boolean().default(false), allow_global: z.boolean().default(false),
-  operations: z.array(z.enum(['recall','propose','commit','forget','manage','verify'])).min(1).default(['recall']),
+  operations: z.array(z.enum(['recall','propose','commit','forget','manage','verify','feedback'])).min(1).default(['recall']),
   connection_id:text(256).default('local-core'),
   semantic_threshold: z.number().min(0).max(1).default(0.425),
   evidence_threshold: z.number().min(0).max(1).default(0.575),
@@ -117,7 +128,8 @@ export const configSchema = z.object({
   cache_disk_max_bytes:z.number().int().min(1048576).max(4294967296).default(134217728),
   cache_cleanup_rows:z.number().int().min(1).max(4096).default(256),
   diagnostics:z.boolean().default(false),
-  graph_enabled:z.boolean().default(false)
+  graph_enabled:z.boolean().default(false),
+  feedback_policy:z.enum(['observe','trusted_outcomes']).default('observe')
 }).strict();
 export type Config = z.infer<typeof configSchema>;
 export type RecallInput = z.infer<typeof recallSchema>;

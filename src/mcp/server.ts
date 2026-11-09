@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ZodError } from 'zod';
 import { MemoryService, readConfig } from '../core/service.js';
-import { MemoryError, recallSchema, proposeSchema, commitSchema, forgetSchema } from '../core/contracts.js';
+import { MemoryError, recallSchema, proposeSchema, commitSchema, forgetSchema, feedbackSchema } from '../core/contracts.js';
 
 const path=process.env.SHARED_MEMORY_CONFIG;
 if(!path)throw new Error('SHARED_MEMORY_CONFIG absolute path is required');
@@ -23,6 +23,7 @@ if(service.config.operations.includes('recall'))server.registerTool('memory_reca
 if(service.config.operations.includes('propose'))server.registerTool('memory_propose',{description:'Persist a user-authorized memory candidate with traceable sources, a real UUID request_id and actual ISO source timestamps. It is not visible until committed. New proposals omit target_id and expected_revision; revision 0 is for the subsequent commit. Updates require target_id and the current positive expected_revision. Ordinary storage uses verification.status=unverified; basis=user_confirmation records explicit user confirmation without claiming privileged verification. verified requires separate verify permission and evidence. Similarity is only a review hint.',inputSchema:proposeSchema.innerType().shape,annotations:{readOnlyHint:false,destructiveHint:false,openWorldHint:false}},handle(x=>service.propose(x)));
 if(service.config.operations.includes('commit'))server.registerTool('memory_commit',{description:'Publish an authorized pending proposal, generating real local embeddings atomically with indexes. Use a fresh request_id distinct from the propose request_id; reuse only for identical commit retries. expected_revision is 0 for a new memory. Re-read conflicts.',inputSchema:commitSchema.shape,annotations:{readOnlyHint:false,destructiveHint:true,openWorldHint:false}},handle(x=>service.commit(x)));
 if(service.config.operations.includes('forget'))server.registerTool('memory_forget',{description:'Execute an explicit user forget request; erase memory and dependent bodies/indexes and report managed cleanup. Cannot retract earlier chat results or unmanaged backups.',inputSchema:forgetSchema.shape,annotations:{readOnlyHint:false,destructiveHint:true,openWorldHint:false}},handle(x=>service.forget(x)));
+if(service.config.operations.includes('feedback'))server.registerTool('memory_feedback',{description:'Record an authorized task outcome for one or two actually used ID/revision pairs from a recall page. Supply its feedback_receipt as page_receipt and a stable UUID task_id. Feedback is about retrieval utility. It cannot verify a memory. Agent reports do not change association weights.',inputSchema:feedbackSchema.innerType().shape,annotations:{readOnlyHint:false,destructiveHint:false,openWorldHint:false}},handle(x=>service.feedback(x)));
 // One process serializes calls; separate clients remain independent SQLite processes.
 await server.connect(new StdioServerTransport());
 let closing=false;
