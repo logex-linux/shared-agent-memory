@@ -20,4 +20,35 @@ recovery that restores Schema 5 requires a separately verified conversion from
 the latest legal data and a retained new database. Where legacy cannot express
 the needed state, retain the new database and repair within the new runtime.
 
-Migration, fault injection and rollback rehearsals are pending.
+Full P5 rehearsals and the final switch checklist remain pending.
+
+P1 rehearsals verified the Schema 5 backup and Schema 6 projection with
+matching bodies, hashes, revisions, index records and vector bytes. SIGKILL
+immediately before commit left Schema 5 intact. SIGKILL after commit left the
+complete Schema 6 copy. Four parallel openers converged on one version copy.
+Use `node --test tests/versions.test.mjs` after building to repeat the synthetic
+migration, scope, archive and revocation tests.
+
+Use an explicitly isolated config for the versioned logical archive.
+
+```sh
+node dist/cli/main.js export --config "$ISOLATED_CONFIG" --project "$PROJECT_ID" --format versioned
+node dist/cli/main.js import --config "$RESTORE_CONFIG" --input "$ARCHIVE_FILE"
+node dist/cli/main.js import --config "$RESTORE_CONFIG" --input "$ARCHIVE_FILE" --mode restore --revocations "$LATEST_LEDGER" --commit
+node dist/cli/main.js check --config "$RESTORE_CONFIG"
+```
+
+The new format is `shared-agent-memory/versions-v1`. Its `records` contain
+every retained revision for each selected record. Restore requires matching
+registered projects, checks body hashes and revision continuity, checks current
+scope and privileges, and indexes the active latest revision with the configured
+local model. A matching existing archive entry is idempotent. A conflicting
+entry or revoked hash stops the restore. An archive that includes a verified
+record requires an operator with verify permission. Keep using SQLite backup
+for byte-identical vectors and for preservation of other canonical tables.
+
+Revocation entries can carry `version_hashes`. Apply the latest ledger before
+reading restored evidence. Managed exports containing forgotten content are
+removed under the existing cleanup protocol. The new archive was refused by
+the v0.4.8 importer on an isolated Schema 5 target. The old runtime also
+reported `SCHEMA_TOO_NEW` when pointed at the Schema 6 rehearsal copy.

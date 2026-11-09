@@ -26,6 +26,16 @@ export const verificationSchema = z.object({
   basis:z.enum(['source_claim','model_inference','user_confirmation','code_review','document_review']).default('source_claim').describe('Provenance basis, independent of verification status. user_confirmation may be stored with status=unverified.'),
   evidence:text(2000).optional(),reviewer:text(256).optional(),reviewed_at:z.string().datetime().optional()
 }).strict();
+const eventTime = z.string().datetime().nullable().optional();
+const episodeSchema = z.object({
+  conversation_ref:text(500).optional(), session_ref:text(500).optional(), event_ref:text(500).optional(),
+  speaker:text(180).nullable().optional(), event_time:eventTime, context:text(500).optional()
+}).strict();
+const effectiveTimeSchema = z.object({ valid_from:eventTime, valid_to:eventTime }).strict().refine(
+  interval=>!interval.valid_from || !interval.valid_to || Date.parse(interval.valid_from)<Date.parse(interval.valid_to),
+  {message:'valid_from must precede valid_to'}
+);
+export const versionRefSchema = z.object({memory_id:z.string().uuid(),revision:z.number().int().positive().safe()}).strict();
 export const recordSchema = z.object({
   project_id: z.string().uuid().nullable(), scope: z.enum(['project', 'global']),
   kind: z.enum(['preference', 'fact', 'decision', 'procedure', 'lesson']),
@@ -35,7 +45,9 @@ export const recordSchema = z.object({
   valid_for: validSchema.default({}),
   author_client: text(80), author_session: text(256),
   derived_from: z.array(z.object({ memory_id: z.string().uuid(), revision: z.number().int().positive() }).strict()).max(20).default([]),
-  import_key: text(256).optional()
+  import_key: text(256).optional(),
+  memory_form:z.enum(['legacy','episodic','semantic','procedural']).optional(),
+  episode:episodeSchema.nullable().optional(), valid_time:effectiveTimeSchema.nullable().optional()
 }).strict().superRefine((r, ctx) => {
   if ((r.scope === 'global') !== (r.project_id === null)) ctx.addIssue({code:'custom', message:'global requires null project_id; project requires UUID'});
 });
@@ -50,13 +62,15 @@ export const commitSchema = z.object({ request_id: request, proposal_id: z.strin
 export const forgetSchema = z.object({ request_id: request, memory_id: z.string().uuid(), expected_revision: z.number().int().positive() }).strict();
 export const recallSchema = z.object({
   query: text(512).optional(), ids: z.array(z.string().uuid()).min(1).max(10).optional(),
+  versions:z.array(versionRefSchema).min(1).max(10).optional(),
   project_id: z.string().uuid().optional(), include_global: z.boolean().optional(),
   context: validSchema.omit({expires_at:true}).default({}), limit: z.number().int().positive().safe().optional(),
   exact_only:z.boolean().default(false),token_budget:z.number().int().min(512).max(1000000).optional(),
   mode:z.enum(['auto','focused','broad']).optional(),view:z.enum(['chunks','evidence']).optional(),
   cursor:text(160).optional(),debug:z.boolean().default(false),max_bytes:z.number().int().min(2048).max(1048576).optional()
 }).strict().superRefine((r,ctx) => {
-  if (Number(Boolean(r.query))+Number(Boolean(r.ids))+Number(Boolean(r.cursor))!==1) ctx.addIssue({code:'custom', message:'exactly one of query, ids or cursor required'});
+  if (Number(Boolean(r.query))+Number(Boolean(r.ids))+Number(Boolean(r.cursor))+Number(Boolean(r.versions))!==1)
+    ctx.addIssue({code:'custom', message:r.versions?'exactly one of query, ids, cursor or versions required':'exactly one of query, ids or cursor required'});
   if(r.exact_only && !r.query)ctx.addIssue({code:'custom',message:'exact_only requires query'});
 });
 export const configSchema = z.object({

@@ -8,8 +8,8 @@ lockfile. Production inspection uses SQLite read-only access and existing MCP.
 | Stage | Status | Evidence |
 | --- | --- | --- |
 | P0 baseline | Passed | Build, 98 tests, frozen 120 and 60 query sets, 6 sanitized audit queries and 53 private replays |
-| P1 versions and events | In progress | ADR and baseline risk reproduction |
-| P2 explicit state and relations | Pending | P1 migration, restore and permission gates |
+| P1 versions and events | Passed | Schema 6, versioned archive, 101 tests, 607 identical frozen pages and 53 identical private replays |
+| P2 explicit state and relations | In progress | State metadata and atomic transition contracts next |
 | P3 bounded graph recall | Pending | P2 endpoints and graph-off comparison |
 | P4 feedback, consolidation and forget | Pending | P3 and receipt authorization |
 | P5 evaluation and recovery | Pending | All stage gates and release evaluation |
@@ -34,6 +34,12 @@ passing import preview after its ID changed. The same probe verified environment
 filtering, parent-update invalidation, and zero canonical event writes on repeated
 recall. Feedback is unavailable at baseline. See `baseline-risks.json`.
 
-Next P1 gate covers byte-preserving migration, history reads with budget and
-permission checks, and recovery under interruption. The fixture and original
-baselines remain frozen for all later comparisons.
+P1 results are in `.local/upgrade-v1/p1/`. `tests-final.log` records 101 tests.
+`compatibility.json` matches all 607 pages over the three frozen corpora with
+zero full-body reads on ordinary queries. `private-replay/report.json` matches
+all 53 available pages. `wire-smoke.log` confirms real-BGE CLI archive restore,
+STDIO revision expansion and v0.4.8 refusal of both the new archive and Schema 6.
+
+P2 will add separate decision and lifecycle metadata with effective-time
+filtering, scoped revision-bound relations and atomic transition plans.
+The fixture and original baselines remain frozen for all later comparisons.

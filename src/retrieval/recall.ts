@@ -5,6 +5,7 @@ import { answerIntent, factState, focusTerms, evidenceWindow, referenceEvidence,
 import { prepared } from '../storage/statements.js';
 import { RetrievalProfile } from './profile.js';
 import { QueryState, authority } from './state.js';
+import { eventMetadata } from '../memory/versions.js';
 type Context = {
     db: DatabaseSync;
     config: Config;
@@ -43,8 +44,11 @@ const blob = (v: Float32Array) => Buffer.from(v.buffer, v.byteOffset, v.byteLeng
 const salienceScaffolding=new Set(terms('用户 已 废弃 改用 决定 配置 入口 最近 排错 记录 相关 当前 已有 既有'));
 export const estimateTokens = (bytes: number) => Math.ceil(bytes / 3);
 function eligibility(input: RecallInput, config: Config) {
-    const params: SQLInputValue[] = [Number(!input.project_id && config.all_projects), JSON.stringify(input.project_id ? [input.project_id] : config.allowed_projects), Number(input.include_global ?? (!input.project_id && config.allow_global)), new Date().toISOString()];
-    let sql = "s.status='active' AND ((s.scope='project' AND s.project_id IN (SELECT p.id FROM projects p WHERE ?=1 OR p.id IN (SELECT value FROM json_each(?)))) OR (?=1 AND s.scope='global')) AND (s.expires_at IS NULL OR julianday(s.expires_at)>julianday(?))";
+    const params: SQLInputValue[] = [Number(!input.project_id && config.all_projects), JSON.stringify(input.project_id ? [input.project_id] : config.allowed_projects), Number(input.include_global ?? (!input.project_id && config.allow_global))];
+    let sql = "s.status='active' AND ((s.scope='project' AND s.project_id IN (SELECT p.id FROM projects p WHERE ?=1 OR p.id IN (SELECT value FROM json_each(?)))) OR (?=1 AND s.scope='global'))";
+    if (input.versions) return {sql,params};
+    sql += ' AND (s.expires_at IS NULL OR julianday(s.expires_at)>julianday(?))';
+    params.push(new Date().toISOString());
     for (const [column, key] of [['branch', 'branch'], ['commit_ref', 'commit'], ['environment', 'environment']] as const) {
         sql += ` AND (s.${column} IS NULL OR ? IS NULL OR s.${column}=?)`;
         params.push(input.context[key] ?? null, input.context[key] ?? null);
@@ -96,7 +100,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
     };
     const parse = (s: string, metadata = false) => { d.json_parses++; if (metadata)
         d.metadata_json_parses++; return JSON.parse(s); };
-    let input = request, queryVector: Buffer | null = null, profile: string | null = null, retrievalMode: string = request.ids ? 'ids' : channel, warnings: string[] = [], state: QueryState | undefined, q = '', page = 0, resolved = 'focused', progress: any = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage: any;
+    const expansion = request.versions ? 'versions' : request.ids ? 'ids' : undefined;
+    const versions = new Map(request.versions?.map(ref=>[ref.memory_id+':'+ref.revision,ref]));
+    let input = request, queryVector: Buffer | null = null, profile: string | null = null, retrievalMode: string = expansion ?? channel, warnings: string[] = [], state: QueryState | undefined, q = '', page = 0, resolved = 'focused', progress: any = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage: any;
     const embeddingStarted=performance.now();
     if (!request.cursor && request.query && channel !== 'lexical')
         try {
@@ -112,7 +118,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
     profileTrace?.add('embedding',performance.now()-embeddingStarted);
     try {
-        if (!request.ids) {
+        if (!expansion) {
             const opened=performance.now();
             state = QueryState.open(ctx.db, config);
             profileTrace?.add('state_open',performance.now()-opened);
@@ -395,7 +401,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         traceBudget=options.max_bytes;
         let pool: Candidate[] = [], selected: string[] = [], contextPriority=false;
         let subjectLeader: string | undefined;
-        if (request.ids)
+        if (request.versions)
+            selected = [...versions.keys()];
+        else if (request.ids)
             selected = request.ids;
         else if (savedPage) {
             pool = parse(savedPage.ids);
@@ -457,7 +465,27 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     selected = selected.slice(0, 1);
             }
         }
-        const flags = new Map((db.prepare(`SELECT s.memory_id,(s.branch IS NOT NULL AND ? IS NULL OR s.commit_ref IS NOT NULL AND ? IS NULL OR s.environment IS NOT NULL AND ? IS NULL) requires_check FROM memory_search s WHERE ${eligible.sql} AND s.memory_id IN (SELECT value FROM json_each(?))`).all(input.context.branch ?? null, input.context.commit ?? null, input.context.environment ?? null, ...eligible.params, JSON.stringify(selected)) as any[]).map(r => [r.memory_id, r.requires_check]));
+        const flags = new Map<string,number>();
+        if (request.versions) {
+            const visible = db.prepare(`SELECT v.revision, s.revision current_revision, json_extract(v.body,'$.valid_for') valid_for
+                FROM memory_versions v JOIN memory_search s ON s.memory_id=v.memory_id
+                WHERE v.memory_id=? AND v.revision=? AND ${eligible.sql}
+                AND NOT EXISTS(SELECT 1 FROM tombstones t WHERE t.id=v.memory_id OR t.content_hash=v.content_hash)
+                AND NOT EXISTS(SELECT 1 FROM revoked_version_hashes h WHERE h.content_hash=v.content_hash)`);
+            for (const [key,ref] of versions) {
+                const row = visible.get(ref.memory_id,ref.revision,...eligible.params);
+                if (!row) continue;
+                const valid = parse(String(row.valid_for ?? '{}'),true);
+                const keys = ['branch','commit','environment'] as const;
+                if (keys.some(k=>valid[k] && input.context[k] && valid[k]!==input.context[k])) continue;
+                flags.set(key,Number(row.revision!==row.current_revision ||
+                    valid.expires_at && Date.parse(valid.expires_at)<=Date.now() ||
+                    keys.some(k=>valid[k] && !input.context[k])));
+            }
+        } else {
+            for (const row of db.prepare(`SELECT s.memory_id,(s.branch IS NOT NULL AND ? IS NULL OR s.commit_ref IS NOT NULL AND ? IS NULL OR s.environment IS NOT NULL AND ? IS NULL) requires_check FROM memory_search s WHERE ${eligible.sql} AND s.memory_id IN (SELECT value FROM json_each(?))`).all(input.context.branch ?? null, input.context.commit ?? null, input.context.environment ?? null, ...eligible.params, JSON.stringify(selected)))
+                flags.set(String(row.memory_id),Number(row.requires_check));
+        }
         if (savedPage && selected.some(id => !flags.has(id)))
             throw new MemoryError('CURSOR_STALE');
         if (state && !savedPage)
@@ -465,27 +493,35 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 if (!flags.has(id))
                     state.db.prepare('DELETE FROM candidates WHERE q=? AND id=?').run(q, id);
         selected = selected.filter(id => flags.has(id));
-        if (!savedPage) {
+        if (!savedPage && !request.versions) {
             const ranked=contextPriority?new Map(pool.map(c=>[c.id,c])):null;
             selected.sort((a, b) => Number(b === subjectLeader) - Number(a === subjectLeader)
                 || (ranked ? Number(directEvidence(ranked.get(b),config.evidence_threshold))-Number(directEvidence(ranked.get(a),config.evidence_threshold)) : 0) || Number(flags.get(a)) - Number(flags.get(b)));
         }
         d.candidate_ids = state ? Number((state.db.prepare('SELECT count(*) n FROM candidates WHERE q=?').get(q) as any).n) : selected.length;
         d.candidates_ranked = selected.length;
-        const plan: any = savedPage ? parse(savedPage.plan) : { mode: request.ids ? 'ids' : resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
+        const plan: any = savedPage ? parse(savedPage.plan) : { mode: expansion ?? resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
         const result: any = { items: [], generation: gen, retrieval_mode: retrievalMode, warnings: [...new Set(warnings)], empty_reason: null, evidence_status: 'none', has_more: false, next_cursor: null, retrieval: plan };
         // Explicit expansion has no query cursor. Account for continuation IDs in
         // the budget before reading bodies; filtered IDs never enter this list.
-        if(request.ids&&selected.length)result.remaining_ids=[...selected];
+        const remainingKey = expansion==='versions'?'remaining_versions':'remaining_ids';
+        const expansionRefs = (keys:string[])=>request.versions?keys.map(key=>versions.get(key)!):keys;
+        if(expansion&&selected.length)result[remainingKey]=expansionRefs(selected);
         if(profileTrace)profileTrace.add('candidates',Math.max(0,performance.now()-candidateStarted-['knn','fts_identifiers','ranking','candidate_sql'].reduce((n,k)=>n+(profileTrace.times[k]??0),0)));
         const materializeStarted=performance.now();if(profileTrace)profileTrace.current='materialization';
         const fitted: string[] = [], candidateMap = new Map(pool.map(c => [c.id, c]));
         let blocked = false;
         const fits = (reserve = 256) => {const bytes=Buffer.byteLength(JSON.stringify(result))+reserve;return bytes<=options.max_bytes-(debug?Math.min(2048,Math.floor(options.max_bytes/2)):0)&&estimateTokens(bytes)<=options.token_budget;};
-        for (const id of selected.slice(0, Math.min(options.limit, config.page_item_limit))) {
-            const row = db.prepare(`SELECT s.revision,s.project_id,s.scope,s.profile_id,s.metadata,m.content_hash,m.written_by,m.verified_at${request.ids ? ',m.body' : ''} FROM memory_search s JOIN memories m ON m.id=s.memory_id WHERE s.memory_id=?`).get(id) as any;
+        for (const key of selected.slice(0, Math.min(options.limit, config.page_item_limit))) {
+            const ref = versions.get(key), id = ref?.memory_id ?? key;
+            const row = ref
+                ? db.prepare(`SELECT v.*,v.recorded_at verified_at,s.scope,s.project_id,s.revision current_revision,
+                  (SELECT min(revision) FROM memory_versions WHERE memory_id=v.memory_id) history_start_revision,
+                  (SELECT count(*) FROM memory_versions WHERE memory_id=v.memory_id) history_version_count
+                  FROM memory_versions v JOIN memory_search s ON s.memory_id=v.memory_id WHERE v.memory_id=? AND v.revision=?`).get(id,ref.revision) as any
+                : db.prepare(`SELECT s.revision,s.project_id,s.scope,s.profile_id,s.metadata,m.content_hash,m.written_by,m.verified_at${request.ids ? ',m.body' : ''} FROM memory_search s JOIN memories m ON m.id=s.memory_id WHERE s.memory_id=?`).get(id) as any;
             let body: any;
-            if (request.ids) {
+            if (expansion) {
                 d.full_body_records_read++;
                 d.full_body_bytes_read += Buffer.byteLength(row.body);
                 body = parse(row.body);
@@ -493,7 +529,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             else
                 body = parse(row.metadata, true);
             const c = candidateMap.get(id), ids = c?.hits.slice(0, options.view === 'evidence' ? 1 : 2).map(h => h[0]) ?? [];
-            const loaded=request.ids?{rows:[],read:0}:readChunks(id,ids),chunks=loaded.rows;
+            const loaded=expansion?{rows:[],read:0}:readChunks(id,ids),chunks=loaded.rows;
             d.chunk_text_rows_read += loaded.read;
             const excerpts: any[] = [];
             let snippetSelection='chunk_fallback';
@@ -509,9 +545,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 else
                     excerpts.push({ start: x.start, end: x.end, text: x.text, chunk_ids: [x.id] });
             }
-            if (request.ids)
+            if (expansion)
                 excerpts.push({ start: 0, end: body.content.length, text: body.content, chunk_ids: [] });
-            if (options.view === 'evidence' && !request.ids) {
+            if (options.view === 'evidence' && !expansion) {
                 for (const e of excerpts) {
                     e.text = e.text.slice(0, 200);
                     e.end = e.start + e.text.length;
@@ -519,12 +555,14 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 excerpts.splice(1);
             }
             const referenceBackground=resolved==='focused'&&Boolean(c?.answer?.referenceBackground);
-            const strength = request.ids || c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold) ? 'supported' : 'weak';
-            const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: flags.get(id) ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? ['id'] };
+            const strength = expansion || c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold) ? 'supported' : 'weak';
+            const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: flags.get(key) ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? [ref?'version':'id'], ...eventMetadata(body) };
+            if (ref) Object.assign(item,{recorded_at:row.recorded_at,current_revision:row.current_revision,history_start_revision:row.history_start_revision,
+                history_complete:row.history_start_revision===1&&row.history_version_count===row.current_revision,does_not_imply_current:true});
             if (c?.answer) item.answer_relevance={state:c.answer.state,assessment:'local_claim_heuristic',intent:answerIntent(input.query??'')};
             if(referenceBackground){item.recall_reason=[...item.recall_reason,'background_only'];if(!result.warnings.includes('REFERENCE_EVIDENCE_MISSING'))result.warnings.push('REFERENCE_EVIDENCE_MISSING');}
-            if (options.view==='evidence'&&!request.ids) item.snippet_selection=snippetSelection;
-            if (request.ids)
+            if (options.view==='evidence'&&!expansion) item.snippet_selection=snippetSelection;
+            if (expansion)
                 Object.assign(item, { written_by: row.written_by, content_hash: row.content_hash, embedding_profile_id: row.profile_id, derived_from: body.derived_from, author_client: body.author_client, author_session: body.author_session, import_key: body.import_key, relevance: c ? { rrf: c.rrf, cosine: c.cosine, identifier_matches: c.exact } : undefined });
             result.items.push(item);
             if (!fits()) {
@@ -557,18 +595,18 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 }
                 if (!best) {
                     result.items.pop();
-                    result.blocked_ids = [id];
+                    result[request.versions?'blocked_versions':'blocked_ids'] = expansionRefs([key]);
                     blocked = true;
                     break;
                 }
                 shorten(best);
             }
-            fitted.push(id);
+            fitted.push(key);
         }
-        if(request.ids){
+        if(expansion){
             const remaining=selected.filter(id=>!fitted.includes(id));
-            if(remaining.length){result.remaining_ids=remaining;result.warnings.push('PARTIAL_ID_EXPANSION');}
-            else delete result.remaining_ids;
+            if(remaining.length){result[remainingKey]=expansionRefs(remaining);result.warnings.push(request.versions?'PARTIAL_VERSION_EXPANSION':'PARTIAL_ID_EXPANSION');}
+            else delete result[remainingKey];
             plan.stop_reason=blocked?'item_exceeds_budget':remaining.length?'page_budget':'exhausted';
         }
         profileTrace?.add('materialization',performance.now()-materializeStarted);

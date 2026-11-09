@@ -49,3 +49,11 @@ Release gates remain those in the architecture plan. Safety regressions are
 hard failures. Quality compares pairs at equal budget, with the original
 source events available to every arm. Graph and learning remain opt-in until
 the measured quality and performance criteria pass.
+
+The P1 rerun uses the same corpus copies, fixtures and options. Replace the
+baseline directory with the corresponding `.local/upgrade-v1/p1/<corpus>`
+and run the current `dist` with `BENCH_LABEL=v1-p1`. Compare each
+`samples[].pages[].response_hash` in the reports. All 607 pages matched
+(380 adaptive, 217 specialist and 10 sanitized call-audit). Each had zero
+ordinary full-body reads. The 53 private replay pages matched as well.
+These are compatibility runs and do not establish latency ratios.
