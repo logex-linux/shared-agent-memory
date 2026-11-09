@@ -3,9 +3,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, realpathSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { hash, MemoryError, type Config } from '../core/contracts.js';
-export const RANKING_VERSION = 'adaptive-v048';
+export const RANKING_VERSION = 'adaptive-v1-state';
 export function authority(config: Config, db: DatabaseSync) {
-    return hash({ ranking: RANKING_VERSION, database: realpathSync(config.database), connection: config.connection_id, projects: [...config.allowed_projects].sort(), all: config.all_projects, global: config.allow_global, operations: [...config.operations].sort(), semantic: config.semantic_threshold, evidence: config.evidence_threshold, model: config.model_dir, dtype: config.dtype, registry: db.prepare('SELECT id FROM projects ORDER BY id').all() });
+    return hash({ ranking: RANKING_VERSION, database: realpathSync(config.database), connection: config.connection_id, projects: [...config.allowed_projects].sort(), all: config.all_projects, global: config.allow_global, operations: [...config.operations].sort(), semantic: config.semantic_threshold, evidence: config.evidence_threshold, model: config.model_dir, dtype: config.dtype,
+        ...(config.operations.includes('feedback')&&{feedback_policy:config.feedback_policy}),registry: db.prepare('SELECT id FROM projects ORDER BY id').all() });
 }
 // Disposable query state: IDs, scores, offsets and facet keys only; never memory bodies.
 // A separate WAL writer serializes page creation without locking canonical memory writes.
@@ -30,7 +31,9 @@ export class QueryState {
     CREATE TABLE IF NOT EXISTS candidates(q TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,base REAL NOT NULL,admitted INTEGER NOT NULL,emitted INTEGER,project TEXT NOT NULL,topic TEXT NOT NULL,period TEXT NOT NULL,source TEXT NOT NULL,PRIMARY KEY(q,id));
     CREATE INDEX IF NOT EXISTS pending ON candidates(q,emitted,admitted,base);
     CREATE TABLE IF NOT EXISTS seen(q TEXT NOT NULL,channel TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(q,channel,id));
-    CREATE TABLE IF NOT EXISTS pages(q TEXT NOT NULL,n INTEGER NOT NULL,ids TEXT NOT NULL,options TEXT NOT NULL,plan TEXT NOT NULL,PRIMARY KEY(q,n));`);
+    CREATE TABLE IF NOT EXISTS pages(q TEXT NOT NULL,n INTEGER NOT NULL,ids TEXT NOT NULL,options TEXT NOT NULL,plan TEXT NOT NULL,PRIMARY KEY(q,n));
+    CREATE UNIQUE INDEX IF NOT EXISTS page_feedback_receipt ON pages(json_extract(plan,'$.feedback.token'))
+        WHERE json_extract(plan,'$.feedback.token') IS NOT NULL;`);
         const deadline=Date.now()+5000;for(;;){try{initialize();break;}catch(e:any){if(!/busy|locked/i.test(e.message)||Date.now()>=deadline)throw e;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}}
         // Additive, disposable sidecar migration. Canonical Schema 5 is untouched.
         const initialized=this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='cache_meta'").get();
@@ -129,6 +132,10 @@ export class QueryState {
         if (!row || row.expires < Date.now())
             throw new MemoryError('CURSOR_EXPIRED');
         return { row, page: Number(match[2]) };
+    }
+    receipt(token:string) {
+        return this.db.prepare(`SELECT q.authority,q.expires,q.input,json_extract(p.plan,'$.feedback.used') used
+            FROM pages p JOIN queries q ON q.id=p.q WHERE json_extract(p.plan,'$.feedback.token')=?`).get(token);
     }
     cursor(q: string, page: number) { return `am4:${q}:${page}`; }
     commit() { this.db.exec('COMMIT');this.timing.held_ms+=performance.now()-this.heldAt; }

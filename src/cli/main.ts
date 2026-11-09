@@ -3,10 +3,16 @@ import { mkdir, readFile, writeFile,realpath,access,stat } from 'node:fs/promise
 import { resolve, join,basename } from 'node:path';
 import { MemoryService, readConfig } from '../core/service.js';
 import { hash, MemoryError, recordSchema,configSchema } from '../core/contracts.js';
+import { VERSION_ARCHIVE } from '../memory/archive.js';
 
 const args=process.argv.slice(2),command=args.shift();
 function flag(name:string,fallback?:string) {const index=args.indexOf('--'+name);return index<0?fallback:args[index+1];}
 async function input(){const file=flag('input');if(!file)throw new Error('--input FILE required');return JSON.parse(await readFile(resolve(file),'utf8'));}
+async function latestRevocations() {
+  const file=flag('revocations');
+  if(!file)throw new MemoryError('LATEST_REVOCATIONS_REQUIRED');
+  return (await readFile(resolve(file),'utf8')).split('\n').filter(line=>line.trim()).map(line=>JSON.parse(line));
+}
 async function main() {
   if(command==='init') {
     const requested=flag('project');if(!requested)throw new MemoryError('WORK_PROJECT_REQUIRED');
@@ -37,39 +43,48 @@ async function main() {
       case 'project':return await service.project(flag('id')!,flag('name')!,resolve(flag('alias')!));
       case 'resolve-project':return await service.resolveProject(resolve(flag('path',process.cwd())!));
       case 'recall':return await service.recall(await input());
+      case 'feedback':return await service.feedback(await input());
+      case 'project-feedback':return service.projectFeedback(Number(flag('limit','100')),args.includes('--rebuild'));
+      case 'consolidate': {
+        if(!args.includes('--dry-run')||args.includes('--commit'))throw new MemoryError('CONSOLIDATION_DRY_RUN_REQUIRED');
+        return service.consolidate(await input());
+      }
       case 'propose':return await service.propose(await input());
       case 'commit':return await service.commit(await input());
       case 'forget':return await service.forget(await input());
       case 'discard-proposal':return await service.discardProposal(flag('id')!);
-      case 'export':return await service.export(flag('project')!,args.includes('--global'),flag('format','json') as 'json'|'markdown');
+      case 'export':return await service.export(flag('project')!,args.includes('--global'),flag('format','json') as 'json'|'markdown'|'versioned');
       case 'import': {
         const data=await input();
-        const memories=Array.isArray(data)?data:data.memories;
-        if(!Array.isArray(memories))throw new Error('Expected records array or export object');
         const mode=flag('mode');
         if(mode && !['new','restore'].includes(mode))throw new MemoryError('IMPORT_MODE_INVALID');
-        if(args.includes('--commit') && !mode)throw new MemoryError('IMPORT_MODE_REQUIRED');
+        const commit=args.includes('--commit');
+        if(commit && !mode)throw new MemoryError('IMPORT_MODE_REQUIRED');
+        if(data?.format===VERSION_ARCHIVE) {
+          if(mode==='new')throw new MemoryError('RESTORE_METADATA_NOT_ALLOWED');
+          const entries=service.previewArchive(data);
+          if(!commit)return {dry_run:true,entries};
+          await service.applyRevocations(await latestRevocations());
+          return {dry_run:false,...await service.restoreArchive(data)};
+        }
+        const memories=Array.isArray(data)?data:data?.memories;
+        if(!Array.isArray(memories))throw new Error('Expected records array or export object');
         const restored=(entry:any)=>['id','revision','content_hash'].some(key=>Object.hasOwn(entry,key));
         if(mode==='new' && (!Array.isArray(data) || memories.some(restored)))throw new MemoryError('RESTORE_METADATA_NOT_ALLOWED');
         // Every committed import checks the external ledger, even arrays of raw bodies.
         // Syntax cannot prove that an apparent new body was never exported before.
         memories.forEach((entry:any)=>service.previewImport(entry));
-        if(args.includes('--commit')) {
-          const revocationFile=flag('revocations');
-          if(!revocationFile)throw new MemoryError('LATEST_REVOCATIONS_REQUIRED');
-          const revocations=(await readFile(resolve(revocationFile),'utf8')).split('\n').filter(line=>line.trim()).map(line=>JSON.parse(line));
-          await service.applyRevocations(revocations);
-        }
+        if(commit)await service.applyRevocations(await latestRevocations());
         const entries=[];
         for(const entry of memories) {
           const preview=service.previewImport(entry);
           const result:any={import_key:preview.import_key,source_hash:preview.source_hash,action:preview.action,source_uris:preview.record.sources.map(s=>s.uri)};
-          if(args.includes('--commit') && !preview.action.startsWith('blocked'))result.result=await service.importEntry(entry);
+          if(commit && !preview.action.startsWith('blocked'))result.result=await service.importEntry(entry);
           entries.push(result);
         }
-        return {dry_run:!args.includes('--commit'),entries};
+        return {dry_run:!commit,entries};
       }
-      default:throw new Error('Commands: cache-inspect cache-maintenance init project resolve-project inspect recall propose commit forget discard-proposal import export reindex check maintenance');
+      default:throw new Error('Commands: cache-inspect cache-maintenance init project resolve-project inspect recall feedback project-feedback consolidate propose commit forget discard-proposal import export reindex check maintenance');
     }
   } finally {service.close();}
 }

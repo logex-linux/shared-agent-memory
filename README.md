@@ -2,6 +2,8 @@
 
 [English](README.en.md) · [协议](docs/protocol.md) · [维护](docs/operations.md) · [自适应检索](docs/adaptive-retrieval.md) · [实测报告](docs/adaptive-results.md) · [MIT](LICENSE)
 
+v1 本地预览提供历史版本、有效时间、显式状态、可选图检索、回执绑定反馈和巩固预览。请先在隔离副本演练升级。见 [v1 协议](docs/upgrade-v1/protocol.md)、[迁移和恢复](docs/upgrade-v1/migration-and-rollback.md)及[评估](docs/upgrade-v1/evaluation.md)。
+
 供同一台机器上的多个 AI Agent 共用的本地记忆服务。提供标准 **MCP STDIO** 和 **CLI**，用本地 embedding、关键词和代码标识符检索，按当前任务返回相关片段。
 
 Agent 可以搜索全库，不需要预先分配任务可见清单；需要完整记录时，再按 ID 读取。每条记忆保留来源、项目归属和版本。各个 agent harness 的 MCP 配置由使用者接入。

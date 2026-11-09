@@ -7,7 +7,7 @@ import {spawnSync} from 'node:child_process';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
 import {MemoryService,readConfig} from '../dist/core/service.js';
-import {setup,record,publish,MODEL} from './helpers.mjs';
+import {setup,record,publish,MODEL,dropTemporalProjection} from './helpers.mjs';
 const run=(script,args)=>spawnSync(process.execPath,[resolve(script),...args],{encoding:'utf8'});
 
 test('P0 identifier boost retains paraphrases; exact_only is explicit',async()=>{
@@ -75,9 +75,10 @@ test('P1 readonly permissions, server identity and verification authority are in
 
 test('P1 migration keeps legacy records unverified and marks unknown writer honestly',async()=>{
  const {service:s,config,project}=await setup();const m=await publish(s,record(project));
- s.db.exec("ALTER TABLE memories DROP COLUMN written_by; ALTER TABLE proposals DROP COLUMN connection_id; ALTER TABLE events DROP COLUMN connection_id; PRAGMA user_version=3;");
+ dropTemporalProjection(s.db);
+ s.db.exec("DROP TRIGGER version_dependency_insert; DROP TABLE version_dependencies; DROP TABLE revoked_aliases; DROP INDEX version_content_hash; DROP TABLE association_edges; DROP TABLE projection_jobs; DROP TABLE learning_events; DELETE FROM meta WHERE key='learning_watermark'; DROP INDEX tombstones_hash; DELETE FROM meta WHERE key='graph_epoch'; DROP TABLE memory_relations; DROP TABLE proposal_transitions; DROP TRIGGER version_insert; DROP TRIGGER version_advance; DROP TABLE memory_versions; DROP TABLE revoked_version_hashes; ALTER TABLE memories DROP COLUMN written_by; ALTER TABLE proposals DROP COLUMN connection_id; ALTER TABLE events DROP COLUMN connection_id; PRAGMA user_version=3;");
  const row=s.db.prepare('SELECT body FROM memories WHERE id=?').get(m.memory_id),body=JSON.parse(row.body);body.verification={method:'legacy claims checked',summary:'Old metadata'};s.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(body),m.memory_id);s.close();
- const reopened=new MemoryService(config);try{const item=(await reopened.recall({ids:[m.memory_id]})).items[0];assert.equal(item.verification.status,'unverified');assert.equal(item.written_by,'legacy:unknown');assert.equal(reopened.inspect().schema,5);assert.equal(reopened.check().integrity[0].integrity_check,'ok');}finally{reopened.close();}
+ const reopened=new MemoryService(config);try{const item=(await reopened.recall({ids:[m.memory_id]})).items[0];assert.equal(item.verification.status,'unverified');assert.equal(item.written_by,'legacy:unknown');assert.equal(reopened.inspect().schema,11);assert.equal(reopened.check().integrity[0].integrity_check,'ok');}finally{reopened.close();}
 });
 
 test('P1 readonly MCP exposes only recall and rejects hidden write tools',async()=>{

@@ -1,10 +1,15 @@
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { MemoryError, verificationSchema, hash, type Config, type Encoder, type RecallInput } from '../core/contracts.js';
 import { identifiers, ftsQuery, terms } from './lexical.js';
 import { answerIntent, factState, focusTerms, evidenceWindow, referenceEvidence, type FactState } from './evidence.js';
 import { prepared } from '../storage/statements.js';
 import { RetrievalProfile } from './profile.js';
 import { QueryState, authority } from './state.js';
+import { extendedMetadata } from '../memory/versions.js';
+import { coversEffectiveTime, declaredFactState, decisionIntent, temporalPredicate } from '../memory/temporal.js';
+import { destination, graphBonus, graphEpoch, graphVersion, GraphReader, GRAPH_PAGE_WORK, GRAPH_SEEDS, readGraph, startGraph,
+    type GraphPath, type GraphProgress } from './graph.js';
 type Context = {
     db: DatabaseSync;
     config: Config;
@@ -36,20 +41,26 @@ type Candidate = {
     requiresCheck: boolean;
     base: number;
     admitted: boolean;
+    graphPath?: GraphPath;
     answer?: { state: FactState; coverage: number; alignment: number; checked: string; salient?: boolean; subjectMatches?: number; referenceBackground?: boolean };
 };
 const blob = (v: Float32Array) => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
 // These describe the request, rather than its subject; they must not dominate IDF anchors.
 const salienceScaffolding=new Set(terms('用户 已 废弃 改用 决定 配置 入口 最近 排错 记录 相关 当前 已有 既有'));
 export const estimateTokens = (bytes: number) => Math.ceil(bytes / 3);
-function eligibility(input: RecallInput, config: Config) {
-    const params: SQLInputValue[] = [Number(!input.project_id && config.all_projects), JSON.stringify(input.project_id ? [input.project_id] : config.allowed_projects), Number(input.include_global ?? (!input.project_id && config.allow_global)), new Date().toISOString()];
-    let sql = "s.status='active' AND ((s.scope='project' AND s.project_id IN (SELECT p.id FROM projects p WHERE ?=1 OR p.id IN (SELECT value FROM json_each(?)))) OR (?=1 AND s.scope='global')) AND (s.expires_at IS NULL OR julianday(s.expires_at)>julianday(?))";
+function eligibility(db:DatabaseSync,input: RecallInput, config: Config, effectiveAt:string) {
+    const params: SQLInputValue[] = [Number(!input.project_id && config.all_projects), JSON.stringify(input.project_id ? [input.project_id] : config.allowed_projects), Number(input.include_global ?? (!input.project_id && config.allow_global))];
+    let sql = "s.status='active' AND ((s.scope='project' AND s.project_id IN (SELECT p.id FROM projects p WHERE ?=1 OR p.id IN (SELECT value FROM json_each(?)))) OR (?=1 AND s.scope='global'))";
+    if (input.versions) return {sql,params};
+    sql += ' AND (s.expires_at IS NULL OR julianday(s.expires_at)>julianday(?))';
+    params.push(new Date().toISOString());
     for (const [column, key] of [['branch', 'branch'], ['commit_ref', 'commit'], ['environment', 'environment']] as const) {
         sql += ` AND (s.${column} IS NULL OR ? IS NULL OR s.${column}=?)`;
         params.push(input.context[key] ?? null, input.context[key] ?? null);
     }
-    return { sql, params };
+    const temporal=temporalPredicate(db,input,effectiveAt);
+    for(const clause of temporal.clauses)sql += ' AND '+clause;
+    return { sql, params:[...params,...temporal.params] };
 }
 const broadIntent = (q: string) => /(长期|稳定.*偏好|归纳|总结|跨项目|多年来|反复.*选择|patterns?|career|across.*projects|long.term|over time|summari)/i.test(q)
     || /(偏好|习惯|倾向|审美|preferences?)/i.test(q)&&!identifiers(q).some(id=>id.includes('/'));
@@ -84,7 +95,7 @@ function assess(c: Candidate, config: Config, broad: boolean, progress: any) {
         c.base = c.rrf + Number(c.exact>0)*.06 + a.coverage*.045 + a.alignment*.035;
     }
 }
-export async function retrieve(ctx: Context, request: RecallInput, channel: 'hybrid' | 'lexical' | 'vector') {
+export async function retrieve(ctx: Context, request: RecallInput, channel: 'hybrid' | 'lexical' | 'vector', graphFallback?:string) {
     const { config, encoder } = ctx, profileTrace=(request.debug||config.diagnostics)?new RetrievalProfile():undefined, db=profileTrace?.database(prepared(ctx.db))??prepared(ctx.db), start = performance.now(), debug = request.debug || config.diagnostics;
     const d = { elapsed_ms: 0, candidate_ids: 0, candidates_ranked: 0, full_body_records_read: 0, full_body_bytes_read: 0, json_parses: 0, metadata_json_parses: 0, chunk_text_rows_read: 0, vector_queries: 0, vector_rows_returned: 0, vector_internal_scanned: null, vector_distance_computations: null, query_embeddings: 0, response_bytes: 0, estimated_tokens: 0, content_estimated_tokens: 0, token_estimator: 'ceil(utf8_bytes/3)', cache_replay: false, ranking_chunk_rows_read: 0 };
     let traceResponse:any,traceBudget=config.page_response_bytes;
@@ -96,7 +107,13 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
     };
     const parse = (s: string, metadata = false) => { d.json_parses++; if (metadata)
         d.metadata_json_parses++; return JSON.parse(s); };
-    let input = request, queryVector: Buffer | null = null, profile: string | null = null, retrievalMode: string = request.ids ? 'ids' : channel, warnings: string[] = [], state: QueryState | undefined, q = '', page = 0, resolved = 'focused', progress: any = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage: any;
+    const expansion = request.versions ? 'versions' : request.ids ? 'ids' : undefined;
+    const versions = new Map(request.versions?.map(ref=>[ref.memory_id+':'+ref.revision,ref]));
+    let effectiveAt=request.as_of??new Date().toISOString();
+    let graphReader:GraphReader|undefined, graphState:GraphProgress|undefined;
+    let graphAttempted=false, graphExamined=0, graphAccepted=0;
+    let runtimeProfile:string|null=null;
+    let input = request, queryVector: Buffer | null = null, profile: string | null = null, retrievalMode: string = expansion ?? channel, warnings: string[] = [], state: QueryState | undefined, q = '', page = 0, resolved = 'focused', progress: any = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage: any;
     const embeddingStarted=performance.now();
     if (!request.cursor && request.query && channel !== 'lexical')
         try {
@@ -112,15 +129,26 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
     profileTrace?.add('embedding',performance.now()-embeddingStarted);
     try {
-        if (!request.ids) {
+        if (!expansion) {
             const opened=performance.now();
             state = QueryState.open(ctx.db, config);
             profileTrace?.add('state_open',performance.now()-opened);
             const cleaning=performance.now();state.cleanupIfExpired();profileTrace?.add('cleanup',performance.now()-cleaning);
+            if(request.cursor && config.graph_enabled) {
+                const row=state.lookup(request.cursor).row;
+                // Only graph cursors need model-profile I/O. The locked lookup
+                // below revalidates the row and its current authority.
+                if(row.profile && JSON.parse(row.progress).graph && row.authority===authority(config,db)) {
+                    const checking=performance.now();
+                    try { runtimeProfile=(await encoder.profile()).id; }
+                    catch { runtimeProfile=null; }
+                    profileTrace?.add('embedding',performance.now()-checking);
+                }
+            }
             // New-query validation needs only canonical data. Keep the same WAL
             // read snapshot through computation; do not occupy the sidecar writer.
             if(!request.cursor){
-                db.exec('BEGIN');ctx.generation();preflightAuthority=authority(config,db);preflightEligibility=eligibility(input,config);
+                db.exec('BEGIN');ctx.generation();preflightAuthority=authority(config,db);preflightEligibility=eligibility(db,input,config,effectiveAt);
                 if(queryVector&&retrievalMode!=='lexical_degraded')indexProblem=profileTrace?profileTrace.stage('index_validation',()=>validateIndex(preflightEligibility!)):validateIndex(preflightEligibility);
                 ctx.checkpoint?.('recall:read_snapshot');
             }
@@ -137,8 +165,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 retrievalMode = found.row.retrieval_mode;
                 resolved = found.row.resolved;
                 progress = parse(found.row.progress);
+                effectiveAt=progress.effectiveAt??input.as_of??effectiveAt;
                 warnings = progress.warnings;
-                for (const key of ['project_id', 'include_global', 'mode'] as const)
+                for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state', 'graph'] as const)
                     if (request[key] !== undefined && request[key] !== input[key])
                         throw new MemoryError('CURSOR_QUERY_MISMATCH');
                 if (Object.keys(request.context).length && hash(request.context) !== hash(input.context))
@@ -147,7 +176,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         // Freeze expiry after query encoding; all channels and materialization share this snapshot.
         const candidateStarted=performance.now();if(!preflightEligibility)db.exec('BEGIN');
-        const gen = ctx.generation(), auth = authority(config, db), eligible = preflightEligibility??eligibility(input, config);
+        const gen = ctx.generation(), auth = authority(config, db), eligible = preflightEligibility??eligibility(db,input,config,effectiveAt);
         if(preflightAuthority&&preflightAuthority!==auth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
         if (state) {
             if (request.cursor) {
@@ -156,6 +185,13 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     throw new MemoryError('CURSOR_SCOPE_CHANGED');
                 if (row.generation !== gen)
                     throw new MemoryError('CURSOR_STALE');
+                if(progress.graph) {
+                    graphState=progress.graph;
+                    const learned=config.learned_graph_enabled&&!input.as_of;
+                    if(!config.graph_enabled || graphState!.version!==graphVersion(learned) ||
+                       graphState!.profile!==profile || profile!==null&&runtimeProfile!==profile ||
+                       graphState!.epoch!==readGraph(()=>graphEpoch(db,learned)))throw new MemoryError('CURSOR_GRAPH_CHANGED');
+                }
                 savedPage = state.db.prepare('SELECT * FROM pages WHERE q=? AND n=?').get(q, page);
                 if (!savedPage && page !== Number((state.db.prepare('SELECT coalesce(max(n),-1)+1 n FROM pages WHERE q=?').get(q) as any).n))
                     throw new MemoryError('CURSOR_INVALID');
@@ -166,6 +202,17 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 progress.ftsDone = channel === 'vector' && retrievalMode !== 'lexical_degraded';
                 progress.idDone = !identifiers(input.query!).length || (channel === 'vector' && !input.exact_only && retrievalMode !== 'lexical_degraded');
                 progress.warnings = warnings;
+                progress.effectiveAt=effectiveAt;
+                if(input.graph) {
+                    if(graphFallback)progress.graphReason=graphFallback;
+                    else if(!config.graph_enabled)progress.graphReason='GRAPH_DISABLED';
+                    else if(input.exact_only)progress.graphReason='GRAPH_EXACT_ONLY';
+                    else {
+                        const learned=config.learned_graph_enabled&&!input.as_of;
+                        graphState=progress.graph=startGraph(readGraph(()=>graphEpoch(db,learned)),profile,learned);
+                    }
+                    if(progress.graphReason)warnings.push(progress.graphReason);
+                }
                 q = state.create({ authority: auth, generation: gen, input: JSON.stringify(input), vector: queryVector, profile, retrieval_mode: retrievalMode, resolved, progress: JSON.stringify(progress), expires: Date.now() + config.query_ttl_seconds * 1000 });
             }
         }
@@ -181,6 +228,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 progress.idDone = !identifiers(input.query!).length;
             }
         }
+        if(graphState)graphReader=readGraph(()=>new GraphReader(db,eligible,input,graphState!.learnedAt));
         const local = { vector: new Set<string>(), fts: new Set<string>(), identifier: new Set<string>() }, candidates = new Map<string, Candidate>();
         let work = 0, lowGain = false;
         // Local exclusion already covers this request; persist each channel once.
@@ -193,7 +241,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 if (old)
                     candidates.set(id, parse(old.data));
                 else {
-                    const r = db.prepare("SELECT s.project_id,s.branch,s.commit_ref,s.environment,json_extract(s.metadata,'$.kind') kind,json_extract(s.metadata,'$.title') title,json_extract(s.metadata,'$.verification.basis') basis,json_extract(s.metadata,'$.verification.status') status,json_extract(s.metadata,'$.tags') tags,json_extract(s.metadata,'$.sources[0].checked_at') date,json_extract(s.metadata,'$.sources[0].uri') source FROM memory_search s WHERE s.memory_id=?").get(id) as any;
+                    const r = db.prepare("SELECT s.project_id,s.branch,s.commit_ref,s.environment,json_extract(s.metadata,'$.kind') kind,json_extract(s.metadata,'$.title') title,json_extract(s.metadata,'$.verification.basis') basis,json_extract(s.metadata,'$.verification.status') status,json_extract(s.metadata,'$.decision_state') decision_state,json_extract(s.metadata,'$.tags') tags,json_extract(s.metadata,'$.sources[0].checked_at') date,json_extract(s.metadata,'$.sources[0].uri') source FROM memory_search s WHERE s.memory_id=?").get(id) as any;
                     analysisMetadata.set(id,r);
                     const tags: string[] = parse(r.tags ?? '[]');
                     const topic=tags.at(-1);
@@ -232,13 +280,14 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             if (c.answer?.checked===signature) return;
             const rankingStarted=performance.now();
             const previousStage=profileTrace?.current;if(profileTrace)profileTrace.current='ranking';
-            const meta=analysisMetadata.get(c.id)??db.prepare("SELECT json_extract(metadata,'$.title') title,json_extract(metadata,'$.verification.basis') basis,json_extract(metadata,'$.verification.status') status FROM memory_search WHERE memory_id=?").get(c.id) as any;
+            const meta=analysisMetadata.get(c.id)??db.prepare("SELECT json_extract(metadata,'$.title') title,json_extract(metadata,'$.verification.basis') basis,json_extract(metadata,'$.verification.status') status,json_extract(metadata,'$.decision_state') decision_state FROM memory_search WHERE memory_id=?").get(c.id) as any;
             const loaded=readChunks(c.id,c.hits.map(h=>h[0])),chunks=loaded.rows;
             d.ranking_chunk_rows_read+=loaded.read;
             const text=[meta.title,...chunks.map(r=>r.text)].join('\n'), words=new Set(terms(text)), qt=queryTerms;
             const denominator=qt.reduce((n,t)=>n+(termWeights.get(t)??Math.log(2+Number((progress.vectorRank??0)+32))),0);
             const coverage=denominator?qt.filter(t=>words.has(t)).reduce((n,t)=>n+(termWeights.get(t)??1),0)/denominator:0;
-            const state=factState(chunks.map(r=>r.text).join('\n'),meta.basis,meta.status==='disputed'), intent=answerIntent(input.query!);
+            const state=declaredFactState(meta.decision_state??undefined)??factState(chunks.map(r=>r.text).join('\n'),meta.basis,meta.status==='disputed');
+            const intent=decisionIntent(input);
             const alignment=intent==='unknown'?0:state===intent?1:state==='unknown'?0:state==='disputed'?-.35:-1;
             const salient=queryTerms.filter(t=>t.length>=2&&!salienceScaffolding.has(t)&&termWeights.has(t)).sort((a,b)=>termWeights.get(b)!-termWeights.get(a)!);
             const salientWeight=salient.length?termWeights.get(salient[0])!:Infinity;
@@ -257,10 +306,48 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         const persist = () => { for (const c of candidates.values()) {
             analyze(c);
             assess(c, config, resolved === 'broad', progress);
+            if(c.graphPath&&c.admitted&&!c.answer?.referenceBackground)c.base+=graphBonus(c.graphPath);
             const data=JSON.stringify(c);if(persisted.get(c.id)===data)continue;
             state!.db.prepare(`INSERT INTO candidates(q,id,data,base,admitted,project,topic,period,source) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(q,id) DO UPDATE SET data=excluded.data,base=excluded.base,admitted=excluded.admitted`).run(q, c.id, data, c.base, Number(c.admitted), c.project, c.topic, c.period, c.source);
             persisted.set(c.id,data);
         } };
+        const graphTerms=graphState?terms(input.query!):[];
+        const graphReferences=graphState?referenceEvidence(input.query!):undefined;
+        const considerGraph=(path:GraphPath)=>{
+            const ref=destination(path);
+            if(state!.db.prepare('SELECT 1 FROM candidates WHERE q=? AND id=? AND emitted IS NOT NULL').get(q,ref.memory_id))return;
+            const title=String(db.prepare("SELECT json_extract(metadata,'$.title') title FROM memory_search WHERE memory_id=?").get(ref.memory_id)?.title??'');
+            const vector=queryVector&&retrievalMode!=='lexical_degraded'?queryVector:null;
+            const rows=db.prepare(`SELECT c.id,c.start,c.end,c.text,${vector?'vec_distance_cosine((SELECT embedding FROM memory_vec WHERE chunk_id=c.id),?)':'NULL'} distance
+                FROM memory_chunks c WHERE c.memory_id=? AND c.revision=? ORDER BY c.id LIMIT 8`)
+                .all(...(vector?[vector]:[]),ref.memory_id,ref.revision);
+            d.ranking_chunk_rows_read+=rows.length;
+            const ranked=rows.map(row=>{
+                const text=title+'\n'+row.text,words=new Set(terms(text));
+                const coverage=graphTerms.length?graphTerms.filter(t=>words.has(t)).length/graphTerms.length:0;
+                const cosine=row.distance===null?0:1-Number(row.distance);
+                const refs=graphReferences!(text,words);
+                return {row,coverage,cosine,reference:refs.count===0||refs.coverage>=.5};
+            }).filter(c=>c.reference&&(c.coverage>=.6||c.cosine>=config.evidence_threshold||
+                c.cosine>=config.semantic_threshold&&c.coverage>=.2))
+              .sort((a,b)=>b.coverage+b.cosine-a.coverage-a.cosine||Number(a.row.id)-Number(b.row.id));
+            if(!ranked.length)return;
+            const best=ranked[0],existed=candidates.has(ref.memory_id),original=candidate(ref.memory_id);
+            const c:Candidate={...original,reasons:[...original.reasons],hits:[...original.hits],graphPath:path};
+            c.coverage=Math.max(c.coverage,best.coverage);
+            c.cosine=Math.max(c.cosine??0,best.cosine);
+            chunkCache.set(Number(best.row.id),best.row);
+            hit(c,Number(best.row.id),Math.max(best.cosine,.02+best.coverage*.1));
+            analyze(c);
+            assess(c,config,resolved==='broad',progress);
+            if(!c.admitted || c.answer?.referenceBackground || (c.answer?.alignment??0)<0) {
+                if(!existed)candidates.delete(ref.memory_id);
+                return;
+            }
+            reason(c,'graph');
+            candidates.set(ref.memory_id,c);
+            graphAccepted++;
+        };
         if (state && !savedPage) {
             do {
                 const k = Math.min(progress.batch, config.page_candidate_budget - work);
@@ -368,6 +455,18 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     if (!identifiers(input.query!).length && sample.length >= 4 && sample.filter(c => c.kind === 'preference').length / sample.length >= .6 && new Set(sample.map(c => c.project + c.period + c.topic)).size >= 3)
                         resolved = 'broad';
                 }
+                if(graphReader && graphState && !graphAttempted) {
+                    const baseDone=progress.vectorDone&&progress.ftsDone&&progress.idDone;
+                    const seeds=[...candidates.values()].filter(c=>c.admitted&&!c.graphPath&&!c.answer?.referenceBackground&&
+                        (c.exact>0||c.coverage>=.6||(c.cosine??0)>=config.evidence_threshold))
+                        .sort((a,b)=>b.base-a.base||a.id.localeCompare(b.id)).slice(0,GRAPH_SEEDS);
+                    readGraph(()=>graphReader!.seed(graphState!,seeds.map(c=>c.id),baseDone));
+                    graphAttempted=graphState.seeded;
+                    graphExamined=readGraph(()=>graphReader!.walk(graphState!,Math.min(GRAPH_PAGE_WORK,config.page_candidate_budget-work),
+                        start+config.page_time_budget_ms,considerGraph));
+                    work+=graphExamined;
+                    if(graphAccepted)persist();
+                }
                 progress.batch = Math.min(256, progress.batch * 2);
                 const count = state.db.prepare(`SELECT count(*) n,count(DISTINCT project||topic||period) facets FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${input.exact_only ? 'AND json_extract(data,\'$.exact\')>0' : ''}`).get(q) as any;
                 // A sparse relevant yield is a per-page stopping suggestion, never exhaustion.
@@ -379,6 +478,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 if (resolved === 'broad' && count.n >= Math.min(request.limit ?? input.limit ?? 32, config.page_item_limit) && (count.facets >= 3 || Boolean(request.limit ?? input.limit)))
                     break;
             } while (!(progress.vectorDone && progress.ftsDone && progress.idDone) && work < config.page_candidate_budget && performance.now() - start < config.page_time_budget_ms);
+            if(graphState?.neighborLimited)warnings.push('GRAPH_NEIGHBOR_LIMIT');
+            if(graphState?.dependencyLimited)warnings.push('GRAPH_DEPENDENCY_LIMIT');
+            if(graphState?.stale)warnings.push('GRAPH_STALE');
             progress.warnings = [...new Set(warnings)];
         }
         let options = { limit: request.limit ?? input.limit ?? (resolved === 'focused' ? 8 : config.page_item_limit), token_budget: Math.min(request.token_budget ?? input.token_budget ?? config.response_token_budget, config.response_token_budget), max_bytes: Math.min(request.max_bytes ?? input.max_bytes ?? config.page_response_bytes, config.page_response_bytes), view: request.view ?? input.view ?? 'chunks' };
@@ -395,7 +497,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         traceBudget=options.max_bytes;
         let pool: Candidate[] = [], selected: string[] = [], contextPriority=false;
         let subjectLeader: string | undefined;
-        if (request.ids)
+        if (request.versions)
+            selected = [...versions.keys()];
+        else if (request.ids)
             selected = request.ids;
         else if (savedPage) {
             pool = parse(savedPage.ids);
@@ -405,11 +509,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             const extra = input.exact_only ? "AND json_extract(data,'$.exact')>0" : '', sql = resolved === 'broad' ? `WITH diverse AS (SELECT *,row_number() OVER(PARTITION BY project,topic,period ORDER BY base DESC,id) facet_rank FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${extra}) SELECT data FROM diverse ORDER BY facet_rank,base DESC,id LIMIT ?` : `SELECT data FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${extra} ORDER BY base DESC,id LIMIT ?`;
             pool = (state!.db.prepare(sql).all(q, config.page_candidate_budget) as any[]).map(r => parse(r.data));
             if (!pool.length && (resolved==='broad'||channel==='lexical'||retrievalMode==='lexical_degraded')) {
-                pool = (state!.db.prepare(`SELECT data FROM candidates WHERE q=? AND emitted IS NULL ${input.exact_only ? 'AND json_extract(data,\'$.exact\')>0' : ''} ORDER BY base DESC,id LIMIT 1`).all(q) as any[]).map(r => parse(r.data));
+                pool = (state!.db.prepare(`SELECT data FROM candidates WHERE q=? AND emitted IS NULL ${input.exact_only ? 'AND json_extract(data,\'$.exact\')>0' : ''} ${graphState?"AND json_extract(data,'$.graphPath') IS NULL":''} ORDER BY base DESC,id LIMIT 1`).all(q) as any[]).map(r => parse(r.data));
             }
             // Quality anchor: score the leading relevance prefix with the v0.3 window.
             // This limits scoring contributions for five leading positions, never candidate discovery.
-            const anchors = (resolved==='broad'||answerIntent(input.query??'')==='unknown') && page === 0 ? (progress.anchors as string[]).map(id => pool.find(c => c.id === id)).filter((c): c is Candidate => !!c) : [];
+            const graphRanked=pool.some(c=>c.graphPath);
+            const anchors = (resolved==='broad'||answerIntent(input.query??'')==='unknown') && page === 0 && !graphRanked ? (progress.anchors as string[]).map(id => pool.find(c => c.id === id)).filter((c): c is Candidate => !!c) : [];
             if (resolved === 'broad') {
                 const counts = new Map<string, number>();
                 for (const facet of ['project', 'topic', 'period', 'source'] as const) {
@@ -457,7 +562,30 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     selected = selected.slice(0, 1);
             }
         }
-        const flags = new Map((db.prepare(`SELECT s.memory_id,(s.branch IS NOT NULL AND ? IS NULL OR s.commit_ref IS NOT NULL AND ? IS NULL OR s.environment IS NOT NULL AND ? IS NULL) requires_check FROM memory_search s WHERE ${eligible.sql} AND s.memory_id IN (SELECT value FROM json_each(?))`).all(input.context.branch ?? null, input.context.commit ?? null, input.context.environment ?? null, ...eligible.params, JSON.stringify(selected)) as any[]).map(r => [r.memory_id, r.requires_check]));
+        const flags = new Map<string,number>();
+        if (request.versions) {
+            const visible = db.prepare(`SELECT v.revision, s.revision current_revision, json_extract(v.body,'$.valid_for') valid_for,
+                json_extract(v.body,'$.decision_state') decision_state, json_extract(v.body,'$.valid_time') valid_time
+                FROM memory_versions v JOIN memory_search s ON s.memory_id=v.memory_id
+                WHERE v.memory_id=? AND v.revision=? AND ${eligible.sql}
+                AND NOT EXISTS(SELECT 1 FROM tombstones t WHERE t.id=v.memory_id OR t.content_hash=v.content_hash)
+                AND NOT EXISTS(SELECT 1 FROM revoked_version_hashes h WHERE h.content_hash=v.content_hash)`);
+            for (const [key,ref] of versions) {
+                const row = visible.get(ref.memory_id,ref.revision,...eligible.params);
+                if (!row) continue;
+                const valid = parse(String(row.valid_for ?? '{}'),true);
+                if (input.decision_state && row.decision_state!==input.decision_state) continue;
+                if (input.as_of && !coversEffectiveTime(parse(String(row.valid_time ?? '{}'),true),effectiveAt)) continue;
+                const keys = ['branch','commit','environment'] as const;
+                if (keys.some(k=>valid[k] && input.context[k] && valid[k]!==input.context[k])) continue;
+                flags.set(key,Number(row.revision!==row.current_revision ||
+                    valid.expires_at && Date.parse(valid.expires_at)<=Date.now() ||
+                    keys.some(k=>valid[k] && !input.context[k])));
+            }
+        } else {
+            for (const row of db.prepare(`SELECT s.memory_id,(s.branch IS NOT NULL AND ? IS NULL OR s.commit_ref IS NOT NULL AND ? IS NULL OR s.environment IS NOT NULL AND ? IS NULL) requires_check FROM memory_search s WHERE ${eligible.sql} AND s.memory_id IN (SELECT value FROM json_each(?))`).all(input.context.branch ?? null, input.context.commit ?? null, input.context.environment ?? null, ...eligible.params, JSON.stringify(selected)))
+                flags.set(String(row.memory_id),Number(row.requires_check));
+        }
         if (savedPage && selected.some(id => !flags.has(id)))
             throw new MemoryError('CURSOR_STALE');
         if (state && !savedPage)
@@ -465,27 +593,48 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 if (!flags.has(id))
                     state.db.prepare('DELETE FROM candidates WHERE q=? AND id=?').run(q, id);
         selected = selected.filter(id => flags.has(id));
-        if (!savedPage) {
+        if (!savedPage && !request.versions) {
             const ranked=contextPriority?new Map(pool.map(c=>[c.id,c])):null;
             selected.sort((a, b) => Number(b === subjectLeader) - Number(a === subjectLeader)
                 || (ranked ? Number(directEvidence(ranked.get(b),config.evidence_threshold))-Number(directEvidence(ranked.get(a),config.evidence_threshold)) : 0) || Number(flags.get(a)) - Number(flags.get(b)));
         }
         d.candidate_ids = state ? Number((state.db.prepare('SELECT count(*) n FROM candidates WHERE q=?').get(q) as any).n) : selected.length;
         d.candidates_ranked = selected.length;
-        const plan: any = savedPage ? parse(savedPage.plan) : { mode: request.ids ? 'ids' : resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
-        const result: any = { items: [], generation: gen, retrieval_mode: retrievalMode, warnings: [...new Set(warnings)], empty_reason: null, evidence_status: 'none', has_more: false, next_cursor: null, retrieval: plan };
+        const draftPlan = { mode: expansion ?? resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
+        const plan: any = savedPage ? parse(savedPage.plan) : draftPlan;
+        const cachedWarnings = plan.graph_page_warnings;
+        const cachedFeedback = plan.feedback;
+        delete plan.graph_page_warnings;
+        delete plan.feedback;
+        if(!savedPage && input.graph)
+            plan.graph=graphState?{state:'active',epoch:graphState.epoch,frontier:graphState.frontier.length,
+                ...(graphState.learnedAt!==undefined&&{learned:true}),
+                limited:graphState.neighborLimited||graphState.dependencyLimited}
+                :{state:['GRAPH_DISABLED','GRAPH_EXACT_ONLY'].includes(progress.graphReason)?'disabled':'degraded',reason:progress.graphReason};
+        const pageWarnings = cachedWarnings?.initial ?? [...new Set(warnings)];
+        const result: any = { items: [], generation: gen, retrieval_mode: retrievalMode, warnings: [...pageWarnings], empty_reason: null, evidence_status: 'none', has_more: false, next_cursor: null, retrieval: cachedWarnings ? {...draftPlan, graph:plan.graph} : plan };
+        if(state && config.operations.includes('feedback'))
+            result.feedback_receipt=savedPage?cachedFeedback?.token:randomUUID();
         // Explicit expansion has no query cursor. Account for continuation IDs in
         // the budget before reading bodies; filtered IDs never enter this list.
-        if(request.ids&&selected.length)result.remaining_ids=[...selected];
+        const remainingKey = expansion==='versions'?'remaining_versions':'remaining_ids';
+        const expansionRefs = (keys:string[])=>request.versions?keys.map(key=>versions.get(key)!):keys;
+        if(expansion&&selected.length)result[remainingKey]=expansionRefs(selected);
         if(profileTrace)profileTrace.add('candidates',Math.max(0,performance.now()-candidateStarted-['knn','fts_identifiers','ranking','candidate_sql'].reduce((n,k)=>n+(profileTrace.times[k]??0),0)));
         const materializeStarted=performance.now();if(profileTrace)profileTrace.current='materialization';
         const fitted: string[] = [], candidateMap = new Map(pool.map(c => [c.id, c]));
         let blocked = false;
         const fits = (reserve = 256) => {const bytes=Buffer.byteLength(JSON.stringify(result))+reserve;return bytes<=options.max_bytes-(debug?Math.min(2048,Math.floor(options.max_bytes/2)):0)&&estimateTokens(bytes)<=options.token_budget;};
-        for (const id of selected.slice(0, Math.min(options.limit, config.page_item_limit))) {
-            const row = db.prepare(`SELECT s.revision,s.project_id,s.scope,s.profile_id,s.metadata,m.content_hash,m.written_by,m.verified_at${request.ids ? ',m.body' : ''} FROM memory_search s JOIN memories m ON m.id=s.memory_id WHERE s.memory_id=?`).get(id) as any;
+        for (const key of selected.slice(0, Math.min(options.limit, config.page_item_limit))) {
+            const ref = versions.get(key), id = ref?.memory_id ?? key;
+            const row = ref
+                ? db.prepare(`SELECT v.*,v.recorded_at verified_at,s.scope,s.project_id,s.revision current_revision,
+                  (SELECT min(revision) FROM memory_versions WHERE memory_id=v.memory_id) history_start_revision,
+                  (SELECT count(*) FROM memory_versions WHERE memory_id=v.memory_id) history_version_count
+                  FROM memory_versions v JOIN memory_search s ON s.memory_id=v.memory_id WHERE v.memory_id=? AND v.revision=?`).get(id,ref.revision) as any
+                : db.prepare(`SELECT s.revision,s.project_id,s.scope,s.profile_id,s.metadata,m.content_hash,m.written_by,m.verified_at${request.ids ? ',m.body' : ''} FROM memory_search s JOIN memories m ON m.id=s.memory_id WHERE s.memory_id=?`).get(id) as any;
             let body: any;
-            if (request.ids) {
+            if (expansion) {
                 d.full_body_records_read++;
                 d.full_body_bytes_read += Buffer.byteLength(row.body);
                 body = parse(row.body);
@@ -493,7 +642,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             else
                 body = parse(row.metadata, true);
             const c = candidateMap.get(id), ids = c?.hits.slice(0, options.view === 'evidence' ? 1 : 2).map(h => h[0]) ?? [];
-            const loaded=request.ids?{rows:[],read:0}:readChunks(id,ids),chunks=loaded.rows;
+            const loaded=expansion?{rows:[],read:0}:readChunks(id,ids),chunks=loaded.rows;
             d.chunk_text_rows_read += loaded.read;
             const excerpts: any[] = [];
             let snippetSelection='chunk_fallback';
@@ -509,9 +658,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 else
                     excerpts.push({ start: x.start, end: x.end, text: x.text, chunk_ids: [x.id] });
             }
-            if (request.ids)
+            if (expansion)
                 excerpts.push({ start: 0, end: body.content.length, text: body.content, chunk_ids: [] });
-            if (options.view === 'evidence' && !request.ids) {
+            if (options.view === 'evidence' && !expansion) {
                 for (const e of excerpts) {
                     e.text = e.text.slice(0, 200);
                     e.end = e.start + e.text.length;
@@ -519,12 +668,23 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 excerpts.splice(1);
             }
             const referenceBackground=resolved==='focused'&&Boolean(c?.answer?.referenceBackground);
-            const strength = request.ids || c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold) ? 'supported' : 'weak';
-            const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: flags.get(id) ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? ['id'] };
-            if (c?.answer) item.answer_relevance={state:c.answer.state,assessment:'local_claim_heuristic',intent:answerIntent(input.query??'')};
+            const unknownTime=Boolean(input.as_of && (!body.valid_time?.valid_from || !body.valid_time?.valid_to));
+            const declared=declaredFactState(body.decision_state);
+            const intent=decisionIntent(input);
+            const mismatchedDecision=!expansion && declared!==undefined && intent!=='unknown' && declared!==intent;
+            const requiresCheck=flags.get(key) || unknownTime || body.lifecycle==='quarantined' ||
+                body.lifecycle==='historical'&&!input.as_of || !coversEffectiveTime(body.valid_time,effectiveAt);
+            const strength = !unknownTime && !mismatchedDecision && (expansion || c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold)) ? 'supported' : 'weak';
+            const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: requiresCheck ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? [ref?'version':'id'], ...extendedMetadata(body) };
+            if (input.as_of) item.effective_time=unknownTime?'unknown':'matched';
+            if (unknownTime && !result.warnings.includes('EFFECTIVE_TIME_UNKNOWN')) result.warnings.push('EFFECTIVE_TIME_UNKNOWN');
+            if (ref) Object.assign(item,{recorded_at:row.recorded_at,current_revision:row.current_revision,history_start_revision:row.history_start_revision,
+                history_complete:row.history_start_revision===1&&row.history_version_count===row.current_revision,does_not_imply_current:true});
+            if (c?.answer) item.answer_relevance={state:c.answer.state,assessment:declared===undefined?'local_claim_heuristic':'declared_state',intent};
+            if(c?.graphPath)item.graph_path=readGraph(()=>graphReader!.explain(c.graphPath!));
             if(referenceBackground){item.recall_reason=[...item.recall_reason,'background_only'];if(!result.warnings.includes('REFERENCE_EVIDENCE_MISSING'))result.warnings.push('REFERENCE_EVIDENCE_MISSING');}
-            if (options.view==='evidence'&&!request.ids) item.snippet_selection=snippetSelection;
-            if (request.ids)
+            if (options.view==='evidence'&&!expansion) item.snippet_selection=snippetSelection;
+            if (expansion)
                 Object.assign(item, { written_by: row.written_by, content_hash: row.content_hash, embedding_profile_id: row.profile_id, derived_from: body.derived_from, author_client: body.author_client, author_session: body.author_session, import_key: body.import_key, relevance: c ? { rrf: c.rrf, cosine: c.cosine, identifier_matches: c.exact } : undefined });
             result.items.push(item);
             if (!fits()) {
@@ -557,39 +717,49 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 }
                 if (!best) {
                     result.items.pop();
-                    result.blocked_ids = [id];
+                    result[request.versions?'blocked_versions':'blocked_ids'] = expansionRefs([key]);
                     blocked = true;
                     break;
                 }
                 shorten(best);
             }
-            fitted.push(id);
+            fitted.push(key);
         }
-        if(request.ids){
+        if(expansion){
             const remaining=selected.filter(id=>!fitted.includes(id));
-            if(remaining.length){result.remaining_ids=remaining;result.warnings.push('PARTIAL_ID_EXPANSION');}
-            else delete result.remaining_ids;
+            if(remaining.length){result[remainingKey]=expansionRefs(remaining);result.warnings.push(request.versions?'PARTIAL_VERSION_EXPANSION':'PARTIAL_ID_EXPANSION');}
+            else delete result[remainingKey];
             plan.stop_reason=blocked?'item_exceeds_budget':remaining.length?'page_budget':'exhausted';
         }
+        if (cachedWarnings) {
+            result.warnings = cachedWarnings.final;
+            result.retrieval = plan;
+        }
+        if (!result.items.length || blocked) delete result.feedback_receipt;
         profileTrace?.add('materialization',performance.now()-materializeStarted);
         const persistStarted=performance.now();
         if (state) {
             if(savedPage)state.db.prepare('UPDATE queries SET expires=? WHERE id=?').run(Date.now() + config.query_ttl_seconds * 1000, q);
             else state.db.prepare('UPDATE queries SET progress=?,resolved=?,retrieval_mode=?,expires=? WHERE id=?').run(JSON.stringify(progress),resolved,retrievalMode,Date.now() + config.query_ttl_seconds * 1000,q);
-            const done = progress.vectorDone && progress.ftsDone && progress.idDone;
+            const done = progress.vectorDone && progress.ftsDone && progress.idDone && !graphState?.frontier.length;
             if (!savedPage) {
                 for(const[ch,ids]of Object.entries(local))if(ids.size)state.db.prepare('INSERT OR IGNORE INTO seen SELECT ?,?,value FROM json_each(?)').run(q,ch,JSON.stringify([...ids]));
                 if(fitted.length)state.db.prepare('UPDATE candidates SET emitted=? WHERE q=? AND id IN (SELECT value FROM json_each(?))').run(page,q,JSON.stringify(fitted));
                 const pending = Number((state.db.prepare(`SELECT count(*) n FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${input.exact_only ? "AND json_extract(data,'$.exact')>0" : ''}`).get(q) as any).n);
                 const more = pending > 0 || !done;
                 plan.stop_reason = blocked ? 'item_exceeds_budget' : !result.items.length ? 'insufficient' : !more ? 'exhausted' : lowGain ? 'low_marginal_gain' : !done && work >= config.page_candidate_budget ? 'candidate_budget' : !done && performance.now() - start >= config.page_time_budget_ms ? 'time_budget' : resolved === 'focused' && fitted.length === 1 ? 'low_marginal_gain' : 'page_budget';
-                plan.more_unexamined = !done;
+                if(!more && plan.graph?.limited && !blocked)plan.stop_reason='graph_limit';
+                plan.more_unexamined = !done || Boolean(plan.graph?.limited);
                 const coverage = state.db.prepare('SELECT count(DISTINCT project) projects,count(DISTINCT period) periods,count(DISTINCT topic) topics FROM candidates WHERE q=? AND emitted IS NOT NULL').get(q);
                 plan.coverage = coverage;
                 result.has_more = more;
                 result.next_cursor = more ? state.cursor(q, blocked ? page : page + 1) : null;
-                if (!blocked)
-                    state.db.prepare('INSERT INTO pages VALUES(?,?,?,?,?)').run(q, page, JSON.stringify(fitted.map(id => candidateMap.get(id))), JSON.stringify(options), JSON.stringify({ ...plan, has_more: more }));
+                if (!blocked) {
+                    const graphPage = plan.graph ? {graph_page_warnings:{initial:pageWarnings,final:result.warnings}} : {};
+                    const feedback = result.feedback_receipt ? {token:result.feedback_receipt,
+                        used:result.items.map((item:any)=>({memory_id:item.id,revision:item.revision}))} : undefined;
+                    state.db.prepare('INSERT INTO pages VALUES(?,?,?,?,?)').run(q, page, JSON.stringify(fitted.map(id => candidateMap.get(id))), JSON.stringify(options), JSON.stringify({ ...plan, has_more: more, ...graphPage, feedback }));
+                }
             }
             else {
                 result.has_more = plan.has_more;
@@ -605,6 +775,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         d.elapsed_ms = Number((performance.now() - start).toFixed(3));
         d.content_estimated_tokens = estimateTokens(Buffer.byteLength(JSON.stringify(result)));
         if (debug) {
+            if(graphState)Object.assign(d,{graph_rows_examined:graphExamined,graph_candidates_admitted:graphAccepted,graph_work_budget:GRAPH_PAGE_WORK});
             result.diagnostics = d;
             for (let i = 0; i < 4; i++) {
                 d.response_bytes = Buffer.byteLength(JSON.stringify(result));
@@ -631,6 +802,10 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         if (db.isTransaction)
             db.exec('ROLLBACK');
         state?.rollback();
+        if(e instanceof MemoryError && (e.code==='GRAPH_UNAVAILABLE'||e.code==='GRAPH_STALE')) {
+            if(request.cursor)throw new MemoryError('CURSOR_GRAPH_CHANGED');
+            if(request.graph&&!graphFallback)return retrieve(ctx,request,channel,e.code);
+        }
         if(state && (e instanceof MemoryError && /QUERY_CACHE/.test(e.code) || e instanceof Error && /database or disk is full/i.test(e.message))) {
             try {state.rejected();}catch{}
             if(!(e instanceof MemoryError))throw new MemoryError('QUERY_CACHE_DISK_CAPACITY');

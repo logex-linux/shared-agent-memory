@@ -1,8 +1,13 @@
 import {randomUUID} from 'node:crypto';
-import {record} from './helpers.mjs';
+import {record,setup} from './helpers.mjs';
 import {indexChunk} from '../dist/retrieval/indexes.js';
 export const vector=(a=1,b=0)=>{const v=new Float32Array(512);v[0]=a;v[1]=b;return v;};
 export const fake={profile:async()=>({id:'adaptive-test',manifest:{test:true}}),query:async()=>vector(),chunks:async(title,text)=>[{start:0,end:text.length,text,tokens:10,vector:vector()}]};
+export async function setupFake(options) {
+ const fixture=await setup(options);
+ fixture.service.encoder=fake;
+ return fixture;
+}
 export function seed(s,projects,count,{relevant=true,valid_for={},start=0}={}){
  const ids=[];s.storage.transaction(()=>{
   s.db.prepare('INSERT OR IGNORE INTO embedding_profiles VALUES(?,?)').run('adaptive-test','{}');
