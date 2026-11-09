@@ -12,7 +12,7 @@ lockfile. Production inspection uses SQLite read-only access and existing MCP.
 | P2 explicit state and relations | Passed | Schema 7, 107 tests, atomic predecessor updates, scoped relation revisions, 607 matching frozen pages and 53 matching private replays |
 | P3 bounded graph recall | Implemented, experimental | Schema 8, 111 tests, 607 matching frozen pages, 53 matching private pages, no gain on frozen cross-event subset |
 | P4 feedback, consolidation and forget | Implemented and tested | Schema 10, receipt-bound learning and projection, bounded learned expansion, consolidation preview and historical erasure. 119 tests and 607 matching compatibility pages. |
-| P5 evaluation and recovery | Pending | All stage gates and release evaluation |
+| P5 evaluation and recovery | Local preview verified | Schema 11, 120 tests, 160 trajectories, 36 independent STDIO cells and switch rehearsal. Graph and learned ranking remain opt-in. |
 
 P0 artifacts are under `.local/upgrade-v1/p0/`. `build.log` and `tests.log`
 contain the fresh Node 24.18.0 runs. `model-profile.json` identifies the validated
@@ -75,6 +75,16 @@ derived record with a changed latest source list and an exact reimport were
 removed along with the root. The unrelated association neighbor survived.
 The compatibility rerun again matched 607 pages with zero full-body reads.
 
-P5 evaluates the complete A/B/C/D/E trajectory set, the multi-client scale
-matrix and migration and recovery. No installed runtime or canonical user
-data has been changed by this development branch.
+P5 completed the 160-task A/B/C/D/E comparison. A passed 72/96 held-out
+checks. B/C/D/E each passed 96/96. Explicit time and decision filters account
+for the difference. Graph had no gain on the labeled cross-event tasks and
+exceeded the latency target in some cells. Graph and learned ranking remain
+opt-in. The graph-off p95 gate was met using the primary matrix and the
+predefined-order rechecks documented in [evaluation](evaluation.md).
+
+The final build, 120 tests, 607 frozen pages and 53 available private replay
+pages passed. The migration rehearsal used a SQLite backup of 368 live
+records, an external ledger with six entries, fault injection and six isolated
+client launch templates. See [migration and recovery](migration-and-rollback.md).
+The checked-out preview is `1.0.0-beta.1`. The installed runtime remains
+v0.4.8 on Schema 5. This branch has no live rollout or remote push.

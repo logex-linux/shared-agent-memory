@@ -1,4 +1,4 @@
-import type { SQLInputValue } from 'node:sqlite';
+import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import type { MemoryRecord, RecallInput } from '../core/contracts.js';
 import { answerIntent, type FactState } from '../retrieval/evidence.js';
 
@@ -10,20 +10,22 @@ export function decisionIntent(input: RecallInput) {
   return declaredFactState(input.decision_state) ?? answerIntent(input.query ?? '');
 }
 
-export function temporalPredicate(input: RecallInput, effectiveAt: string) {
+export const TEMPORAL_EXCEPTION = "lifecycle<>'current' OR valid_from_jd IS NOT NULL OR valid_to_jd IS NOT NULL";
+
+export function temporalPredicate(db:DatabaseSync, input: RecallInput, effectiveAt: string) {
   const clauses:string[]=[];
   const params:SQLInputValue[]=[];
-  const lifecycle = "coalesce(json_extract(s.metadata,'$.lifecycle'),'current')";
-  if (!input.include_history)
-    clauses.push(input.as_of ? `${lifecycle} IN ('current','historical')` : `${lifecycle}='current'`);
-  if (input.as_of || !input.include_history) {
-    const from = "json_extract(s.metadata,'$.valid_time.valid_from')";
-    const to = "json_extract(s.metadata,'$.valid_time.valid_to')";
-    clauses.push(`(${from} IS NULL OR julianday(${from})<=julianday(?))`,`(${to} IS NULL OR julianday(${to})>julianday(?))`);
+  const needsTime=input.as_of || !input.include_history && Boolean(
+    db.prepare(`SELECT 1 FROM memory_search WHERE ${TEMPORAL_EXCEPTION} LIMIT 1`).get());
+  if (!input.include_history && needsTime)
+    clauses.push(input.as_of ? "s.lifecycle IN ('current','historical')" : "s.lifecycle='current'");
+  if (needsTime) {
+    clauses.push('(s.valid_from_jd IS NULL OR s.valid_from_jd<=julianday(?))',
+      '(s.valid_to_jd IS NULL OR s.valid_to_jd>julianday(?))');
     params.push(effectiveAt,effectiveAt);
   }
   if (input.decision_state) {
-    clauses.push("json_extract(s.metadata,'$.decision_state')=?");
+    clauses.push('s.decision_state=?');
     params.push(input.decision_state);
   }
   return {clauses,params};

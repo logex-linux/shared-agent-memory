@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { record, publish } from './helpers.mjs';
 import { setupFake } from './adaptive-helpers.mjs';
+import { TEMPORAL_EXCEPTION } from '../dist/memory/temporal.js';
 
 
 test('effective time uses the asserted interval for a late event and respects its exclusive end',async()=>{
@@ -72,5 +73,24 @@ test('continuations cannot change the selected effective time or lifecycle scope
     const next=await s.recall({cursor:first.next_cursor});
     assert.equal(next.items[0].effective_time,'matched');
     assert.notEqual(next.items[0].id,first.items[0].id);
+  } finally {s.close();}
+});
+
+test('the temporal exception index tracks the first stateful revision and keeps it out of ordinary candidates',async()=>{
+  const {service:s,project}=await setupFake();
+  const title='Synthetic temporal projection test';
+  const memory=record(project,{title,content:'Synthetic temporal projection retains source information.'});
+  try {
+    const created=await publish(s,memory);
+    const lookup=`SELECT 1 FROM memory_search WHERE ${TEMPORAL_EXCEPTION} LIMIT 1`;
+    assert.equal(s.db.prepare(lookup).get(),undefined);
+    assert.match(s.db.prepare('EXPLAIN QUERY PLAN '+lookup).all().map(r=>r.detail).join('\n'),/search_temporal_exceptions/);
+    assert.equal((await s.recall({query:title})).items[0].id,created.memory_id);
+    const updated=await publish(s,{...memory,lifecycle:'quarantined'},{target_id:created.memory_id,expected_revision:1});
+    assert.ok(s.db.prepare(lookup).get());
+    assert.equal(s.db.prepare('SELECT lifecycle FROM memory_search WHERE memory_id=?').get(updated.memory_id).lifecycle,'quarantined');
+    assert.deepEqual((await s.recall({query:title})).items,[]);
+    assert.deepEqual((await s.recall({ids:[updated.memory_id]})).items,[]);
+    assert.equal((await s.recall({versions:[{memory_id:updated.memory_id,revision:1}]})).items[0].content,memory.content);
   } finally {s.close();}
 });

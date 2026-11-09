@@ -44,4 +44,8 @@ Accepted for isolated implementation. Release baseline is v0.4.8 at
   An explicit versions list uses the existing item and byte budgets. A version
   archive uses a distinct wire format so v0.4.8 cannot import a subset.
   Compatibility mode within the upgraded runtime preserves the latest data.
-  Direct downgrade of a Schema 6 database to v0.4.8 is unsupported.
+  Direct downgrade of a Schema 6 or later database to v0.4.8 is unsupported.
+- The time and lifecycle projection stores generated values in the rebuildable
+  search table. Its exception index allows the ordinary legacy predicate to
+  run when the current read snapshot contains no time or lifecycle exceptions.
+  Per-query index validation still runs.

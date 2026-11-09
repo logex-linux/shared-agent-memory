@@ -1,8 +1,9 @@
 # Shared Agent Memory v1 · Protocol
 
-The installed v0.4.8 protocol remains documented in [protocol.md](../protocol.md).
-This document records the proposed v1 additions and implementation status. Each
-stage adds its executable examples here after its acceptance checks.
+The v0.4.8 protocol remains documented in [protocol.md](../protocol.md).
+The v1 preview advertises version `1.0.0-beta.1` during MCP initialization.
+Existing tools retain their names. Discover optional arguments and permissioned
+tools through the tool list.
 
 | Contract | Stage | Status |
 | --- | --- | --- |

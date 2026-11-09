@@ -6,7 +6,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { backup, DatabaseSync } from 'node:sqlite';
 import * as vec from 'sqlite-vec';
-import { record, publish } from './helpers.mjs';
+import { record, publish,dropTemporalProjection } from './helpers.mjs';
 import { fake, setupFake } from './adaptive-helpers.mjs';
 import { MemoryService } from '../dist/core/service.js';
 import { hash } from '../dist/core/contracts.js';
@@ -27,9 +27,10 @@ test('migration is atomic across interruption and racing opens, preserving Schem
   const {service:s,root,config,project}=await setupFake();
   const original=await publish(s,record(project));
   await publish(s,record(project,{content:'Revision two is the earliest retained snapshot.'}),{target_id:original.memory_id,expected_revision:1});
+  dropTemporalProjection(s.db);
   s.db.exec('DROP TRIGGER version_dependency_insert; DROP TABLE version_dependencies; DROP TABLE revoked_aliases; DROP INDEX version_content_hash; DROP TABLE association_edges; DROP TABLE projection_jobs; DROP TABLE learning_events; DELETE FROM meta WHERE key=\'learning_watermark\'; DROP INDEX tombstones_hash; DELETE FROM meta WHERE key=\'graph_epoch\'; DROP TABLE memory_relations; DROP TABLE proposal_transitions; DROP TRIGGER version_insert; DROP TRIGGER version_advance; DROP TABLE memory_versions; DROP TABLE revoked_version_hashes; PRAGMA user_version=5;');
   const signature=db=>['memories','memory_chunks','memory_vec','embedding_profiles','events','memory_search','chunk_fts','chunk_identifiers'].map(table=>
-    hash(db.prepare('SELECT * FROM '+table+' ORDER BY 1,2').all()));
+    hash(db.prepare('SELECT '+(table==='memory_search'?'memory_id,project_id,scope,revision,status,profile_id,branch,commit_ref,environment,expires_at,metadata':'*')+' FROM '+table+' ORDER BY 1,2').all()));
   const before=signature(s.db), gen=s.storage.generation(), copy=join(root,'rehearsal.db'), committedCopy=join(root,'post-commit.db');
   await backup(s.db,copy);await backup(s.db,committedCopy);s.close();
   const configPath=join(root,'migration.json');
@@ -48,12 +49,12 @@ test('migration is atomic across interruption and racing opens, preserving Schem
   assert.equal(committed.signal,'SIGKILL',String(committed.stderr));
   const postCommit=new DatabaseSync(committedCopy,{readOnly:true,allowExtension:true});vec.load(postCommit);
   try {
-    assert.equal(postCommit.prepare('PRAGMA user_version').get().user_version,10);
+    assert.equal(postCommit.prepare('PRAGMA user_version').get().user_version,11);
     assert.equal(postCommit.prepare('SELECT count(*) n FROM memory_versions').get().n,1);
     assert.deepEqual(signature(postCommit),before);
   } finally {postCommit.close();}
   const runs=await Promise.all(Array.from({length:4},()=>inspectWorker(configPath)));
-  for(const run of runs){assert.equal(run.code,0,run.error);assert.equal(JSON.parse(run.output).schema,10);}
+  for(const run of runs){assert.equal(run.code,0,run.error);assert.equal(JSON.parse(run.output).schema,11);}
   const migrated=new MemoryService({...config,database:copy},fake);
   try {
     assert.deepEqual(signature(migrated.db),before);

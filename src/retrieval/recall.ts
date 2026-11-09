@@ -48,7 +48,7 @@ const blob = (v: Float32Array) => Buffer.from(v.buffer, v.byteOffset, v.byteLeng
 // These describe the request, rather than its subject; they must not dominate IDF anchors.
 const salienceScaffolding=new Set(terms('用户 已 废弃 改用 决定 配置 入口 最近 排错 记录 相关 当前 已有 既有'));
 export const estimateTokens = (bytes: number) => Math.ceil(bytes / 3);
-function eligibility(input: RecallInput, config: Config, effectiveAt:string) {
+function eligibility(db:DatabaseSync,input: RecallInput, config: Config, effectiveAt:string) {
     const params: SQLInputValue[] = [Number(!input.project_id && config.all_projects), JSON.stringify(input.project_id ? [input.project_id] : config.allowed_projects), Number(input.include_global ?? (!input.project_id && config.allow_global))];
     let sql = "s.status='active' AND ((s.scope='project' AND s.project_id IN (SELECT p.id FROM projects p WHERE ?=1 OR p.id IN (SELECT value FROM json_each(?)))) OR (?=1 AND s.scope='global'))";
     if (input.versions) return {sql,params};
@@ -58,7 +58,7 @@ function eligibility(input: RecallInput, config: Config, effectiveAt:string) {
         sql += ` AND (s.${column} IS NULL OR ? IS NULL OR s.${column}=?)`;
         params.push(input.context[key] ?? null, input.context[key] ?? null);
     }
-    const temporal=temporalPredicate(input,effectiveAt);
+    const temporal=temporalPredicate(db,input,effectiveAt);
     for(const clause of temporal.clauses)sql += ' AND '+clause;
     return { sql, params:[...params,...temporal.params] };
 }
@@ -148,7 +148,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             // New-query validation needs only canonical data. Keep the same WAL
             // read snapshot through computation; do not occupy the sidecar writer.
             if(!request.cursor){
-                db.exec('BEGIN');ctx.generation();preflightAuthority=authority(config,db);preflightEligibility=eligibility(input,config,effectiveAt);
+                db.exec('BEGIN');ctx.generation();preflightAuthority=authority(config,db);preflightEligibility=eligibility(db,input,config,effectiveAt);
                 if(queryVector&&retrievalMode!=='lexical_degraded')indexProblem=profileTrace?profileTrace.stage('index_validation',()=>validateIndex(preflightEligibility!)):validateIndex(preflightEligibility);
                 ctx.checkpoint?.('recall:read_snapshot');
             }
@@ -176,7 +176,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         // Freeze expiry after query encoding; all channels and materialization share this snapshot.
         const candidateStarted=performance.now();if(!preflightEligibility)db.exec('BEGIN');
-        const gen = ctx.generation(), auth = authority(config, db), eligible = preflightEligibility??eligibility(input, config,effectiveAt);
+        const gen = ctx.generation(), auth = authority(config, db), eligible = preflightEligibility??eligibility(db,input,config,effectiveAt);
         if(preflightAuthority&&preflightAuthority!==auth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
         if (state) {
             if (request.cursor) {

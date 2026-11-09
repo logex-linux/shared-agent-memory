@@ -3,14 +3,14 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as sqliteVec from 'sqlite-vec';
 import { MemoryError } from '../core/contracts.js';
-import { migrateSearch } from '../retrieval/indexes.js';
+import { migrateSearch, migrateTemporalSearch } from '../retrieval/indexes.js';
 import { migrateVersions } from '../memory/versions.js';
 import { migrateRelations } from '../memory/transitions.js';
 import { migrateGraph } from '../retrieval/graph.js';
 import { migrateErasure } from '../memory/erasure.js';
 import { indexAssociationWalk, migrateFeedback } from '../memory/feedback.js';
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 export class Storage {
   db: DatabaseSync;
@@ -99,6 +99,10 @@ export class Storage {
       migrateErasure(this.db);
       indexAssociationWalk(this.db);
       this.db.exec('PRAGMA user_version=10;');
+    }
+    if(version<11){
+      migrateTemporalSearch(this.db);
+      this.db.exec('PRAGMA user_version=11;');
     }
   }
   transaction<T>(fn:()=>T):T {

@@ -1,21 +1,13 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { terms,identifierWeights } from './lexical.js';
+import { TEMPORAL_EXCEPTION } from '../memory/temporal.js';
 
-// Derived indexes only. The canonical body and its revision are never rewritten here.
-export const SEARCH_SCHEMA=`
-CREATE TABLE IF NOT EXISTS memory_search(
+const SEARCH_COLUMNS=`
  memory_id TEXT PRIMARY KEY,project_id TEXT,scope TEXT NOT NULL,revision INTEGER NOT NULL,
  status TEXT NOT NULL,profile_id TEXT NOT NULL,branch TEXT,commit_ref TEXT,environment TEXT,expires_at TEXT,
- metadata TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS search_scope ON memory_search(scope,project_id,status,profile_id);
-CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(chunk_id UNINDEXED,memory_id UNINDEXED,terms,tokenize='unicode61');
-INSERT INTO chunk_fts(chunk_fts,rank) VALUES('secure-delete',1);
-CREATE TABLE IF NOT EXISTS chunk_identifiers(
- chunk_id INTEGER NOT NULL,memory_id TEXT NOT NULL,identifier TEXT NOT NULL,weight INTEGER NOT NULL,
- PRIMARY KEY(chunk_id,identifier)
-);
-CREATE INDEX IF NOT EXISTS identifiers_lookup ON chunk_identifiers(identifier,memory_id);
+ metadata TEXT NOT NULL`;
+const SEARCH_SCOPE_INDEX='CREATE INDEX IF NOT EXISTS search_scope ON memory_search(scope,project_id,status,profile_id);';
+const SEARCH_TRIGGERS=`
 CREATE TRIGGER IF NOT EXISTS search_insert AFTER INSERT ON memories BEGIN
  INSERT OR REPLACE INTO memory_search VALUES(new.id,new.project_id,new.scope,new.revision,new.status,new.profile_id,
  json_extract(new.body,'$.valid_for.branch'),json_extract(new.body,'$.valid_for.commit'),
@@ -30,11 +22,47 @@ END;
 CREATE TRIGGER IF NOT EXISTS search_delete AFTER DELETE ON memories BEGIN
  DELETE FROM memory_search WHERE memory_id=old.id;
 END;
+`;
+
+// Derived indexes only. The canonical body and its revision are never rewritten here.
+export const SEARCH_SCHEMA=`
+CREATE TABLE IF NOT EXISTS memory_search(${SEARCH_COLUMNS});
+${SEARCH_SCOPE_INDEX}
+CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(chunk_id UNINDEXED,memory_id UNINDEXED,terms,tokenize='unicode61');
+INSERT INTO chunk_fts(chunk_fts,rank) VALUES('secure-delete',1);
+CREATE TABLE IF NOT EXISTS chunk_identifiers(
+ chunk_id INTEGER NOT NULL,memory_id TEXT NOT NULL,identifier TEXT NOT NULL,weight INTEGER NOT NULL,
+ PRIMARY KEY(chunk_id,identifier)
+);
+CREATE INDEX IF NOT EXISTS identifiers_lookup ON chunk_identifiers(identifier,memory_id);
+${SEARCH_TRIGGERS}
 CREATE TRIGGER IF NOT EXISTS chunk_search_delete AFTER DELETE ON memory_chunks BEGIN
  DELETE FROM chunk_fts WHERE chunk_id=old.id;
  DELETE FROM chunk_identifiers WHERE chunk_id=old.id;
 END;
 `;
+
+export function migrateTemporalSearch(db:DatabaseSync) {
+  db.exec(`
+    CREATE TABLE memory_search_v11(${SEARCH_COLUMNS},
+      lifecycle TEXT GENERATED ALWAYS AS (coalesce(json_extract(metadata,'$.lifecycle'),'current')) STORED,
+      valid_from_jd REAL GENERATED ALWAYS AS (CASE WHEN json_extract(metadata,'$.valid_time.valid_from') IS NOT NULL
+        THEN coalesce(julianday(json_extract(metadata,'$.valid_time.valid_from')),1e12) END) STORED,
+      valid_to_jd REAL GENERATED ALWAYS AS (CASE WHEN json_extract(metadata,'$.valid_time.valid_to') IS NOT NULL
+        THEN coalesce(julianday(json_extract(metadata,'$.valid_time.valid_to')),-1e12) END) STORED,
+      decision_state TEXT GENERATED ALWAYS AS (json_extract(metadata,'$.decision_state')) STORED
+    );
+    INSERT INTO memory_search_v11 SELECT * FROM memory_search;
+    DROP TRIGGER search_insert;
+    DROP TRIGGER search_update;
+    DROP TRIGGER search_delete;
+    DROP TABLE memory_search;
+    ALTER TABLE memory_search_v11 RENAME TO memory_search;
+    ${SEARCH_SCOPE_INDEX}
+    CREATE INDEX search_temporal_exceptions ON memory_search(memory_id) WHERE ${TEMPORAL_EXCEPTION};
+    ${SEARCH_TRIGGERS}
+  `);
+}
 
 export function indexChunk(db:DatabaseSync,chunk:{id:number;memory_id:string;text:string},title:string,tags:string[]) {
   db.prepare('INSERT INTO chunk_fts VALUES(?,?,?)').run(chunk.id,chunk.memory_id,terms(title+' '+chunk.text+' '+tags.join(' ')).join(' '));

@@ -672,7 +672,7 @@ export class MemoryService {
         for(const hash of hashes)
           this.db.prepare('INSERT OR IGNORE INTO revoked_version_hashes VALUES(?,?)').run(t.id,hash);
         const alias=this.db.prepare('INSERT OR IGNORE INTO revoked_aliases VALUES(?,?,?)');
-        for(const value of importKeys)alias.run(t.id,'import_key',value);
+        for(const value of new Set([...importKeys,...(t.import_key==null?[]:[t.import_key])]))alias.run(t.id,'import_key',value);
         for(const value of sourceHashes)alias.run(t.id,'source_hash',value);
         for(const id of this.erasureTree(t.id))erase.add(id);
         const copies=this.db.prepare(`SELECT DISTINCT v.memory_id FROM memory_versions v JOIN memories m ON m.id=v.memory_id

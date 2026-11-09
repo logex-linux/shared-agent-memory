@@ -65,12 +65,11 @@ export class GraphReader {
     private checks = new Map<string,'valid'|'stale'|'limited'>();
     private readonly visible;
     constructor(private db:DatabaseSync, eligible:{sql:string;params:SQLInputValue[]}, input:RecallInput, private learnedAt?:number) {
-        const knownTime=input.as_of? ` AND json_extract(s.metadata,'$.valid_time.valid_from') IS NOT NULL
-            AND json_extract(s.metadata,'$.valid_time.valid_to') IS NOT NULL`:'';
+        const knownTime=input.as_of? ' AND s.valid_from_jd IS NOT NULL AND s.valid_to_jd IS NOT NULL':'';
         const statement=db.prepare(`SELECT s.memory_id,s.revision,s.scope,s.project_id FROM memory_search s
             JOIN memories m ON m.id=s.memory_id
             WHERE s.memory_id=? AND ${eligible.sql} AND m.revision=s.revision
-            AND coalesce(json_extract(s.metadata,'$.lifecycle'),'current')<>'quarantined'
+            AND s.lifecycle<>'quarantined'
             AND (s.branch IS NULL OR s.branch=?) AND (s.commit_ref IS NULL OR s.commit_ref=?)
             AND (s.environment IS NULL OR s.environment=?) ${knownTime}
             AND NOT EXISTS(SELECT 1 FROM tombstones t WHERE t.id=m.id OR t.content_hash=m.content_hash)

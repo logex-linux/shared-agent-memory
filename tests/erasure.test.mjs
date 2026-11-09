@@ -59,10 +59,11 @@ test('forget removes historical derivations and exact reimports and revokes old 
     assert.equal(tombstone.version_hashes.length,2);
     restored=new MemoryService({...s.config,database},fake);
     await restored.applyRevocations(ledger);
+    await restored.applyRevocations([{...tombstone,import_key:'older-external-key',import_keys:undefined}]);
     assert.deepEqual((await restored.recall({versions:erased.map(ref)})).items,[]);
     assert.deepEqual((await restored.recall({...query,limit:10})).items.map(r=>r.id),[independent.memory_id]);
     const replay={...scope,content:'Synthetic material under a different body and ID.'};
-    for(const overrides of [{import_key:'old-import'},{sources:original.sources},
+    for(const overrides of [{import_key:'old-import'},{import_key:'older-external-key'},{sources:original.sources},
       {sources:[{...scope.sources[0],source_hash:tombstone.version_hashes[0]}]}]) {
       const entry={...replay,...overrides};
       assert.equal(restored.previewImport({id:id(),revision:1,record:entry}).action,'blocked_revoked');

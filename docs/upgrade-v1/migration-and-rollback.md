@@ -6,8 +6,8 @@ SQLite connection to inspect their state. The runtime constructor may migrate.
 
 The migration gate checks a SQLite backup of Schema 5, latest revocations, old
 and new schema opens, hashes of every record and vector, and interruption before
-and after the migration commit. Schema 6 will record the existing revision and
-all subsequent revisions. Older bodies absent from the backup remain unknown.
+and after the migration commit. Schema 6 records the existing revision and all
+subsequent revisions. Older bodies absent from the backup remain unknown.
 
 Recovery first applies the latest externally retained revocation ledger. A
 versioned archive and a database backup have different roles. A database backup
@@ -15,12 +15,11 @@ preserves canonical receipts and projection inputs. The archive's guarantees
 will be documented with its implementation and tests.
 
 After migration, use compatibility retrieval inside the new runtime if a
-ranking feature needs to be turned off. The old binary rejects Schema 6. A
-recovery that restores Schema 5 requires a separately verified conversion from
-the latest legal data and a retained new database. Where legacy cannot express
-the needed state, retain the new database and repair within the new runtime.
-
-Full P5 rehearsals and the final switch checklist remain pending.
+ranking feature needs to be turned off. Direct v0.4.8 binary rollback on the
+upgraded database is prohibited. The old runtime returns `SCHEMA_TOO_NEW`, and
+its format cannot retain versions, decision state, citations or learning
+inputs. Keep the upgraded database and its subsequent writes. A pre-upgrade
+backup is an input for recovery rehearsal and diagnosis.
 
 P1 rehearsals verified the Schema 5 backup and Schema 6 projection with
 matching bodies, hashes, revisions, index records and vector bytes. SIGKILL
@@ -87,3 +86,48 @@ exact value. Matching a digest does not erase separate existing statements
 that merely cite the same source, and hashes cannot identify paraphrases.
 Managed exports are removed through the existing cleanup path. Previous chat
 results and unmanaged backups remain outside the service's control.
+
+Schema 11 adds generated stored time and state fields to the derived search
+table and a partial exception index. The migration rebuilds only that derived
+table inside the canonical migration transaction. It preserves the old search
+projection columns and their values, FTS, vector bytes and record revisions.
+
+## Rehearsed switch
+
+Run with an existing private output directory and the latest external ledger.
+
+```sh
+node bench/upgrade-v1/rehearse.mjs "$ISOLATED_OUTPUT" "$SOURCE_DB" "$LATEST_LEDGER" "$V048_DIST"
+```
+
+The source is opened read-only. The runner signs existing canonical rows and
+vector bytes, then uses SQLite's backup API. In the final rehearsal, 368
+records and their source signatures survived migration and reopen. SIGKILL
+before the migration commit left Schema 5. SIGKILL after commit left Schema
+11. The latest ledger applied all six entries and none returned through ID
+recall. SQLite integrity passed. An isolated test record could read its newer
+revision and its original revision after switching to compatibility retrieval.
+
+Six generated templates were tested through the exact STDIO launch command
+they specify. These cover Codex, StepCode, Claude, Pi, DSH and Hermes. Each
+launch kept the scoped writer tool set and returned the selected revision.
+The exercise starts separate MCP processes using isolated configs. It does not
+exercise the individual desktop applications or alter installed settings.
+The private report is under `.local/upgrade-v1/p5/rehearsal-VZ8Ydg/`.
+
+Before an operator-approved live switch:
+
+1. Confirm Node 24.18.0, the pinned model profile, the exact release build and
+   each client's current project scope and operations. Record the latest
+   revocation ledger independently of the database backup.
+2. Quiesce writes and create a fresh SQLite backup. Rehearse the migration on
+   a copy. Verify schema, hashes, vector bytes, scopes and forgotten IDs before
+   allowing clients to read it.
+3. Start the new binary with graph and learning disabled. Switch each client
+   launch command to the same vetted binary and preserve its existing config
+   permissions. Confirm the server version, tool list, scoped recall and a
+   synthetic test write in an isolated project.
+4. Restart old query cursors and keep the upgraded canonical database as the
+   source of truth. If retrieval needs recovery, keep the new binary and
+   disable optional ranking channels. Apply the newest revocations to any
+   restored copy before it becomes available to a client.

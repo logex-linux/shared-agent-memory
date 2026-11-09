@@ -4,6 +4,11 @@ import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { MemoryService } from '../dist/core/service.js';
 export const MODEL=resolve('.local/models/bge-small-zh-v1.5');
+export function dropTemporalProjection(db) {
+  db.exec('DROP INDEX search_temporal_exceptions');
+  for(const column of ['lifecycle','valid_from_jd','valid_to_jd','decision_state'])
+    db.exec('ALTER TABLE memory_search DROP COLUMN '+column);
+}
 export async function setup(options={}) {
   const root=await mkdtemp(join(await realpath(tmpdir()),'shared-memory-test-'));
   const project=randomUUID(),other=randomUUID();
