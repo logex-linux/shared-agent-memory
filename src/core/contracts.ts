@@ -36,6 +36,14 @@ const effectiveTimeSchema = z.object({ valid_from:eventTime, valid_to:eventTime 
   {message:'valid_from must precede valid_to'}
 );
 export const versionRefSchema = z.object({memory_id:z.string().uuid(),revision:z.number().int().positive().safe()}).strict();
+export const decisionStateSchema = z.enum(['unknown','proposed','adopted','rejected']);
+export const lifecycleSchema = z.enum(['current','historical','quarantined']);
+export const relationTypeSchema = z.enum(['supports','contradicts','supersedes','context_variant','related_to']);
+const relationDraftSchema = z.object({
+  target_id:z.string().uuid(),
+  type:relationTypeSchema.exclude(['supersedes']),
+  sources:z.array(sourceSchema).min(1).max(12)
+}).strict();
 export const recordSchema = z.object({
   project_id: z.string().uuid().nullable(), scope: z.enum(['project', 'global']),
   kind: z.enum(['preference', 'fact', 'decision', 'procedure', 'lesson']),
@@ -47,22 +55,37 @@ export const recordSchema = z.object({
   derived_from: z.array(z.object({ memory_id: z.string().uuid(), revision: z.number().int().positive() }).strict()).max(20).default([]),
   import_key: text(256).optional(),
   memory_form:z.enum(['legacy','episodic','semantic','procedural']).optional(),
-  episode:episodeSchema.nullable().optional(), valid_time:effectiveTimeSchema.nullable().optional()
+  episode:episodeSchema.nullable().optional(), valid_time:effectiveTimeSchema.nullable().optional(),
+  decision_state:decisionStateSchema.optional(), lifecycle:lifecycleSchema.optional(),
+  subject_id:text(256).optional(), context_key:text(256).optional()
 }).strict().superRefine((r, ctx) => {
   if ((r.scope === 'global') !== (r.project_id === null)) ctx.addIssue({code:'custom', message:'global requires null project_id; project requires UUID'});
 });
 export type MemoryRecord = z.infer<typeof recordSchema>;
 const request = z.string().uuid().describe('A fresh real UUID per tool operation; propose and commit need different UUIDs. Reuse only for an identical retry of the same operation, never send a placeholder.');
 export const proposeSchema = z.object({ request_id: request, record: recordSchema,
-  target_id: z.string().uuid().optional(), expected_revision: z.number().int().positive().optional().describe('Updates only: current positive revision, together with target_id. For a new proposal omit both fields; revision 0 belongs to memory_commit.')
+  target_id: z.string().uuid().optional(), expected_revision: z.number().int().positive().optional().describe('Updates only: current positive revision, together with target_id. For a new proposal omit both fields; revision 0 belongs to memory_commit.'),
+  transition:z.enum(['new','reinforce','supersede','branch','quarantine']).optional(),
+  expected_refs:z.array(versionRefSchema).min(1).max(10).optional(),
+  relations:z.array(relationDraftSchema).min(1).max(10).optional()
 }).strict().superRefine((r,ctx) => {
   if (Boolean(r.target_id) !== Boolean(r.expected_revision)) ctx.addIssue({code:'custom', message:'target_id and expected_revision required together'});
+  const refs=new Set(r.expected_refs?.map(ref=>ref.memory_id));
+  if (refs.size!==(r.expected_refs?.length??0))
+    ctx.addIssue({code:'custom',message:'expected_refs must use distinct memory IDs'});
+  if (r.relations?.some(relation=>!refs.has(relation.target_id)))
+    ctx.addIssue({code:'custom',message:'every relation target requires an expected_refs revision'});
+  if (r.transition==='quarantine' ? !r.target_id : Boolean(r.transition&&r.target_id))
+    ctx.addIssue({code:'custom',message:'quarantine updates a target, other transitions create a new memory'});
+  if (r.transition && ['reinforce','supersede','branch'].includes(r.transition) && !refs.size)
+    ctx.addIssue({code:'custom',message:'reinforce, supersede and branch require expected_refs'});
 });
 export const commitSchema = z.object({ request_id: request, proposal_id: z.string().uuid(), expected_revision: z.number().int().nonnegative() }).strict();
 export const forgetSchema = z.object({ request_id: request, memory_id: z.string().uuid(), expected_revision: z.number().int().positive() }).strict();
 export const recallSchema = z.object({
   query: text(512).optional(), ids: z.array(z.string().uuid()).min(1).max(10).optional(),
   versions:z.array(versionRefSchema).min(1).max(10).optional(),
+  as_of:z.string().datetime().optional(), include_history:z.boolean().optional(), decision_state:decisionStateSchema.optional(),
   project_id: z.string().uuid().optional(), include_global: z.boolean().optional(),
   context: validSchema.omit({expires_at:true}).default({}), limit: z.number().int().positive().safe().optional(),
   exact_only:z.boolean().default(false),token_budget:z.number().int().min(512).max(1000000).optional(),

@@ -1,13 +1,14 @@
-import { mkdtemp, mkdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { MemoryService } from '../dist/core/service.js';
 export const MODEL=resolve('.local/models/bge-small-zh-v1.5');
 export async function setup(options={}) {
-  const root=await mkdtemp(join(tmpdir(),'shared-memory-test-'));
+  const root=await mkdtemp(join(await realpath(tmpdir()),'shared-memory-test-'));
   const project=randomUUID(),other=randomUUID();
   const config={database:join(root,'memory.db'),model_dir:MODEL,allowed_projects:[project,other],allow_global:true,operations:['recall','propose','commit','forget','manage'],semantic_threshold:0.65,dtype:'fp32',threads:2,...options};
+  if(dirname(resolve(config.database))!==root)throw Error('Test database must be inside its temporary fixture');
   const service=new MemoryService(config);
   await service.project(project,'project',root);
   await mkdir(join(root,'other'));await service.project(other,'project',join(root,'other'));

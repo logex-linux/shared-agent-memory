@@ -5,7 +5,8 @@ import { answerIntent, factState, focusTerms, evidenceWindow, referenceEvidence,
 import { prepared } from '../storage/statements.js';
 import { RetrievalProfile } from './profile.js';
 import { QueryState, authority } from './state.js';
-import { eventMetadata } from '../memory/versions.js';
+import { extendedMetadata } from '../memory/versions.js';
+import { coversEffectiveTime, declaredFactState, decisionIntent, temporalPredicate } from '../memory/temporal.js';
 type Context = {
     db: DatabaseSync;
     config: Config;
@@ -43,7 +44,7 @@ const blob = (v: Float32Array) => Buffer.from(v.buffer, v.byteOffset, v.byteLeng
 // These describe the request, rather than its subject; they must not dominate IDF anchors.
 const salienceScaffolding=new Set(terms('用户 已 废弃 改用 决定 配置 入口 最近 排错 记录 相关 当前 已有 既有'));
 export const estimateTokens = (bytes: number) => Math.ceil(bytes / 3);
-function eligibility(input: RecallInput, config: Config) {
+function eligibility(input: RecallInput, config: Config, effectiveAt:string) {
     const params: SQLInputValue[] = [Number(!input.project_id && config.all_projects), JSON.stringify(input.project_id ? [input.project_id] : config.allowed_projects), Number(input.include_global ?? (!input.project_id && config.allow_global))];
     let sql = "s.status='active' AND ((s.scope='project' AND s.project_id IN (SELECT p.id FROM projects p WHERE ?=1 OR p.id IN (SELECT value FROM json_each(?)))) OR (?=1 AND s.scope='global'))";
     if (input.versions) return {sql,params};
@@ -53,7 +54,9 @@ function eligibility(input: RecallInput, config: Config) {
         sql += ` AND (s.${column} IS NULL OR ? IS NULL OR s.${column}=?)`;
         params.push(input.context[key] ?? null, input.context[key] ?? null);
     }
-    return { sql, params };
+    const temporal=temporalPredicate(input,effectiveAt);
+    for(const clause of temporal.clauses)sql += ' AND '+clause;
+    return { sql, params:[...params,...temporal.params] };
 }
 const broadIntent = (q: string) => /(长期|稳定.*偏好|归纳|总结|跨项目|多年来|反复.*选择|patterns?|career|across.*projects|long.term|over time|summari)/i.test(q)
     || /(偏好|习惯|倾向|审美|preferences?)/i.test(q)&&!identifiers(q).some(id=>id.includes('/'));
@@ -102,6 +105,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         d.metadata_json_parses++; return JSON.parse(s); };
     const expansion = request.versions ? 'versions' : request.ids ? 'ids' : undefined;
     const versions = new Map(request.versions?.map(ref=>[ref.memory_id+':'+ref.revision,ref]));
+    let effectiveAt=request.as_of??new Date().toISOString();
     let input = request, queryVector: Buffer | null = null, profile: string | null = null, retrievalMode: string = expansion ?? channel, warnings: string[] = [], state: QueryState | undefined, q = '', page = 0, resolved = 'focused', progress: any = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage: any;
     const embeddingStarted=performance.now();
     if (!request.cursor && request.query && channel !== 'lexical')
@@ -126,7 +130,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             // New-query validation needs only canonical data. Keep the same WAL
             // read snapshot through computation; do not occupy the sidecar writer.
             if(!request.cursor){
-                db.exec('BEGIN');ctx.generation();preflightAuthority=authority(config,db);preflightEligibility=eligibility(input,config);
+                db.exec('BEGIN');ctx.generation();preflightAuthority=authority(config,db);preflightEligibility=eligibility(input,config,effectiveAt);
                 if(queryVector&&retrievalMode!=='lexical_degraded')indexProblem=profileTrace?profileTrace.stage('index_validation',()=>validateIndex(preflightEligibility!)):validateIndex(preflightEligibility);
                 ctx.checkpoint?.('recall:read_snapshot');
             }
@@ -143,8 +147,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 retrievalMode = found.row.retrieval_mode;
                 resolved = found.row.resolved;
                 progress = parse(found.row.progress);
+                effectiveAt=progress.effectiveAt??input.as_of??effectiveAt;
                 warnings = progress.warnings;
-                for (const key of ['project_id', 'include_global', 'mode'] as const)
+                for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state'] as const)
                     if (request[key] !== undefined && request[key] !== input[key])
                         throw new MemoryError('CURSOR_QUERY_MISMATCH');
                 if (Object.keys(request.context).length && hash(request.context) !== hash(input.context))
@@ -153,7 +158,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         // Freeze expiry after query encoding; all channels and materialization share this snapshot.
         const candidateStarted=performance.now();if(!preflightEligibility)db.exec('BEGIN');
-        const gen = ctx.generation(), auth = authority(config, db), eligible = preflightEligibility??eligibility(input, config);
+        const gen = ctx.generation(), auth = authority(config, db), eligible = preflightEligibility??eligibility(input, config,effectiveAt);
         if(preflightAuthority&&preflightAuthority!==auth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
         if (state) {
             if (request.cursor) {
@@ -172,6 +177,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 progress.ftsDone = channel === 'vector' && retrievalMode !== 'lexical_degraded';
                 progress.idDone = !identifiers(input.query!).length || (channel === 'vector' && !input.exact_only && retrievalMode !== 'lexical_degraded');
                 progress.warnings = warnings;
+                progress.effectiveAt=effectiveAt;
                 q = state.create({ authority: auth, generation: gen, input: JSON.stringify(input), vector: queryVector, profile, retrieval_mode: retrievalMode, resolved, progress: JSON.stringify(progress), expires: Date.now() + config.query_ttl_seconds * 1000 });
             }
         }
@@ -199,7 +205,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 if (old)
                     candidates.set(id, parse(old.data));
                 else {
-                    const r = db.prepare("SELECT s.project_id,s.branch,s.commit_ref,s.environment,json_extract(s.metadata,'$.kind') kind,json_extract(s.metadata,'$.title') title,json_extract(s.metadata,'$.verification.basis') basis,json_extract(s.metadata,'$.verification.status') status,json_extract(s.metadata,'$.tags') tags,json_extract(s.metadata,'$.sources[0].checked_at') date,json_extract(s.metadata,'$.sources[0].uri') source FROM memory_search s WHERE s.memory_id=?").get(id) as any;
+                    const r = db.prepare("SELECT s.project_id,s.branch,s.commit_ref,s.environment,json_extract(s.metadata,'$.kind') kind,json_extract(s.metadata,'$.title') title,json_extract(s.metadata,'$.verification.basis') basis,json_extract(s.metadata,'$.verification.status') status,json_extract(s.metadata,'$.decision_state') decision_state,json_extract(s.metadata,'$.tags') tags,json_extract(s.metadata,'$.sources[0].checked_at') date,json_extract(s.metadata,'$.sources[0].uri') source FROM memory_search s WHERE s.memory_id=?").get(id) as any;
                     analysisMetadata.set(id,r);
                     const tags: string[] = parse(r.tags ?? '[]');
                     const topic=tags.at(-1);
@@ -238,13 +244,14 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             if (c.answer?.checked===signature) return;
             const rankingStarted=performance.now();
             const previousStage=profileTrace?.current;if(profileTrace)profileTrace.current='ranking';
-            const meta=analysisMetadata.get(c.id)??db.prepare("SELECT json_extract(metadata,'$.title') title,json_extract(metadata,'$.verification.basis') basis,json_extract(metadata,'$.verification.status') status FROM memory_search WHERE memory_id=?").get(c.id) as any;
+            const meta=analysisMetadata.get(c.id)??db.prepare("SELECT json_extract(metadata,'$.title') title,json_extract(metadata,'$.verification.basis') basis,json_extract(metadata,'$.verification.status') status,json_extract(metadata,'$.decision_state') decision_state FROM memory_search WHERE memory_id=?").get(c.id) as any;
             const loaded=readChunks(c.id,c.hits.map(h=>h[0])),chunks=loaded.rows;
             d.ranking_chunk_rows_read+=loaded.read;
             const text=[meta.title,...chunks.map(r=>r.text)].join('\n'), words=new Set(terms(text)), qt=queryTerms;
             const denominator=qt.reduce((n,t)=>n+(termWeights.get(t)??Math.log(2+Number((progress.vectorRank??0)+32))),0);
             const coverage=denominator?qt.filter(t=>words.has(t)).reduce((n,t)=>n+(termWeights.get(t)??1),0)/denominator:0;
-            const state=factState(chunks.map(r=>r.text).join('\n'),meta.basis,meta.status==='disputed'), intent=answerIntent(input.query!);
+            const state=declaredFactState(meta.decision_state??undefined)??factState(chunks.map(r=>r.text).join('\n'),meta.basis,meta.status==='disputed');
+            const intent=decisionIntent(input);
             const alignment=intent==='unknown'?0:state===intent?1:state==='unknown'?0:state==='disputed'?-.35:-1;
             const salient=queryTerms.filter(t=>t.length>=2&&!salienceScaffolding.has(t)&&termWeights.has(t)).sort((a,b)=>termWeights.get(b)!-termWeights.get(a)!);
             const salientWeight=salient.length?termWeights.get(salient[0])!:Infinity;
@@ -467,7 +474,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         const flags = new Map<string,number>();
         if (request.versions) {
-            const visible = db.prepare(`SELECT v.revision, s.revision current_revision, json_extract(v.body,'$.valid_for') valid_for
+            const visible = db.prepare(`SELECT v.revision, s.revision current_revision, json_extract(v.body,'$.valid_for') valid_for,
+                json_extract(v.body,'$.decision_state') decision_state, json_extract(v.body,'$.valid_time') valid_time
                 FROM memory_versions v JOIN memory_search s ON s.memory_id=v.memory_id
                 WHERE v.memory_id=? AND v.revision=? AND ${eligible.sql}
                 AND NOT EXISTS(SELECT 1 FROM tombstones t WHERE t.id=v.memory_id OR t.content_hash=v.content_hash)
@@ -476,6 +484,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 const row = visible.get(ref.memory_id,ref.revision,...eligible.params);
                 if (!row) continue;
                 const valid = parse(String(row.valid_for ?? '{}'),true);
+                if (input.decision_state && row.decision_state!==input.decision_state) continue;
+                if (input.as_of && !coversEffectiveTime(parse(String(row.valid_time ?? '{}'),true),effectiveAt)) continue;
                 const keys = ['branch','commit','environment'] as const;
                 if (keys.some(k=>valid[k] && input.context[k] && valid[k]!==input.context[k])) continue;
                 flags.set(key,Number(row.revision!==row.current_revision ||
@@ -555,11 +565,19 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 excerpts.splice(1);
             }
             const referenceBackground=resolved==='focused'&&Boolean(c?.answer?.referenceBackground);
-            const strength = expansion || c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold) ? 'supported' : 'weak';
-            const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: flags.get(key) ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? [ref?'version':'id'], ...eventMetadata(body) };
+            const unknownTime=Boolean(input.as_of && (!body.valid_time?.valid_from || !body.valid_time?.valid_to));
+            const declared=declaredFactState(body.decision_state);
+            const intent=decisionIntent(input);
+            const mismatchedDecision=!expansion && declared!==undefined && intent!=='unknown' && declared!==intent;
+            const requiresCheck=flags.get(key) || unknownTime || body.lifecycle==='quarantined' ||
+                body.lifecycle==='historical'&&!input.as_of || !coversEffectiveTime(body.valid_time,effectiveAt);
+            const strength = !unknownTime && !mismatchedDecision && (expansion || c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold)) ? 'supported' : 'weak';
+            const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: requiresCheck ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? [ref?'version':'id'], ...extendedMetadata(body) };
+            if (input.as_of) item.effective_time=unknownTime?'unknown':'matched';
+            if (unknownTime && !result.warnings.includes('EFFECTIVE_TIME_UNKNOWN')) result.warnings.push('EFFECTIVE_TIME_UNKNOWN');
             if (ref) Object.assign(item,{recorded_at:row.recorded_at,current_revision:row.current_revision,history_start_revision:row.history_start_revision,
                 history_complete:row.history_start_revision===1&&row.history_version_count===row.current_revision,does_not_imply_current:true});
-            if (c?.answer) item.answer_relevance={state:c.answer.state,assessment:'local_claim_heuristic',intent:answerIntent(input.query??'')};
+            if (c?.answer) item.answer_relevance={state:c.answer.state,assessment:declared===undefined?'local_claim_heuristic':'declared_state',intent};
             if(referenceBackground){item.recall_reason=[...item.recall_reason,'background_only'];if(!result.warnings.includes('REFERENCE_EVIDENCE_MISSING'))result.warnings.push('REFERENCE_EVIDENCE_MISSING');}
             if (options.view==='evidence'&&!expansion) item.snippet_selection=snippetSelection;
             if (expansion)

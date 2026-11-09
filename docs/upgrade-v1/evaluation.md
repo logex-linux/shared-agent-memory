@@ -57,3 +57,11 @@ and run the current `dist` with `BENCH_LABEL=v1-p1`. Compare each
 (380 adaptive, 217 specialist and 10 sanitized call-audit). Each had zero
 ordinary full-body reads. The 53 private replay pages matched as well.
 These are compatibility runs and do not establish latency ratios.
+
+P2 repeats the three corpus commands with `BENCH_LABEL=v1-p2` and the corpus
+copies under `.local/upgrade-v1/p2/`. All 607 pages and 53 private pages
+matched the v0.4.8 baseline. Ordinary body reads stayed at zero. The 107-test
+suite passed, including the new deterministic mock state and transition gates.
+A multi-target CAS test changes one target while successor encoding is paused.
+A separate checkpoint injects an error after updating predecessors inside the
+transaction. Both leave the successor and relation rows uncommitted.

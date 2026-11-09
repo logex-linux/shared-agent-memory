@@ -52,3 +52,10 @@ reading restored evidence. Managed exports containing forgotten content are
 removed under the existing cleanup protocol. The new archive was refused by
 the v0.4.8 importer on an isolated Schema 5 target. The old runtime also
 reported `SCHEMA_TOO_NEW` when pointed at the Schema 6 rehearsal copy.
+
+P2 advances the isolated development schema to 7 to add the canonical
+relation and pending transition tables. Schema 5 and 6 open through the same
+transactional migration path. Relation and proposal state are retained in
+SQLite backups. The P1 logical version archive carries record revisions and
+their embedded state metadata. It does not include relation rows or pending
+plans, so use SQLite backups for full P2 recovery.

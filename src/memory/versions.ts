@@ -2,16 +2,20 @@ import type { DatabaseSync } from 'node:sqlite';
 import { hash, type MemoryRecord } from '../core/contracts.js';
 
 export function recordHash(record: MemoryRecord): string {
-  if (record.memory_form !== undefined || record.episode !== undefined || record.valid_time !== undefined)
+  if (Object.keys(extendedMetadata(record)).length)
     return hash({ envelope: 'sam-record-v1', record });
   return hash(record);
 }
 
-export function eventMetadata(record: MemoryRecord) {
+export function extendedMetadata(record: MemoryRecord) {
   return {
     ...(record.memory_form !== undefined && { memory_form: record.memory_form }),
     ...(record.episode !== undefined && { episode: record.episode }),
-    ...(record.valid_time !== undefined && { valid_time: record.valid_time })
+    ...(record.valid_time !== undefined && { valid_time: record.valid_time }),
+    ...(record.decision_state !== undefined && { decision_state: record.decision_state }),
+    ...(record.lifecycle !== undefined && { lifecycle: record.lifecycle }),
+    ...(record.subject_id !== undefined && { subject_id: record.subject_id }),
+    ...(record.context_key !== undefined && { context_key: record.context_key })
   };
 }
 

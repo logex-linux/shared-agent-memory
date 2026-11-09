@@ -2,23 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readFile, realpath, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { backup, DatabaseSync } from 'node:sqlite';
 import * as vec from 'sqlite-vec';
-import { setup, record, publish } from './helpers.mjs';
-import { fake } from './adaptive-helpers.mjs';
+import { record, publish } from './helpers.mjs';
+import { fake, setupFake } from './adaptive-helpers.mjs';
 import { MemoryService } from '../dist/core/service.js';
 import { hash } from '../dist/core/contracts.js';
 
-async function isolated() {
-  const fixture=await setup();
-  assert.equal(dirname(await realpath(fixture.root)),await realpath(tmpdir()));
-  assert.equal(dirname(fixture.config.database),fixture.root);
-  fixture.service.encoder=fake;
-  return fixture;
-}
 
 function inspectWorker(config) {
   return new Promise((resolve,reject)=>{
@@ -32,10 +24,10 @@ function inspectWorker(config) {
 }
 
 test('migration is atomic across interruption and racing opens, preserving Schema 5 data and vector bytes',async()=>{
-  const {service:s,root,config,project}=await isolated();
+  const {service:s,root,config,project}=await setupFake();
   const original=await publish(s,record(project));
   await publish(s,record(project,{content:'Revision two is the earliest retained snapshot.'}),{target_id:original.memory_id,expected_revision:1});
-  s.db.exec('DROP TRIGGER version_insert; DROP TRIGGER version_advance; DROP TABLE memory_versions; DROP TABLE revoked_version_hashes; PRAGMA user_version=5;');
+  s.db.exec('DROP TABLE memory_relations; DROP TABLE proposal_transitions; DROP TRIGGER version_insert; DROP TRIGGER version_advance; DROP TABLE memory_versions; DROP TABLE revoked_version_hashes; PRAGMA user_version=5;');
   const signature=db=>['memories','memory_chunks','memory_vec','embedding_profiles','events','memory_search','chunk_fts','chunk_identifiers'].map(table=>
     hash(db.prepare('SELECT * FROM '+table+' ORDER BY 1,2').all()));
   const before=signature(s.db), gen=s.storage.generation(), copy=join(root,'rehearsal.db'), committedCopy=join(root,'post-commit.db');
@@ -56,12 +48,12 @@ test('migration is atomic across interruption and racing opens, preserving Schem
   assert.equal(committed.signal,'SIGKILL',String(committed.stderr));
   const postCommit=new DatabaseSync(committedCopy,{readOnly:true,allowExtension:true});vec.load(postCommit);
   try {
-    assert.equal(postCommit.prepare('PRAGMA user_version').get().user_version,6);
+    assert.equal(postCommit.prepare('PRAGMA user_version').get().user_version,7);
     assert.equal(postCommit.prepare('SELECT count(*) n FROM memory_versions').get().n,1);
     assert.deepEqual(signature(postCommit),before);
   } finally {postCommit.close();}
   const runs=await Promise.all(Array.from({length:4},()=>inspectWorker(configPath)));
-  for(const run of runs){assert.equal(run.code,0,run.error);assert.equal(JSON.parse(run.output).schema,6);}
+  for(const run of runs){assert.equal(run.code,0,run.error);assert.equal(JSON.parse(run.output).schema,7);}
   const migrated=new MemoryService({...config,database:copy},fake);
   try {
     assert.deepEqual(signature(migrated.db),before);
@@ -78,7 +70,7 @@ test('migration is atomic across interruption and racing opens, preserving Schem
 });
 
 test('revision expansion keeps historical offsets, scope and paged source budgets',async()=>{
-  const {service:s,config,project,other}=await isolated();
+  const {service:s,config,project,other}=await setupFake();
   const oldContent='历史内容 '+ '🎛️'.repeat(580);
   const input=record(project,{content:oldContent,memory_form:'episodic',episode:{event_ref:'synthetic-turn-42',speaker:'operator',event_time:null},
     valid_time:{valid_from:'2026-01-03T00:00:00.000Z',valid_to:null},valid_for:{environment:'dev'}});
@@ -115,7 +107,7 @@ test('revision expansion keeps historical offsets, scope and paged source budget
 });
 
 test('versioned restore validates history and revocation blocks old bytes even under a new ID',async()=>{
-  const a=await isolated(),b=await isolated();
+  const a=await setupFake(),b=await setupFake();
   const s=a.service, dst=b.service, project=a.project;
   try {
     dst.config.allowed_projects.push(project);

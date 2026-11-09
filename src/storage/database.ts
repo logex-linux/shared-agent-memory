@@ -5,8 +5,9 @@ import * as sqliteVec from 'sqlite-vec';
 import { MemoryError } from '../core/contracts.js';
 import { migrateSearch } from '../retrieval/indexes.js';
 import { migrateVersions } from '../memory/versions.js';
+import { migrateRelations } from '../memory/transitions.js';
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 export class Storage {
   db: DatabaseSync;
@@ -78,6 +79,10 @@ export class Storage {
     if(version<6){
       migrateVersions(this.db);
       this.db.exec('PRAGMA user_version=6;');
+    }
+    if(version<7){
+      migrateRelations(this.db);
+      this.db.exec('PRAGMA user_version=7;');
     }
   }
   transaction<T>(fn:()=>T):T {
