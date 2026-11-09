@@ -8,7 +8,7 @@ stage adds its executable examples here after its acceptance checks.
 | --- | --- | --- |
 | Exact version expansion and event metadata | P1 | Implemented and tested |
 | Effective time, decision state and atomic transitions | P2 | Implemented and tested |
-| Bounded related-evidence paths | P3 | Planned |
+| Bounded related-evidence paths | P3 | Implemented, experimental and off by default |
 | Authorized feedback and dry-run consolidation | P4 | Planned |
 
 A record may include `memory_form` of `legacy`, `episodic`, `semantic` or
@@ -96,4 +96,32 @@ Each target must appear in `expected_refs`. Manual relations allow
 `supports`, `contradicts`, `context_variant` and `related_to`.
 `supersedes` is produced only by its state transition. Relation sources are
 stored with exact endpoint revisions and the shared scope. The graph reader
-will validate endpoint currency and visibility before it can use these rows.
+validates endpoint currency and visibility before it uses these rows.
+
+Enable `graph_enabled` in the operator configuration and request expansion
+explicitly. Both switches are required.
+
+```json
+{"query":"What check followed the restart incident?","mode":"focused","view":"evidence","graph":true,"limit":5}
+```
+
+An admitted item can include `graph_path.seed` and `graph_path.steps`. Each
+step gives the edge ID and revision, its type and direction, both endpoint
+versions and the edge sources. Every returned item still needs independent
+query evidence in its own title and hit chunks. A path records an association.
+It does not certify a claim or change its verification. `supersedes` and
+`contradicts` are excluded from positive expansion. `exact_only` bypasses it.
+
+The initial limits are eight seeds, two hops, 16 examined edges per expanded
+node and 128 examined edges per page, within the shared candidate and time
+budgets. Source paths use the same response budget as other evidence. Resume
+with the existing `next_cursor`. `retrieval.graph` reports its state and the
+remaining frontier count. `graph_limit` with `more_unexamined` indicates the
+bounded walk stopped with edges left outside its limits. `GRAPH_STALE` warns
+that an old endpoint revision was skipped. An unavailable or corrupt graph
+degrades to ordinary hybrid retrieval with an explicit warning.
+
+The cursor pins the initial effective time, algorithm and model profile as
+well as scope, canonical generation and graph epoch. Restart on
+`CURSOR_GRAPH_CHANGED`. Ordinary graph-off cursors ignore a graph-only epoch
+change. Pages save paths and warnings so the same cursor can be replayed.

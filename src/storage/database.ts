@@ -6,8 +6,9 @@ import { MemoryError } from '../core/contracts.js';
 import { migrateSearch } from '../retrieval/indexes.js';
 import { migrateVersions } from '../memory/versions.js';
 import { migrateRelations } from '../memory/transitions.js';
+import { migrateGraph } from '../retrieval/graph.js';
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export class Storage {
   db: DatabaseSync;
@@ -83,6 +84,10 @@ export class Storage {
     if(version<7){
       migrateRelations(this.db);
       this.db.exec('PRAGMA user_version=7;');
+    }
+    if(version<8){
+      migrateGraph(this.db);
+      this.db.exec('PRAGMA user_version=8;');
     }
   }
   transaction<T>(fn:()=>T):T {

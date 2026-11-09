@@ -85,6 +85,7 @@ export const forgetSchema = z.object({ request_id: request, memory_id: z.string(
 export const recallSchema = z.object({
   query: text(512).optional(), ids: z.array(z.string().uuid()).min(1).max(10).optional(),
   versions:z.array(versionRefSchema).min(1).max(10).optional(),
+  graph:z.boolean().optional(),
   as_of:z.string().datetime().optional(), include_history:z.boolean().optional(), decision_state:decisionStateSchema.optional(),
   project_id: z.string().uuid().optional(), include_global: z.boolean().optional(),
   context: validSchema.omit({expires_at:true}).default({}), limit: z.number().int().positive().safe().optional(),
@@ -95,6 +96,7 @@ export const recallSchema = z.object({
   if (Number(Boolean(r.query))+Number(Boolean(r.ids))+Number(Boolean(r.cursor))+Number(Boolean(r.versions))!==1)
     ctx.addIssue({code:'custom', message:r.versions?'exactly one of query, ids, cursor or versions required':'exactly one of query, ids or cursor required'});
   if(r.exact_only && !r.query)ctx.addIssue({code:'custom',message:'exact_only requires query'});
+  if(r.graph && !r.query && !r.cursor)ctx.addIssue({code:'custom',message:'graph requires query or cursor'});
 });
 export const configSchema = z.object({
   database: z.string().startsWith('/'), model_dir: z.string().startsWith('/'),
@@ -114,7 +116,8 @@ export const configSchema = z.object({
   cache_query_max_bytes:z.number().int().min(16384).max(1073741824).default(8388608),
   cache_disk_max_bytes:z.number().int().min(1048576).max(4294967296).default(134217728),
   cache_cleanup_rows:z.number().int().min(1).max(4096).default(256),
-  diagnostics:z.boolean().default(false)
+  diagnostics:z.boolean().default(false),
+  graph_enabled:z.boolean().default(false)
 }).strict();
 export type Config = z.infer<typeof configSchema>;
 export type RecallInput = z.infer<typeof recallSchema>;

@@ -297,6 +297,7 @@ export class MemoryService {
       this.db.prepare('INSERT INTO memories_fts VALUES(?,?)').run(id,terms(record.title+' '+record.content+' '+record.tags.join(' ')).join(' '));
       this.checkpoint('fts');
       const relations=plan?this.writeRelations(id,revision,record,plan,targets):undefined;
+      if(relations?.length)this.db.exec("UPDATE meta SET value=value+1 WHERE key='graph_epoch'");
       this.db.prepare("UPDATE proposals SET status='committed',body=NULL WHERE id=?").run(proposal.id);
       if(plan)this.db.prepare('DELETE FROM proposal_transitions WHERE proposal_id=?').run(proposal.id);
       this.checkpoint('proposal');

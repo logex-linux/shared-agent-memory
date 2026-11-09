@@ -10,7 +10,7 @@ lockfile. Production inspection uses SQLite read-only access and existing MCP.
 | P0 baseline | Passed | Build, 98 tests, frozen 120 and 60 query sets, 6 sanitized audit queries and 53 private replays |
 | P1 versions and events | Passed | Schema 6, versioned archive, 101 tests, 607 identical frozen pages and 53 identical private replays |
 | P2 explicit state and relations | Passed | Schema 7, 107 tests, atomic predecessor updates, scoped relation revisions, 607 matching frozen pages and 53 matching private replays |
-| P3 bounded graph recall | Pending | P2 endpoints and graph-off comparison |
+| P3 bounded graph recall | Implemented, experimental | Schema 8, 111 tests, 607 matching frozen pages, 53 matching private pages, no gain on frozen cross-event subset |
 | P4 feedback, consolidation and forget | Pending | P3 and receipt authorization |
 | P5 evaluation and recovery | Pending | All stage gates and release evaluation |
 
@@ -49,8 +49,13 @@ state, cross-environment coexistence, scope, CAS, rollback and dependency
 invalidation. `compatibility.json` matches all 607 old pages with zero ordinary
 body reads. `private-replay/report.json` matches all 53 available pages.
 
-Next P3 adds opt-in relation expansion in the existing query transaction. Bind
-each hop to eligible current endpoints and a valid path. Test bounded paging
-and exact-only isolation before the real-BGE graph ablation. P4 and P5 remain
-part of the active objective. Their feedback, consolidation, broader forgetting
-coverage, 160-task scoring, scale matrix and full recovery gates are pending.
+P3 results are in `.local/upgrade-v1/p3/`. The four graph tests cover eligible
+two-hop explanations, hidden bridges, stale and corrupt edges, concurrent replay
+and shared work budgets. The full suite covers Schema 5 migration through Schema
+8. `compatibility.json` matches 607 frozen pages, and `private-replay/report.json`
+matches 53 private pages. The real-BGE B/C cross-event comparison reached the
+Recall@5 ceiling in both arms. Keep graph disabled by default.
+
+Next P4 adds authorized page receipts, feedback and its projection, dry-run
+consolidation and broader forgetting coverage. P5 still needs full A/B/C/D/E
+trajectory scoring, the scale matrix and complete recovery rehearsals.

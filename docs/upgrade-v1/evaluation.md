@@ -65,3 +65,29 @@ suite passed, including the new deterministic mock state and transition gates.
 A multi-target CAS test changes one target while successor encoding is paused.
 A separate checkpoint injects an error after updating predecessors inside the
 transaction. Both leave the successor and relation rows uncommitted.
+
+P3 repeats the graph-off compatibility runs with `BENCH_LABEL=v1-p3`.
+All 607 frozen pages and 53 available private pages matched v0.4.8, with zero
+ordinary full-body reads. `node --test tests/graph.test.mjs` runs the four mock
+tests for sourced two-hop paths, graph-off and exact isolation, invalid edges,
+profile and epoch invalidation, and bounded cross-process continuation.
+
+Run `node bench/upgrade-v1/graph-ablation.mjs .local/upgrade-v1/p3` after building.
+This B/C comparison uses one database of 80 source events for the 20 frozen
+cross-event tasks, identical budgets and real FP32 BGE. The runner checks source
+and revision matches, simulator exclusions and zero ordinary full-body reads.
+The 12 held-out tasks reached 100% Recall@5 in both arms. The paired change was
+0 points with a bootstrap interval of [0, 0] on that sample. Both arms returned
+the answer excerpts for all 20 tasks. Graph inspected 80 edges per round and
+admitted no additional paths on these queries. The baseline already retrieved
+every labeled item. These data cannot establish a +10 point gain.
+
+| Round | B warm p95 | C warm p95 |
+| --- | ---: | ---: |
+| 1 | 12.57 ms | 13.50 ms |
+| 2 | 12.36 ms | 12.43 ms |
+| 3 | 12.28 ms | 13.17 ms |
+
+P3 leaves graph opt-in. The above is a single-process slice, with report under
+`.local/upgrade-v1/p3/graph-ablation-tJehGF/`. P5 still needs the full trajectory
+and multi-client scale matrix, including the A/B latency gate.

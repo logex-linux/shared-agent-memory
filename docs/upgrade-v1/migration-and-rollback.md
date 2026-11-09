@@ -59,3 +59,8 @@ transactional migration path. Relation and proposal state are retained in
 SQLite backups. The P1 logical version archive carries record revisions and
 their embedded state metadata. It does not include relation rows or pending
 plans, so use SQLite backups for full P2 recovery.
+
+P3 advances to Schema 8 in the same migration transaction. It adds a graph
+epoch and traversal and revocation indexes. The existing edge and record rows
+are unchanged. Set `graph_enabled` to `false` for compatibility retrieval on
+the upgraded database. A stored graph cursor must restart after this change.

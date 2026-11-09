@@ -7,6 +7,8 @@ import { RetrievalProfile } from './profile.js';
 import { QueryState, authority } from './state.js';
 import { extendedMetadata } from '../memory/versions.js';
 import { coversEffectiveTime, declaredFactState, decisionIntent, temporalPredicate } from '../memory/temporal.js';
+import { destination, graphBonus, graphEpoch, GraphReader, GRAPH_PAGE_WORK, GRAPH_SEEDS, GRAPH_VERSION, readGraph, startGraph,
+    type GraphPath, type GraphProgress } from './graph.js';
 type Context = {
     db: DatabaseSync;
     config: Config;
@@ -38,6 +40,7 @@ type Candidate = {
     requiresCheck: boolean;
     base: number;
     admitted: boolean;
+    graphPath?: GraphPath;
     answer?: { state: FactState; coverage: number; alignment: number; checked: string; salient?: boolean; subjectMatches?: number; referenceBackground?: boolean };
 };
 const blob = (v: Float32Array) => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
@@ -91,7 +94,7 @@ function assess(c: Candidate, config: Config, broad: boolean, progress: any) {
         c.base = c.rrf + Number(c.exact>0)*.06 + a.coverage*.045 + a.alignment*.035;
     }
 }
-export async function retrieve(ctx: Context, request: RecallInput, channel: 'hybrid' | 'lexical' | 'vector') {
+export async function retrieve(ctx: Context, request: RecallInput, channel: 'hybrid' | 'lexical' | 'vector', graphFallback?:string) {
     const { config, encoder } = ctx, profileTrace=(request.debug||config.diagnostics)?new RetrievalProfile():undefined, db=profileTrace?.database(prepared(ctx.db))??prepared(ctx.db), start = performance.now(), debug = request.debug || config.diagnostics;
     const d = { elapsed_ms: 0, candidate_ids: 0, candidates_ranked: 0, full_body_records_read: 0, full_body_bytes_read: 0, json_parses: 0, metadata_json_parses: 0, chunk_text_rows_read: 0, vector_queries: 0, vector_rows_returned: 0, vector_internal_scanned: null, vector_distance_computations: null, query_embeddings: 0, response_bytes: 0, estimated_tokens: 0, content_estimated_tokens: 0, token_estimator: 'ceil(utf8_bytes/3)', cache_replay: false, ranking_chunk_rows_read: 0 };
     let traceResponse:any,traceBudget=config.page_response_bytes;
@@ -106,6 +109,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
     const expansion = request.versions ? 'versions' : request.ids ? 'ids' : undefined;
     const versions = new Map(request.versions?.map(ref=>[ref.memory_id+':'+ref.revision,ref]));
     let effectiveAt=request.as_of??new Date().toISOString();
+    let graphReader:GraphReader|undefined, graphState:GraphProgress|undefined;
+    let graphAttempted=false, graphExamined=0, graphAccepted=0;
+    let runtimeProfile:string|null=null;
     let input = request, queryVector: Buffer | null = null, profile: string | null = null, retrievalMode: string = expansion ?? channel, warnings: string[] = [], state: QueryState | undefined, q = '', page = 0, resolved = 'focused', progress: any = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage: any;
     const embeddingStarted=performance.now();
     if (!request.cursor && request.query && channel !== 'lexical')
@@ -127,6 +133,17 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             state = QueryState.open(ctx.db, config);
             profileTrace?.add('state_open',performance.now()-opened);
             const cleaning=performance.now();state.cleanupIfExpired();profileTrace?.add('cleanup',performance.now()-cleaning);
+            if(request.cursor && config.graph_enabled) {
+                const row=state.lookup(request.cursor).row;
+                // Only graph cursors need model-profile I/O. The locked lookup
+                // below revalidates the row and its current authority.
+                if(row.profile && JSON.parse(row.progress).graph && row.authority===authority(config,db)) {
+                    const checking=performance.now();
+                    try { runtimeProfile=(await encoder.profile()).id; }
+                    catch { runtimeProfile=null; }
+                    profileTrace?.add('embedding',performance.now()-checking);
+                }
+            }
             // New-query validation needs only canonical data. Keep the same WAL
             // read snapshot through computation; do not occupy the sidecar writer.
             if(!request.cursor){
@@ -149,7 +166,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 progress = parse(found.row.progress);
                 effectiveAt=progress.effectiveAt??input.as_of??effectiveAt;
                 warnings = progress.warnings;
-                for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state'] as const)
+                for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state', 'graph'] as const)
                     if (request[key] !== undefined && request[key] !== input[key])
                         throw new MemoryError('CURSOR_QUERY_MISMATCH');
                 if (Object.keys(request.context).length && hash(request.context) !== hash(input.context))
@@ -167,6 +184,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     throw new MemoryError('CURSOR_SCOPE_CHANGED');
                 if (row.generation !== gen)
                     throw new MemoryError('CURSOR_STALE');
+                if(progress.graph) {
+                    graphState=progress.graph;
+                    if(!config.graph_enabled || graphState!.version!==GRAPH_VERSION ||
+                       graphState!.profile!==profile || profile!==null&&runtimeProfile!==profile ||
+                       graphState!.epoch!==readGraph(()=>graphEpoch(db)))throw new MemoryError('CURSOR_GRAPH_CHANGED');
+                }
                 savedPage = state.db.prepare('SELECT * FROM pages WHERE q=? AND n=?').get(q, page);
                 if (!savedPage && page !== Number((state.db.prepare('SELECT coalesce(max(n),-1)+1 n FROM pages WHERE q=?').get(q) as any).n))
                     throw new MemoryError('CURSOR_INVALID');
@@ -178,6 +201,13 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 progress.idDone = !identifiers(input.query!).length || (channel === 'vector' && !input.exact_only && retrievalMode !== 'lexical_degraded');
                 progress.warnings = warnings;
                 progress.effectiveAt=effectiveAt;
+                if(input.graph) {
+                    if(graphFallback)progress.graphReason=graphFallback;
+                    else if(!config.graph_enabled)progress.graphReason='GRAPH_DISABLED';
+                    else if(input.exact_only)progress.graphReason='GRAPH_EXACT_ONLY';
+                    else graphState=progress.graph=startGraph(readGraph(()=>graphEpoch(db)),profile);
+                    if(progress.graphReason)warnings.push(progress.graphReason);
+                }
                 q = state.create({ authority: auth, generation: gen, input: JSON.stringify(input), vector: queryVector, profile, retrieval_mode: retrievalMode, resolved, progress: JSON.stringify(progress), expires: Date.now() + config.query_ttl_seconds * 1000 });
             }
         }
@@ -193,6 +223,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 progress.idDone = !identifiers(input.query!).length;
             }
         }
+        if(graphState)graphReader=readGraph(()=>new GraphReader(db,eligible,input));
         const local = { vector: new Set<string>(), fts: new Set<string>(), identifier: new Set<string>() }, candidates = new Map<string, Candidate>();
         let work = 0, lowGain = false;
         // Local exclusion already covers this request; persist each channel once.
@@ -270,10 +301,48 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         const persist = () => { for (const c of candidates.values()) {
             analyze(c);
             assess(c, config, resolved === 'broad', progress);
+            if(c.graphPath&&c.admitted&&!c.answer?.referenceBackground)c.base+=graphBonus(c.graphPath);
             const data=JSON.stringify(c);if(persisted.get(c.id)===data)continue;
             state!.db.prepare(`INSERT INTO candidates(q,id,data,base,admitted,project,topic,period,source) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(q,id) DO UPDATE SET data=excluded.data,base=excluded.base,admitted=excluded.admitted`).run(q, c.id, data, c.base, Number(c.admitted), c.project, c.topic, c.period, c.source);
             persisted.set(c.id,data);
         } };
+        const graphTerms=graphState?terms(input.query!):[];
+        const graphReferences=graphState?referenceEvidence(input.query!):undefined;
+        const considerGraph=(path:GraphPath)=>{
+            const ref=destination(path);
+            if(state!.db.prepare('SELECT 1 FROM candidates WHERE q=? AND id=? AND emitted IS NOT NULL').get(q,ref.memory_id))return;
+            const title=String(db.prepare("SELECT json_extract(metadata,'$.title') title FROM memory_search WHERE memory_id=?").get(ref.memory_id)?.title??'');
+            const vector=queryVector&&retrievalMode!=='lexical_degraded'?queryVector:null;
+            const rows=db.prepare(`SELECT c.id,c.start,c.end,c.text,${vector?'vec_distance_cosine((SELECT embedding FROM memory_vec WHERE chunk_id=c.id),?)':'NULL'} distance
+                FROM memory_chunks c WHERE c.memory_id=? AND c.revision=? ORDER BY c.id LIMIT 8`)
+                .all(...(vector?[vector]:[]),ref.memory_id,ref.revision);
+            d.ranking_chunk_rows_read+=rows.length;
+            const ranked=rows.map(row=>{
+                const text=title+'\n'+row.text,words=new Set(terms(text));
+                const coverage=graphTerms.length?graphTerms.filter(t=>words.has(t)).length/graphTerms.length:0;
+                const cosine=row.distance===null?0:1-Number(row.distance);
+                const refs=graphReferences!(text,words);
+                return {row,coverage,cosine,reference:refs.count===0||refs.coverage>=.5};
+            }).filter(c=>c.reference&&(c.coverage>=.6||c.cosine>=config.evidence_threshold||
+                c.cosine>=config.semantic_threshold&&c.coverage>=.2))
+              .sort((a,b)=>b.coverage+b.cosine-a.coverage-a.cosine||Number(a.row.id)-Number(b.row.id));
+            if(!ranked.length)return;
+            const best=ranked[0],existed=candidates.has(ref.memory_id),original=candidate(ref.memory_id);
+            const c:Candidate={...original,reasons:[...original.reasons],hits:[...original.hits],graphPath:path};
+            c.coverage=Math.max(c.coverage,best.coverage);
+            c.cosine=Math.max(c.cosine??0,best.cosine);
+            chunkCache.set(Number(best.row.id),best.row);
+            hit(c,Number(best.row.id),Math.max(best.cosine,.02+best.coverage*.1));
+            analyze(c);
+            assess(c,config,resolved==='broad',progress);
+            if(!c.admitted || c.answer?.referenceBackground || (c.answer?.alignment??0)<0) {
+                if(!existed)candidates.delete(ref.memory_id);
+                return;
+            }
+            reason(c,'graph');
+            candidates.set(ref.memory_id,c);
+            graphAccepted++;
+        };
         if (state && !savedPage) {
             do {
                 const k = Math.min(progress.batch, config.page_candidate_budget - work);
@@ -381,6 +450,18 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     if (!identifiers(input.query!).length && sample.length >= 4 && sample.filter(c => c.kind === 'preference').length / sample.length >= .6 && new Set(sample.map(c => c.project + c.period + c.topic)).size >= 3)
                         resolved = 'broad';
                 }
+                if(graphReader && graphState && !graphAttempted) {
+                    const baseDone=progress.vectorDone&&progress.ftsDone&&progress.idDone;
+                    const seeds=[...candidates.values()].filter(c=>c.admitted&&!c.graphPath&&!c.answer?.referenceBackground&&
+                        (c.exact>0||c.coverage>=.6||(c.cosine??0)>=config.evidence_threshold))
+                        .sort((a,b)=>b.base-a.base||a.id.localeCompare(b.id)).slice(0,GRAPH_SEEDS);
+                    readGraph(()=>graphReader!.seed(graphState!,seeds.map(c=>c.id),baseDone));
+                    graphAttempted=graphState.seeded;
+                    graphExamined=readGraph(()=>graphReader!.walk(graphState!,Math.min(GRAPH_PAGE_WORK,config.page_candidate_budget-work),
+                        start+config.page_time_budget_ms,considerGraph));
+                    work+=graphExamined;
+                    if(graphAccepted)persist();
+                }
                 progress.batch = Math.min(256, progress.batch * 2);
                 const count = state.db.prepare(`SELECT count(*) n,count(DISTINCT project||topic||period) facets FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${input.exact_only ? 'AND json_extract(data,\'$.exact\')>0' : ''}`).get(q) as any;
                 // A sparse relevant yield is a per-page stopping suggestion, never exhaustion.
@@ -392,6 +473,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 if (resolved === 'broad' && count.n >= Math.min(request.limit ?? input.limit ?? 32, config.page_item_limit) && (count.facets >= 3 || Boolean(request.limit ?? input.limit)))
                     break;
             } while (!(progress.vectorDone && progress.ftsDone && progress.idDone) && work < config.page_candidate_budget && performance.now() - start < config.page_time_budget_ms);
+            if(graphState?.neighborLimited)warnings.push('GRAPH_NEIGHBOR_LIMIT');
+            if(graphState?.dependencyLimited)warnings.push('GRAPH_DEPENDENCY_LIMIT');
+            if(graphState?.stale)warnings.push('GRAPH_STALE');
             progress.warnings = [...new Set(warnings)];
         }
         let options = { limit: request.limit ?? input.limit ?? (resolved === 'focused' ? 8 : config.page_item_limit), token_budget: Math.min(request.token_budget ?? input.token_budget ?? config.response_token_budget, config.response_token_budget), max_bytes: Math.min(request.max_bytes ?? input.max_bytes ?? config.page_response_bytes, config.page_response_bytes), view: request.view ?? input.view ?? 'chunks' };
@@ -420,11 +504,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             const extra = input.exact_only ? "AND json_extract(data,'$.exact')>0" : '', sql = resolved === 'broad' ? `WITH diverse AS (SELECT *,row_number() OVER(PARTITION BY project,topic,period ORDER BY base DESC,id) facet_rank FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${extra}) SELECT data FROM diverse ORDER BY facet_rank,base DESC,id LIMIT ?` : `SELECT data FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${extra} ORDER BY base DESC,id LIMIT ?`;
             pool = (state!.db.prepare(sql).all(q, config.page_candidate_budget) as any[]).map(r => parse(r.data));
             if (!pool.length && (resolved==='broad'||channel==='lexical'||retrievalMode==='lexical_degraded')) {
-                pool = (state!.db.prepare(`SELECT data FROM candidates WHERE q=? AND emitted IS NULL ${input.exact_only ? 'AND json_extract(data,\'$.exact\')>0' : ''} ORDER BY base DESC,id LIMIT 1`).all(q) as any[]).map(r => parse(r.data));
+                pool = (state!.db.prepare(`SELECT data FROM candidates WHERE q=? AND emitted IS NULL ${input.exact_only ? 'AND json_extract(data,\'$.exact\')>0' : ''} ${graphState?"AND json_extract(data,'$.graphPath') IS NULL":''} ORDER BY base DESC,id LIMIT 1`).all(q) as any[]).map(r => parse(r.data));
             }
             // Quality anchor: score the leading relevance prefix with the v0.3 window.
             // This limits scoring contributions for five leading positions, never candidate discovery.
-            const anchors = (resolved==='broad'||answerIntent(input.query??'')==='unknown') && page === 0 ? (progress.anchors as string[]).map(id => pool.find(c => c.id === id)).filter((c): c is Candidate => !!c) : [];
+            const graphRanked=pool.some(c=>c.graphPath);
+            const anchors = (resolved==='broad'||answerIntent(input.query??'')==='unknown') && page === 0 && !graphRanked ? (progress.anchors as string[]).map(id => pool.find(c => c.id === id)).filter((c): c is Candidate => !!c) : [];
             if (resolved === 'broad') {
                 const counts = new Map<string, number>();
                 for (const facet of ['project', 'topic', 'period', 'source'] as const) {
@@ -510,8 +595,16 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         d.candidate_ids = state ? Number((state.db.prepare('SELECT count(*) n FROM candidates WHERE q=?').get(q) as any).n) : selected.length;
         d.candidates_ranked = selected.length;
-        const plan: any = savedPage ? parse(savedPage.plan) : { mode: expansion ?? resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
-        const result: any = { items: [], generation: gen, retrieval_mode: retrievalMode, warnings: [...new Set(warnings)], empty_reason: null, evidence_status: 'none', has_more: false, next_cursor: null, retrieval: plan };
+        const draftPlan = { mode: expansion ?? resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
+        const plan: any = savedPage ? parse(savedPage.plan) : draftPlan;
+        const cachedWarnings = plan.graph_page_warnings;
+        delete plan.graph_page_warnings;
+        if(!savedPage && input.graph)
+            plan.graph=graphState?{state:'active',epoch:graphState.epoch,frontier:graphState.frontier.length,
+                limited:graphState.neighborLimited||graphState.dependencyLimited}
+                :{state:['GRAPH_DISABLED','GRAPH_EXACT_ONLY'].includes(progress.graphReason)?'disabled':'degraded',reason:progress.graphReason};
+        const pageWarnings = cachedWarnings?.initial ?? [...new Set(warnings)];
+        const result: any = { items: [], generation: gen, retrieval_mode: retrievalMode, warnings: [...pageWarnings], empty_reason: null, evidence_status: 'none', has_more: false, next_cursor: null, retrieval: cachedWarnings ? {...draftPlan, graph:plan.graph} : plan };
         // Explicit expansion has no query cursor. Account for continuation IDs in
         // the budget before reading bodies; filtered IDs never enter this list.
         const remainingKey = expansion==='versions'?'remaining_versions':'remaining_ids';
@@ -578,6 +671,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             if (ref) Object.assign(item,{recorded_at:row.recorded_at,current_revision:row.current_revision,history_start_revision:row.history_start_revision,
                 history_complete:row.history_start_revision===1&&row.history_version_count===row.current_revision,does_not_imply_current:true});
             if (c?.answer) item.answer_relevance={state:c.answer.state,assessment:declared===undefined?'local_claim_heuristic':'declared_state',intent};
+            if(c?.graphPath)item.graph_path=readGraph(()=>graphReader!.explain(c.graphPath!));
             if(referenceBackground){item.recall_reason=[...item.recall_reason,'background_only'];if(!result.warnings.includes('REFERENCE_EVIDENCE_MISSING'))result.warnings.push('REFERENCE_EVIDENCE_MISSING');}
             if (options.view==='evidence'&&!expansion) item.snippet_selection=snippetSelection;
             if (expansion)
@@ -627,25 +721,32 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             else delete result[remainingKey];
             plan.stop_reason=blocked?'item_exceeds_budget':remaining.length?'page_budget':'exhausted';
         }
+        if (cachedWarnings) {
+            result.warnings = cachedWarnings.final;
+            result.retrieval = plan;
+        }
         profileTrace?.add('materialization',performance.now()-materializeStarted);
         const persistStarted=performance.now();
         if (state) {
             if(savedPage)state.db.prepare('UPDATE queries SET expires=? WHERE id=?').run(Date.now() + config.query_ttl_seconds * 1000, q);
             else state.db.prepare('UPDATE queries SET progress=?,resolved=?,retrieval_mode=?,expires=? WHERE id=?').run(JSON.stringify(progress),resolved,retrievalMode,Date.now() + config.query_ttl_seconds * 1000,q);
-            const done = progress.vectorDone && progress.ftsDone && progress.idDone;
+            const done = progress.vectorDone && progress.ftsDone && progress.idDone && !graphState?.frontier.length;
             if (!savedPage) {
                 for(const[ch,ids]of Object.entries(local))if(ids.size)state.db.prepare('INSERT OR IGNORE INTO seen SELECT ?,?,value FROM json_each(?)').run(q,ch,JSON.stringify([...ids]));
                 if(fitted.length)state.db.prepare('UPDATE candidates SET emitted=? WHERE q=? AND id IN (SELECT value FROM json_each(?))').run(page,q,JSON.stringify(fitted));
                 const pending = Number((state.db.prepare(`SELECT count(*) n FROM candidates WHERE q=? AND emitted IS NULL AND admitted=1 ${input.exact_only ? "AND json_extract(data,'$.exact')>0" : ''}`).get(q) as any).n);
                 const more = pending > 0 || !done;
                 plan.stop_reason = blocked ? 'item_exceeds_budget' : !result.items.length ? 'insufficient' : !more ? 'exhausted' : lowGain ? 'low_marginal_gain' : !done && work >= config.page_candidate_budget ? 'candidate_budget' : !done && performance.now() - start >= config.page_time_budget_ms ? 'time_budget' : resolved === 'focused' && fitted.length === 1 ? 'low_marginal_gain' : 'page_budget';
-                plan.more_unexamined = !done;
+                if(!more && plan.graph?.limited && !blocked)plan.stop_reason='graph_limit';
+                plan.more_unexamined = !done || Boolean(plan.graph?.limited);
                 const coverage = state.db.prepare('SELECT count(DISTINCT project) projects,count(DISTINCT period) periods,count(DISTINCT topic) topics FROM candidates WHERE q=? AND emitted IS NOT NULL').get(q);
                 plan.coverage = coverage;
                 result.has_more = more;
                 result.next_cursor = more ? state.cursor(q, blocked ? page : page + 1) : null;
-                if (!blocked)
-                    state.db.prepare('INSERT INTO pages VALUES(?,?,?,?,?)').run(q, page, JSON.stringify(fitted.map(id => candidateMap.get(id))), JSON.stringify(options), JSON.stringify({ ...plan, has_more: more }));
+                if (!blocked) {
+                    const graphPage = plan.graph ? {graph_page_warnings:{initial:pageWarnings,final:result.warnings}} : {};
+                    state.db.prepare('INSERT INTO pages VALUES(?,?,?,?,?)').run(q, page, JSON.stringify(fitted.map(id => candidateMap.get(id))), JSON.stringify(options), JSON.stringify({ ...plan, has_more: more, ...graphPage }));
+                }
             }
             else {
                 result.has_more = plan.has_more;
@@ -661,6 +762,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         d.elapsed_ms = Number((performance.now() - start).toFixed(3));
         d.content_estimated_tokens = estimateTokens(Buffer.byteLength(JSON.stringify(result)));
         if (debug) {
+            if(graphState)Object.assign(d,{graph_rows_examined:graphExamined,graph_candidates_admitted:graphAccepted,graph_work_budget:GRAPH_PAGE_WORK});
             result.diagnostics = d;
             for (let i = 0; i < 4; i++) {
                 d.response_bytes = Buffer.byteLength(JSON.stringify(result));
@@ -687,6 +789,10 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         if (db.isTransaction)
             db.exec('ROLLBACK');
         state?.rollback();
+        if(e instanceof MemoryError && (e.code==='GRAPH_UNAVAILABLE'||e.code==='GRAPH_STALE')) {
+            if(request.cursor)throw new MemoryError('CURSOR_GRAPH_CHANGED');
+            if(request.graph&&!graphFallback)return retrieve(ctx,request,channel,e.code);
+        }
         if(state && (e instanceof MemoryError && /QUERY_CACHE/.test(e.code) || e instanceof Error && /database or disk is full/i.test(e.message))) {
             try {state.rejected();}catch{}
             if(!(e instanceof MemoryError))throw new MemoryError('QUERY_CACHE_DISK_CAPACITY');
