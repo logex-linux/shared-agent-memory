@@ -4,7 +4,20 @@ import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { MemoryService } from '../dist/core/service.js';
 export const MODEL=resolve('.local/models/bge-small-zh-v1.5');
+export function restoreSchema11Storage(db) {
+  db.exec(`UPDATE memory_versions AS v SET body=(SELECT m.body FROM memories m WHERE m.id=v.memory_id AND m.revision=v.revision) WHERE v.body='';
+    DROP TRIGGER version_dependency_insert;
+    DROP VIEW memory_version_bodies;
+    CREATE TRIGGER version_dependency_insert AFTER INSERT ON memory_versions BEGIN
+      INSERT OR IGNORE INTO version_dependencies SELECT json_extract(d.value,'$.memory_id'),new.memory_id,new.revision
+      FROM json_each(new.body,'$.derived_from') d;
+    END;
+    CREATE VIRTUAL TABLE memories_fts USING fts5(memory_id UNINDEXED,terms,tokenize='unicode61');
+    INSERT INTO memories_fts SELECT id, json_extract(body,'$.title')||' '||json_extract(body,'$.content') FROM memories WHERE status='active';
+    PRAGMA user_version=11;`);
+}
 export function dropTemporalProjection(db) {
+  restoreSchema11Storage(db);
   db.exec('DROP INDEX search_temporal_exceptions');
   for(const column of ['lifecycle','valid_from_jd','valid_to_jd','decision_state'])
     db.exec('ALTER TABLE memory_search DROP COLUMN '+column);

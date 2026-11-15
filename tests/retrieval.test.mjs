@@ -3,7 +3,7 @@ import {randomUUID} from 'node:crypto';import {writeFile,copyFile,mkdir} from 'n
 import {DatabaseSync,backup} from 'node:sqlite';import * as vec from 'sqlite-vec';
 import {spawnSync} from 'node:child_process';
 import {MemoryService} from '../dist/core/service.js';import {indexChunk} from '../dist/retrieval/indexes.js';
-import {setup,record,publish} from './helpers.mjs';
+import {setup,record,publish,restoreSchema11Storage} from './helpers.mjs';
 const vector=(a=1,b=0)=>{const v=new Float32Array(512);v[0]=a;v[1]=b;return v;};
 const fake={profile:async()=>({id:'deterministic-test',manifest:{test:true}}),query:async()=>vector(),chunks:async(title,text)=>[{start:0,end:text.length,text,tokens:10,vector:vector()}]};
 function seed(s,project,count,{start=0,gold=false,body='无关库存登记',v=vector(0,1),valid_for={}}={}){
@@ -14,7 +14,7 @@ function seed(s,project,count,{start=0,gold=false,body='无关库存登记',v=ve
    const id=randomUUID(),r=record(project,{title:gold?'目标经验':'库存登记 '+(start+i),content:gold?'目标经验正文':body+' '+(start+i),valid_for});
    insert.run(id,project,project?'project':'global',JSON.stringify(r),1,'active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','deterministic-test','fixture:'+id,null,'test');
    const c=s.db.prepare('INSERT INTO memory_chunks(memory_id,revision,start,end,tokens,text,profile_id) VALUES(?,1,0,?,10,?,?)').run(id,r.content.length,r.content,'deterministic-test');
-   s.db.prepare('INSERT INTO memory_vec VALUES(?,?,?)').run(BigInt(c.lastInsertRowid),Buffer.from(v.buffer),project??'global');indexChunk(s.db,{id:Number(c.lastInsertRowid),memory_id:id,text:r.content},r.title,r.tags);s.db.prepare('INSERT INTO memories_fts VALUES(?,?)').run(id,r.title+' '+r.content);rows.push({id,chunk:Number(c.lastInsertRowid)});
+   s.db.prepare('INSERT INTO memory_vec VALUES(?,?,?)').run(BigInt(c.lastInsertRowid),Buffer.from(v.buffer),project??'global');indexChunk(s.db,{id:Number(c.lastInsertRowid),memory_id:id,text:r.content},r.title,r.tags);rows.push({id,chunk:Number(c.lastInsertRowid)});
   }
  });return rows;
 }
@@ -113,7 +113,7 @@ test('broken model explicitly degrades to indexed lexical/identifier retrieval',
 });
 
 // Build a genuine schema4 fixture by removing only schema5 derived objects.
-function toSchema4(db){db.exec(`DROP TRIGGER search_insert;DROP TRIGGER search_update;DROP TRIGGER search_delete;DROP TRIGGER chunk_search_delete;DROP TABLE memory_search;DROP TABLE chunk_fts;DROP TABLE chunk_identifiers;
+function toSchema4(db){restoreSchema11Storage(db);db.exec(`DROP TRIGGER search_insert;DROP TRIGGER search_update;DROP TRIGGER search_delete;DROP TRIGGER chunk_search_delete;DROP TABLE memory_search;DROP TABLE chunk_fts;DROP TABLE chunk_identifiers;
  CREATE TABLE old_vectors AS SELECT * FROM memory_vec;DROP TABLE memory_vec;CREATE VIRTUAL TABLE memory_vec USING vec0(chunk_id INTEGER PRIMARY KEY,embedding FLOAT[512],project_scope TEXT);INSERT INTO memory_vec SELECT * FROM old_vectors;DROP TABLE old_vectors;DROP TRIGGER version_dependency_insert; DROP TABLE version_dependencies; DROP TABLE revoked_aliases; DROP INDEX version_content_hash; DROP TABLE association_edges; DROP TABLE projection_jobs; DROP TABLE learning_events; DELETE FROM meta WHERE key='learning_watermark'; DROP INDEX tombstones_hash; DELETE FROM meta WHERE key='graph_epoch'; DROP TABLE memory_relations; DROP TABLE proposal_transitions; DROP TRIGGER version_insert; DROP TRIGGER version_advance; DROP TABLE memory_versions; DROP TABLE revoked_version_hashes; PRAGMA user_version=4;`);}
 function signature(db){return {records:db.prepare('SELECT id,revision,body,content_hash FROM memories ORDER BY id').all(),vectors:db.prepare('SELECT chunk_id,hex(embedding) embedding FROM memory_vec ORDER BY chunk_id').all()};}
 test('schema4 migration and backup rollback preserve IDs, revisions, canonical bodies and vector bytes; interrupted DDL rolls back',async()=>{
@@ -121,6 +121,6 @@ test('schema4 migration and backup rollback preserve IDs, revisions, canonical b
  const code=`import {DatabaseSync} from 'node:sqlite';import * as vec from 'sqlite-vec';import {migrateSearch} from './dist/retrieval/indexes.js';const db=new DatabaseSync(process.argv[1],{allowExtension:true});vec.load(db);db.exec('BEGIN IMMEDIATE');migrateSearch(db);process.kill(process.pid,'SIGKILL');`;
  const interrupted=spawnSync(process.execPath,['--input-type=module','-e',code,config.database]);assert.equal(interrupted.signal,'SIGKILL');
  let db=new DatabaseSync(config.database,{allowExtension:true});vec.load(db);assert.equal(db.prepare('PRAGMA user_version').get().user_version,4);assert.deepEqual(signature(db),before);assert.equal(db.prepare("SELECT count(*) n FROM sqlite_master WHERE name='memory_search'").get().n,0);db.close();
- const migrated=new MemoryService(config,fake);try{assert.equal(migrated.inspect().schema,11);assert.deepEqual(signature(migrated.db),before);assert.ok(migrated.db.prepare("SELECT sql FROM sqlite_master WHERE name='memory_vec'").get().sql.includes('distance_metric=cosine'));assert.ok(!Object.hasOwn(JSON.parse(migrated.db.prepare('SELECT metadata FROM memory_search LIMIT 1').get().metadata),'content'));assert.equal((await migrated.recall({query:'语义任务'},'vector')).items.length,3);}finally{migrated.close();}
+ const migrated=new MemoryService(config,fake);try{assert.equal(migrated.inspect().schema,12);assert.deepEqual(signature(migrated.db),before);assert.ok(migrated.db.prepare("SELECT sql FROM sqlite_master WHERE name='memory_vec'").get().sql.includes('distance_metric=cosine'));assert.ok(!Object.hasOwn(JSON.parse(migrated.db.prepare('SELECT metadata FROM memory_search LIMIT 1').get().metadata),'content'));assert.equal((await migrated.recall({query:'语义任务'},'vector')).items.length,3);}finally{migrated.close();}
  await copyFile(root+'/before.db',root+'/rolled-back.db');db=new DatabaseSync(root+'/rolled-back.db',{allowExtension:true});vec.load(db);try{assert.equal(db.prepare('PRAGMA user_version').get().user_version,4);assert.deepEqual(signature(db),before);}finally{db.close();}
 });

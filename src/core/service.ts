@@ -212,7 +212,15 @@ export class MemoryService {
         if(duplicate && duplicate.id!==input.target_id)throw new MemoryError('IMPORT_ALREADY_EXISTS');
       }
       const similarQuery=ftsQuery(record.title+' '+record.content);
-      const candidates=similarQuery?this.db.prepare("SELECT m.id,m.revision,m.body FROM memories_fts f JOIN memories m ON m.id=f.memory_id WHERE memories_fts MATCH ? AND m.status='active' AND m.scope=? AND m.project_id IS ? ORDER BY bm25(memories_fts) LIMIT 20").all(similarQuery,record.scope,record.project_id) as any[]:[];
+      const candidates=similarQuery?this.db.prepare(`WITH matches AS MATERIALIZED (
+        SELECT f.memory_id,bm25(chunk_fts) rank FROM chunk_fts f
+        JOIN memory_chunks c ON c.id=f.chunk_id AND c.memory_id=f.memory_id
+        JOIN memories m ON m.id=c.memory_id AND m.revision=c.revision AND m.profile_id=c.profile_id
+        WHERE chunk_fts MATCH ? AND m.status='active' AND m.scope=? AND m.project_id IS ?
+      ), best AS (
+        SELECT memory_id,min(rank) rank FROM matches GROUP BY memory_id ORDER BY rank,memory_id LIMIT 20
+      ) SELECT m.id,m.revision,m.body FROM best JOIN memories m ON m.id=best.memory_id ORDER BY best.rank,m.id`)
+        .all(similarQuery,record.scope,record.project_id) as any[]:[];
       const words=new Set(terms(record.title+' '+record.content));
       const similar=candidates.map(x=>({memory_id:x.id,revision:x.revision,overlap:terms(JSON.parse(x.body).title+' '+JSON.parse(x.body).content).filter(w=>words.has(w)).length})).filter(x=>x.overlap>=3).sort((a,b)=>b.overlap-a.overlap).slice(0,5);
       const id=randomUUID();
@@ -231,7 +239,6 @@ export class MemoryService {
     const chunks=this.db.prepare('SELECT id FROM memory_chunks WHERE memory_id=?').all(id) as any[];
     for(const c of chunks)this.db.prepare('DELETE FROM memory_vec WHERE chunk_id=?').run(BigInt(c.id));
     this.db.prepare('DELETE FROM memory_chunks WHERE memory_id=?').run(id);
-    this.db.prepare('DELETE FROM memories_fts WHERE memory_id=?').run(id);
   }
   private descendants(id:string) {
     return (this.db.prepare(`WITH RECURSIVE children(id) AS(SELECT child_id FROM dependencies WHERE parent_id=? UNION SELECT d.child_id FROM dependencies d JOIN children c ON d.parent_id=c.id) SELECT id FROM children`).all(id) as any[]).map(x=>x.id as string);
@@ -345,7 +352,6 @@ export class MemoryService {
       this.checkpoint('dependencies');
       this.indexChunks(id,revision,profile.id,record,chunks);
       this.checkpoint('chunks');
-      this.db.prepare('INSERT INTO memories_fts VALUES(?,?)').run(id,terms(record.title+' '+record.content+' '+record.tags.join(' ')).join(' '));
       this.checkpoint('fts');
       const relations=plan?this.writeRelations(id,revision,record,plan,targets):undefined;
       if(relations?.length)this.db.exec("UPDATE meta SET value=value+1 WHERE key='graph_epoch'");
@@ -444,7 +450,7 @@ export class MemoryService {
         try {unlinkSync(entry.path);this.db.prepare("UPDATE exports SET status='removed' WHERE id=?").run(entry.id);}
         catch(e:any) {if(e.code==='ENOENT')this.db.prepare("UPDATE exports SET status='removed' WHERE id=?").run(entry.id);else errors.push('EXPORT_CLEANUP_PENDING');}
       }
-      try{this.db.exec("INSERT INTO memories_fts(memories_fts) VALUES('optimize'); INSERT INTO chunk_fts(chunk_fts) VALUES('optimize');");}catch{errors.push('FTS_CLEANUP_PENDING');}
+      try{this.db.exec("INSERT INTO chunk_fts(chunk_fts) VALUES('optimize');");}catch{errors.push('FTS_CLEANUP_PENDING');}
       try {
         const root=dirname(this.config.database);mkdirSync(root,{recursive:true,mode:0o700});
         const tombstones=this.revocationRows();
@@ -477,27 +483,28 @@ export class MemoryService {
     const orphan_chunks=this.db.prepare("SELECT count(*) AS n FROM memory_chunks c LEFT JOIN memories m ON m.id=c.memory_id WHERE m.id IS NULL OR m.status!='active' OR m.revision!=c.revision OR m.profile_id!=c.profile_id").get();
     const orphan_vectors=this.db.prepare('SELECT count(*) AS n FROM memory_vec v LEFT JOIN memory_chunks c ON c.id=v.chunk_id WHERE c.id IS NULL').get();
     const missing_vectors=this.db.prepare('SELECT count(*) AS n FROM memory_chunks c LEFT JOIN memory_vec v ON c.id=v.chunk_id WHERE v.chunk_id IS NULL').get();
-    const unindexed=this.db.prepare("SELECT count(*) AS n FROM memories m WHERE status='active' AND (NOT EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=m.id) OR NOT EXISTS(SELECT 1 FROM memories_fts f WHERE f.memory_id=m.id))").get();
+    const unindexed=this.db.prepare("SELECT count(*) AS n FROM memories m WHERE status='active' AND NOT EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=m.id)").get();
     const search_mismatch=this.db.prepare(`SELECT count(*) n FROM memories m LEFT JOIN memory_search s ON s.memory_id=m.id
       WHERE s.memory_id IS NULL OR s.revision!=m.revision OR s.status!=m.status OR s.profile_id!=m.profile_id OR s.project_id IS NOT m.project_id OR s.scope!=m.scope OR s.metadata!=json_remove(m.body,'$.content')`).get();
     const missing_chunk_fts=this.db.prepare("SELECT count(*) n FROM memory_chunks c JOIN memories m ON m.id=c.memory_id WHERE m.status='active' AND NOT EXISTS(SELECT 1 FROM chunk_fts f WHERE f.chunk_id=c.id AND f.memory_id=c.memory_id)").get();
     const orphan_chunk_fts=this.db.prepare('SELECT count(*) n FROM chunk_fts f LEFT JOIN memory_chunks c ON c.id=f.chunk_id WHERE c.id IS NULL OR c.memory_id!=f.memory_id').get();
     const orphan_identifiers=this.db.prepare('SELECT count(*) n FROM chunk_identifiers i LEFT JOIN memory_chunks c ON c.id=i.chunk_id WHERE c.id IS NULL OR c.memory_id!=i.memory_id').get();
-    const version_mismatch=this.db.prepare(`SELECT count(*) n FROM memories m LEFT JOIN memory_versions v ON v.memory_id=m.id AND v.revision=m.revision
-      WHERE v.memory_id IS NULL OR v.body<>m.body OR v.content_hash<>m.content_hash OR v.written_by<>m.written_by OR v.recorded_at<>m.verified_at`).get();
+    const version_mismatch=this.db.prepare(`SELECT count(*) n FROM memories m LEFT JOIN memory_version_bodies v ON v.memory_id=m.id AND v.revision=m.revision
+      WHERE v.memory_id IS NULL OR v.body IS NOT m.body OR v.content_hash<>m.content_hash OR v.written_by<>m.written_by OR v.recorded_at<>m.verified_at`).get();
     const invalid_versions=this.db.prepare(`SELECT count(*) n FROM memory_versions v LEFT JOIN memories m ON m.id=v.memory_id
-      WHERE m.id IS NULL OR v.revision>m.revision OR EXISTS(SELECT 1 FROM tombstones t WHERE t.id=v.memory_id)`).get();
+      WHERE m.id IS NULL OR v.revision>m.revision OR (v.body='' AND v.revision<>m.revision)
+        OR EXISTS(SELECT 1 FROM tombstones t WHERE t.id=v.memory_id)`).get();
     const version_gaps=this.db.prepare(`SELECT count(*) n FROM (
       SELECT memory_id FROM memory_versions GROUP BY memory_id HAVING count(*)<>max(revision)-min(revision)+1)`).get();
     const missing_version_dependencies=this.db.prepare(`SELECT count(*) n FROM (
-      SELECT json_extract(d.value,'$.memory_id'),v.memory_id,v.revision FROM memory_versions v,json_each(v.body,'$.derived_from') d
+      SELECT json_extract(d.value,'$.memory_id'),v.memory_id,v.revision FROM memory_version_bodies v,json_each(v.body,'$.derived_from') d
       EXCEPT SELECT parent_id,child_id,child_revision FROM version_dependencies)`).get();
     const relation_scope_errors=this.db.prepare(`SELECT count(*) n FROM memory_relations e
       LEFT JOIN memories a ON a.id=e.from_id LEFT JOIN memories b ON b.id=e.to_id
       WHERE a.id IS NULL OR b.id IS NULL OR a.scope<>e.scope OR b.scope<>e.scope
         OR a.project_id IS NOT e.project_id OR b.project_id IS NOT e.project_id`).get();
     let version_hash_errors=0;
-    for(const row of this.db.prepare('SELECT body,content_hash FROM memory_versions').iterate()) {
+    for(const row of this.db.prepare('SELECT body,content_hash FROM memory_version_bodies').iterate()) {
       try { if(recordHash(JSON.parse(String(row.body)))!==row.content_hash)version_hash_errors++; }
       catch { version_hash_errors++; }
     }
@@ -505,7 +512,7 @@ export class MemoryService {
       version_mismatch,invalid_versions,version_gaps,missing_version_dependencies,version_hash_errors:{n:version_hash_errors},relation_scope_errors};
   }
   private archivedVersions(id:string) {
-    return this.db.prepare('SELECT revision,body,content_hash,recorded_at,profile_id,written_by FROM memory_versions WHERE memory_id=? ORDER BY revision').all(id);
+    return this.db.prepare('SELECT revision,body,content_hash,recorded_at,profile_id,written_by FROM memory_version_bodies WHERE memory_id=? ORDER BY revision').all(id);
   }
   async export(project_id:string,include_global=false,format:'json'|'markdown'|'versioned'='json') {
     this.permission('manage');this.scope(project_id,'project');if(include_global)this.scope(null,'global');
@@ -586,13 +593,10 @@ export class MemoryService {
           record.import_key??null,version.written_by);
         this.db.prepare('DELETE FROM memory_versions WHERE memory_id=?').run(entry.id);
         const insert=this.db.prepare('INSERT INTO memory_versions VALUES(?,?,?,?,?,?,?)');
-        for(const v of entry.versions)insert.run(entry.id,v.revision,v.body,v.content_hash,v.recorded_at,v.profile_id,v.written_by);
+        for(const v of entry.versions)insert.run(entry.id,v.revision,v.revision===version.revision?'':v.body,v.content_hash,v.recorded_at,v.profile_id,v.written_by);
         for(const d of record.derived_from)this.db.prepare('INSERT INTO dependencies VALUES(?,?,?)').run(entry.id,d.memory_id,d.revision);
         const chunks=encoded.get(entry.id);
-        if(chunks) {
-          this.indexChunks(entry.id,version.revision,profile.id,record,chunks);
-          this.db.prepare('INSERT INTO memories_fts VALUES(?,?)').run(entry.id,terms(record.title+' '+record.content+' '+record.tags.join(' ')).join(' '));
-        }
+        if(chunks)this.indexChunks(entry.id,version.revision,profile.id,record,chunks);
       }
       for(const entry of pending) {
         this.dependencies(entry.latest.record,entry.id,entry.status==='invalidated');
@@ -612,13 +616,12 @@ export class MemoryService {
     for(const row of rows){const body=JSON.parse(row.body);encoded.push({row,chunks:await this.encoder.chunks(body.title,body.content)});}
     return this.storage.transaction(()=>{
       if(this.storage.generation()!==generation)throw new MemoryError('VERSION_CONFLICT');
-      this.db.exec('DELETE FROM memory_vec; DELETE FROM memory_chunks; DELETE FROM memories_fts;');
+      this.db.exec('DELETE FROM memory_vec; DELETE FROM memory_chunks;');
       this.db.prepare('INSERT OR IGNORE INTO embedding_profiles VALUES(?,?)').run(profile.id,JSON.stringify(profile.manifest));
       for(const {row,chunks} of encoded) {
         const body=JSON.parse(row.body);
         this.db.prepare('UPDATE memories SET profile_id=? WHERE id=?').run(profile.id,row.id);
         this.indexChunks(row.id,row.revision,profile.id,body,chunks);
-        this.db.prepare('INSERT INTO memories_fts VALUES(?,?)').run(row.id,terms(body.title+' '+body.content+' '+body.tags.join(' ')).join(' '));
       }
       return {reindexed:rows.length,profile_id:profile.id,generation:this.storage.advance()};
     });

@@ -28,6 +28,25 @@ test('index checks still detect corruption with unchanged generation, including 
  const{service:s,gold}=await fixture();try{const before=await s.recall(input);s.db.prepare('DELETE FROM memory_vec WHERE chunk_id=(SELECT id FROM memory_chunks WHERE memory_id=?)').run(gold[0]);const after=await s.recall(input);assert.equal(after.generation,before.generation);assert.equal(after.retrieval_mode,'lexical_degraded');assert.ok(after.warnings.includes('INDEX_INCOMPLETE'));}finally{s.close();}
 });
 
+test('warm index validation notices an external repair and preserves unaffected scopes',async()=>{
+ const {service:s,config,project,other}=await fixture();
+ const [foreign]=seed(s,[other],1);
+ const writer=new MemoryService(config,fake);
+ try {
+   const before=await s.recall(input);
+   const row=writer.db.prepare('SELECT * FROM memory_vec WHERE chunk_id=(SELECT id FROM memory_chunks WHERE memory_id=?)').get(foreign);
+   writer.db.prepare('DELETE FROM memory_vec WHERE chunk_id=?').run(BigInt(row.chunk_id));
+   const broken=await s.recall(input);
+   assert.equal(broken.generation,before.generation);
+   assert.ok(broken.warnings.includes('INDEX_INCOMPLETE'));
+   assert.equal((await s.recall({...input,project_id:project})).retrieval_mode,'hybrid');
+   writer.db.prepare('INSERT INTO memory_vec VALUES(?,?,?)').run(BigInt(row.chunk_id),row.embedding,row.project_scope);
+   const repaired=await s.recall(input);
+   assert.equal(repaired.generation,before.generation);
+   assert.equal(repaired.retrieval_mode,'hybrid');
+ } finally {writer.close();s.close();}
+});
+
 for(const point of ['read_snapshot','state_updated'])test('in-flight permission changes at '+point+' roll back the page',async()=>{
  const{service:s,config,other}=await fixture();s.close();let reader;reader=new MemoryService(config,fake,p=>{if(p==='recall:'+point)reader.config.allowed_projects=[other];});
  try{await assert.rejects(reader.recall(input),{code:'CURSOR_SCOPE_CHANGED'});const state=QueryState.open(reader.db,reader.config);assert.equal(state.db.prepare('SELECT count(*) n FROM queries').get().n,0);assert.equal(state.db.prepare('SELECT count(*) n FROM pages').get().n,0);}finally{reader.close();}

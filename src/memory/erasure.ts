@@ -29,8 +29,8 @@ export function migrateErasure(db:DatabaseSync) {
 export function revokeVersions(db:DatabaseSync,id:string) {
   db.prepare('INSERT OR IGNORE INTO revoked_version_hashes SELECT memory_id,content_hash FROM memory_versions WHERE memory_id=?').run(id);
   db.prepare(`INSERT OR IGNORE INTO revoked_aliases SELECT memory_id,'import_key',json_extract(body,'$.import_key')
-    FROM memory_versions WHERE memory_id=? AND json_extract(body,'$.import_key') IS NOT NULL`).run(id);
+    FROM memory_version_bodies WHERE memory_id=? AND json_extract(body,'$.import_key') IS NOT NULL`).run(id);
   db.prepare(`INSERT OR IGNORE INTO revoked_aliases SELECT v.memory_id,'source_hash',json_extract(s.value,'$.source_hash')
-    FROM memory_versions v,json_each(v.body,'$.sources') s WHERE v.memory_id=?
+    FROM memory_version_bodies v,json_each(v.body,'$.sources') s WHERE v.memory_id=?
     AND json_extract(s.value,'$.source_hash') IS NOT NULL`).run(id);
 }

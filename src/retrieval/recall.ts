@@ -45,6 +45,37 @@ type Candidate = {
     answer?: { state: FactState; coverage: number; alignment: number; checked: string; salient?: boolean; subjectMatches?: number; referenceBackground?: boolean };
 };
 const blob = (v: Float32Array) => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+const INCOMPLETE_INDEX = `(NOT EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=s.memory_id)
+    OR EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=s.memory_id AND
+      (c.revision!=s.revision OR c.profile_id!=s.profile_id OR c.id NOT IN (SELECT chunk_id FROM memory_vec))))`;
+type IndexSnapshot = { stamp: string; profile?: string; healthy?: boolean; chunks?: number };
+const indexSnapshots = new WeakMap<DatabaseSync, IndexSnapshot>();
+function indexSnapshot(main:DatabaseSync,db:DatabaseSync,generation:number) {
+    // Read after pinning the main WAL snapshot. data_version tracks other
+    // connections, while total_changes covers repairs on this connection.
+    const external=db.prepare('PRAGMA main.data_version').get()!.data_version;
+    const local=db.prepare('SELECT total_changes() AS n').get()!.n;
+    const stamp=`${generation}:${external}:${local}`;
+    const cached=indexSnapshots.get(main);
+    if(cached?.stamp===stamp)return cached;
+    const fresh:IndexSnapshot={stamp};
+    indexSnapshots.set(main,fresh);
+    return fresh;
+}
+function validateIndex(db:DatabaseSync, snapshot:IndexSnapshot, profile:string, eligible:ReturnType<typeof eligibility>) {
+    // A healthy library is valid for every scope and effective time. When an
+    // index is damaged, check the eligible subset to retain scoped behavior.
+    if(snapshot.healthy===undefined || snapshot.profile!==profile) {
+        snapshot.healthy=!db.prepare(`SELECT 1 FROM memory_search s WHERE s.status='active'
+            AND (s.profile_id IS NOT ? OR ${INCOMPLETE_INDEX}) LIMIT 1`).get(profile);
+        snapshot.profile=profile;
+    }
+    if(snapshot.healthy)return null;
+    if(db.prepare(`SELECT 1 FROM memory_search s WHERE ${eligible.sql} AND ${INCOMPLETE_INDEX} LIMIT 1`).get(...eligible.params))
+        return 'INDEX_INCOMPLETE';
+    return db.prepare(`SELECT 1 FROM memory_search s WHERE ${eligible.sql} AND s.profile_id IS NOT ? LIMIT 1`).get(...eligible.params,profile)
+        ? 'INDEX_PROFILE_MISMATCH' : null;
+}
 // These describe the request, rather than its subject; they must not dominate IDF anchors.
 const salienceScaffolding=new Set(terms('用户 已 废弃 改用 决定 配置 入口 最近 排错 记录 相关 当前 已有 既有'));
 export const estimateTokens = (bytes: number) => Math.ceil(bytes / 3);
@@ -99,12 +130,6 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
     const { config, encoder } = ctx, profileTrace=(request.debug||config.diagnostics)?new RetrievalProfile():undefined, db=profileTrace?.database(prepared(ctx.db))??prepared(ctx.db), start = performance.now(), debug = request.debug || config.diagnostics;
     const d = { elapsed_ms: 0, candidate_ids: 0, candidates_ranked: 0, full_body_records_read: 0, full_body_bytes_read: 0, json_parses: 0, metadata_json_parses: 0, chunk_text_rows_read: 0, vector_queries: 0, vector_rows_returned: 0, vector_internal_scanned: null, vector_distance_computations: null, query_embeddings: 0, response_bytes: 0, estimated_tokens: 0, content_estimated_tokens: 0, token_estimator: 'ceil(utf8_bytes/3)', cache_replay: false, ranking_chunk_rows_read: 0 };
     let traceResponse:any,traceBudget=config.page_response_bytes;
-    let preflightEligibility:ReturnType<typeof eligibility>|undefined,preflightAuthority:string|undefined,indexProblem:string|null|undefined;
-    const validateIndex=(eligible:ReturnType<typeof eligibility>)=>{
-        const profiles=(db.prepare(`SELECT DISTINCT s.profile_id FROM memory_search s WHERE ${eligible.sql}`).all(...eligible.params) as any[]).map(r=>r.profile_id);
-        const incomplete=db.prepare(`SELECT 1 FROM memory_search s WHERE ${eligible.sql} AND (NOT EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=s.memory_id) OR EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=s.memory_id AND (c.revision!=s.revision OR c.profile_id!=s.profile_id OR c.id NOT IN (SELECT chunk_id FROM memory_vec)))) LIMIT 1`).get(...eligible.params);
-        return incomplete?'INDEX_INCOMPLETE':profiles.some(p=>p!==profile)?'INDEX_PROFILE_MISMATCH':null;
-    };
     const parse = (s: string, metadata = false) => { d.json_parses++; if (metadata)
         d.metadata_json_parses++; return JSON.parse(s); };
     const expansion = request.versions ? 'versions' : request.ids ? 'ids' : undefined;
@@ -113,7 +138,19 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
     let graphReader:GraphReader|undefined, graphState:GraphProgress|undefined;
     let graphAttempted=false, graphExamined=0, graphAccepted=0;
     let runtimeProfile:string|null=null;
-    let input = request, queryVector: Buffer | null = null, profile: string | null = null, retrievalMode: string = expansion ?? channel, warnings: string[] = [], state: QueryState | undefined, q = '', page = 0, resolved = 'focused', progress: any = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage: any;
+    let input = request, queryVector: Buffer | null = null, profile: string | null = null, retrievalMode: string = expansion ?? channel, warnings: string[] = [], state: QueryState | undefined, durable: QueryState | undefined, q = '', page = 0, resolved = 'focused', progress: any = { vectorDone: channel === 'lexical', ftsDone: channel === 'vector', idDone: false, vectorRank: 0, ftsRank: 0, batch: 32, warnings: [] }, savedPage: any;
+    const openState = () => {
+        const opened=performance.now();
+        const cache=QueryState.open(ctx.db,config);
+        profileTrace?.add('state_open',performance.now()-opened);
+        const cleaning=performance.now();cache.cleanupIfExpired();profileTrace?.add('cleanup',performance.now()-cleaning);
+        return cache;
+    };
+    const lockState = (cache:QueryState) => {
+        ctx.checkpoint?.('recall:before_state_lock');
+        const lockStarted=performance.now();cache.begin();profileTrace?.add('state_wait',performance.now()-lockStarted);
+        ctx.checkpoint?.('recall:state_locked');
+    };
     const embeddingStarted=performance.now();
     if (!request.cursor && request.query && channel !== 'lexical')
         try {
@@ -129,12 +166,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
     profileTrace?.add('embedding',performance.now()-embeddingStarted);
     try {
-        if (!expansion) {
-            const opened=performance.now();
-            state = QueryState.open(ctx.db, config);
-            profileTrace?.add('state_open',performance.now()-opened);
-            const cleaning=performance.now();state.cleanupIfExpired();profileTrace?.add('cleanup',performance.now()-cleaning);
-            if(request.cursor && config.graph_enabled) {
+        if (request.cursor) {
+            state=durable=openState();
+            if(config.graph_enabled) {
                 const row=state.lookup(request.cursor).row;
                 // Only graph cursors need model-profile I/O. The locked lookup
                 // below revalidates the row and its current authority.
@@ -145,39 +179,34 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     profileTrace?.add('embedding',performance.now()-checking);
                 }
             }
-            // New-query validation needs only canonical data. Keep the same WAL
-            // read snapshot through computation; do not occupy the sidecar writer.
-            if(!request.cursor){
-                db.exec('BEGIN');ctx.generation();preflightAuthority=authority(config,db);preflightEligibility=eligibility(db,input,config,effectiveAt);
-                if(queryVector&&retrievalMode!=='lexical_degraded')indexProblem=profileTrace?profileTrace.stage('index_validation',()=>validateIndex(preflightEligibility!)):validateIndex(preflightEligibility);
-                ctx.checkpoint?.('recall:read_snapshot');
-            }
-            ctx.checkpoint?.('recall:before_state_lock');
-            const lockStarted=performance.now();state.begin();profileTrace?.add('state_wait',performance.now()-lockStarted);
-            ctx.checkpoint?.('recall:state_locked');
-            if (request.cursor) {
-                const found = state.lookup(request.cursor);
-                q = found.row.id;
-                page = found.page;
-                input = parse(found.row.input);
-                queryVector = found.row.vector ? Buffer.from(found.row.vector) : null;
-                profile = found.row.profile;
-                retrievalMode = found.row.retrieval_mode;
-                resolved = found.row.resolved;
-                progress = parse(found.row.progress);
-                effectiveAt=progress.effectiveAt??input.as_of??effectiveAt;
-                warnings = progress.warnings;
-                for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state', 'graph'] as const)
-                    if (request[key] !== undefined && request[key] !== input[key])
-                        throw new MemoryError('CURSOR_QUERY_MISMATCH');
-                if (Object.keys(request.context).length && hash(request.context) !== hash(input.context))
+            state.attach(ctx.db);
+            lockState(state);
+            const found = state.lookup(request.cursor);
+            q = found.row.id;
+            page = found.page;
+            input = parse(found.row.input);
+            queryVector = found.row.vector ? Buffer.from(found.row.vector) : null;
+            profile = found.row.profile;
+            retrievalMode = found.row.retrieval_mode;
+            resolved = found.row.resolved;
+            progress = parse(found.row.progress);
+            effectiveAt=progress.effectiveAt??input.as_of??effectiveAt;
+            warnings = progress.warnings;
+            for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state', 'graph'] as const)
+                if (request[key] !== undefined && request[key] !== input[key])
                     throw new MemoryError('CURSOR_QUERY_MISMATCH');
-            }
+            if (Object.keys(request.context).length && hash(request.context) !== hash(input.context))
+                throw new MemoryError('CURSOR_QUERY_MISMATCH');
         }
         // Freeze expiry after query encoding; all channels and materialization share this snapshot.
-        const candidateStarted=performance.now();if(!preflightEligibility)db.exec('BEGIN');
-        const gen = ctx.generation(), auth = authority(config, db), eligible = preflightEligibility??eligibility(db,input,config,effectiveAt);
-        if(preflightAuthority&&preflightAuthority!==auth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
+        const candidateStarted=performance.now();db.exec('BEGIN');
+        const gen = ctx.generation(), auth = authority(config, db), eligible = eligibility(db,input,config,effectiveAt);
+        const snapshot=expansion?undefined:indexSnapshot(ctx.db,db,gen);
+        if(!expansion && !request.cursor) {
+            ctx.checkpoint?.('recall:read_snapshot');
+            if(authority(config,db)!==auth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
+            state=QueryState.workspace(config);
+        }
         if (state) {
             if (request.cursor) {
                 const row = state.db.prepare('SELECT authority,generation FROM queries WHERE id=?').get(q) as any;
@@ -217,7 +246,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
         }
         if (queryVector && retrievalMode !== 'lexical_degraded' && !savedPage) {
-            const problem=indexProblem===undefined?validateIndex(eligible):indexProblem;
+            const check=()=>validateIndex(db,snapshot!,profile!,eligible);
+            const problem=profileTrace?profileTrace.stage('index_validation',check):check();
             if (problem) {
                 if (request.cursor)
                     throw new MemoryError('CURSOR_INDEX_CHANGED');
@@ -233,7 +263,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         let work = 0, lowGain = false;
         // Local exclusion already covers this request; persist each channel once.
         const seen = (ch: keyof typeof local, id: string) => { local[ch].add(id); };
-        const exclusion = (ch: keyof typeof local) => `s.memory_id NOT IN (SELECT id FROM retrieval_state.seen WHERE q=? AND channel='${ch}') AND s.memory_id NOT IN (SELECT value FROM json_each(?))`;
+        const exclusion = (ch: keyof typeof local) => (request.cursor ? `s.memory_id NOT IN (SELECT id FROM retrieval_state.seen WHERE q=? AND channel='${ch}') AND ` : '') + 's.memory_id NOT IN (SELECT value FROM json_each(?))';
+        const excluded = (ch: keyof typeof local) => [...(request.cursor ? [q] : []), JSON.stringify([...local[ch]])];
         const analysisMetadata=new Map<string,any>(),topicCounts=new Map<string,number>();
         const candidate = (id: string) => {
             if (!candidates.has(id)) {
@@ -269,8 +300,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         const queryTerms=input.query?focusTerms(input.query):[], termWeights=new Map<string,number>(),references=resolved==='focused'?referenceEvidence(input.query??''):undefined;
         const queryIdentifiers=identifiers(input.query??'').filter(id=>input.exact_only||!/^20\d{2}$/.test(id)||queryTerms.length===1);
         if(resolved==='focused'&&input.query) {
-            db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS temp.recall_vocab USING fts5vocab(main,chunk_fts,'row')");
-            const total=Number((db.prepare('SELECT count(*) n FROM memory_chunks').get() as any).n);
+            const total=snapshot!.chunks??=Number(db.prepare('SELECT count(*) n FROM memory_chunks').get()!.n);
             for(const r of db.prepare('SELECT term,doc FROM temp.recall_vocab WHERE term IN (SELECT value FROM json_each(?))').all(JSON.stringify(queryTerms)) as any[])
                 termWeights.set(r.term,Math.log(1+total/(1+r.doc)));
         }
@@ -355,7 +385,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     break;
                 if (!progress.vectorDone)
                     try {
-                        const rows = db.prepare(`SELECT chunk_id,distance FROM memory_vec WHERE embedding MATCH ? AND k=? AND distance<=? AND chunk_id IN (SELECT c.id FROM memory_chunks c JOIN memory_search s ON s.memory_id=c.memory_id WHERE ${eligible.sql} AND c.revision=s.revision AND c.profile_id=s.profile_id AND ${exclusion('vector')}) ORDER BY distance`).all(queryVector!, Math.min(k, 4096), 1 - config.semantic_threshold, ...eligible.params, q, JSON.stringify([...local.vector])) as any[];
+                        const rows = db.prepare(`SELECT chunk_id,distance FROM memory_vec WHERE embedding MATCH ? AND k=? AND distance<=? AND chunk_id IN (SELECT c.id FROM memory_chunks c JOIN memory_search s ON s.memory_id=c.memory_id WHERE ${eligible.sql} AND c.revision=s.revision AND c.profile_id=s.profile_id AND ${exclusion('vector')}) ORDER BY distance`).all(queryVector!, Math.min(k, 4096), 1 - config.semantic_threshold, ...eligible.params, ...excluded('vector')) as any[];
                         d.vector_queries++;
                         d.vector_rows_returned += rows.length;
                         work += rows.length;
@@ -392,7 +422,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     if (!fq)
                         progress.ftsDone = true;
                     else {
-                        const n = Math.min(k, config.page_candidate_budget - work), rows = db.prepare(`SELECT chunk_id,memory_id,terms,bm25(chunk_fts) rank FROM chunk_fts WHERE chunk_fts MATCH ? AND chunk_id IN (SELECT c.id FROM memory_chunks c JOIN memory_search s ON s.memory_id=c.memory_id WHERE ${eligible.sql} AND c.revision=s.revision AND c.profile_id=s.profile_id AND ${exclusion('fts')}) ORDER BY rank,chunk_id LIMIT ?`).all(fq, ...eligible.params, q, JSON.stringify([...local.fts]), n) as any[];
+                        const n = Math.min(k, config.page_candidate_budget - work), rows = db.prepare(`SELECT chunk_id,memory_id,terms,bm25(chunk_fts) rank FROM chunk_fts WHERE chunk_fts MATCH ? AND chunk_id IN (SELECT c.id FROM memory_chunks c JOIN memory_search s ON s.memory_id=c.memory_id WHERE ${eligible.sql} AND c.revision=s.revision AND c.profile_id=s.profile_id AND ${exclusion('fts')}) ORDER BY rank,chunk_id LIMIT ?`).all(fq, ...eligible.params, ...excluded('fts'), n) as any[];
                         work += rows.length;
                         const qt = terms(input.query!), batch = new Set<string>();
                         for (const r of rows) {
@@ -415,7 +445,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     }
                 }
                 if (!progress.idDone && work < config.page_candidate_budget) {
-                    const n = Math.min(k, config.page_candidate_budget - work), rows = db.prepare(`WITH matches AS MATERIALIZED (SELECT i.* FROM chunk_identifiers i JOIN memory_chunks c ON c.id=i.chunk_id JOIN memory_search s ON s.memory_id=i.memory_id WHERE i.identifier IN (SELECT value FROM json_each(?)) AND ${eligible.sql} AND c.revision=s.revision AND c.profile_id=s.profile_id AND ${exclusion('identifier')}), per_identifier AS (SELECT memory_id,identifier,max(weight) weight FROM matches GROUP BY memory_id,identifier),totals AS (SELECT memory_id,sum(weight) exact FROM per_identifier GROUP BY memory_id) SELECT t.*,(SELECT chunk_id FROM matches h WHERE h.memory_id=t.memory_id ORDER BY weight DESC,chunk_id LIMIT 1) chunk_id FROM totals t ORDER BY exact DESC,memory_id LIMIT ?`).all(JSON.stringify(resolved==='broad'?identifiers(input.query!):queryIdentifiers), ...eligible.params, q, JSON.stringify([...local.identifier]), n) as any[];
+                    const n = Math.min(k, config.page_candidate_budget - work), rows = db.prepare(`WITH matches AS MATERIALIZED (SELECT i.* FROM chunk_identifiers i JOIN memory_chunks c ON c.id=i.chunk_id JOIN memory_search s ON s.memory_id=i.memory_id WHERE i.identifier IN (SELECT value FROM json_each(?)) AND ${eligible.sql} AND c.revision=s.revision AND c.profile_id=s.profile_id AND ${exclusion('identifier')}), per_identifier AS (SELECT memory_id,identifier,max(weight) weight FROM matches GROUP BY memory_id,identifier),totals AS (SELECT memory_id,sum(weight) exact FROM per_identifier GROUP BY memory_id) SELECT t.*,(SELECT chunk_id FROM matches h WHERE h.memory_id=t.memory_id ORDER BY weight DESC,chunk_id LIMIT 1) chunk_id FROM totals t ORDER BY exact DESC,memory_id LIMIT ?`).all(JSON.stringify(resolved==='broad'?identifiers(input.query!):queryIdentifiers), ...eligible.params, ...excluded('identifier'), n) as any[];
                     work += rows.length;
                     for (const r of rows) {
                         const c = candidate(r.memory_id);
@@ -566,7 +596,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         if (request.versions) {
             const visible = db.prepare(`SELECT v.revision, s.revision current_revision, json_extract(v.body,'$.valid_for') valid_for,
                 json_extract(v.body,'$.decision_state') decision_state, json_extract(v.body,'$.valid_time') valid_time
-                FROM memory_versions v JOIN memory_search s ON s.memory_id=v.memory_id
+                FROM memory_version_bodies v JOIN memory_search s ON s.memory_id=v.memory_id
                 WHERE v.memory_id=? AND v.revision=? AND ${eligible.sql}
                 AND NOT EXISTS(SELECT 1 FROM tombstones t WHERE t.id=v.memory_id OR t.content_hash=v.content_hash)
                 AND NOT EXISTS(SELECT 1 FROM revoked_version_hashes h WHERE h.content_hash=v.content_hash)`);
@@ -620,7 +650,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         const remainingKey = expansion==='versions'?'remaining_versions':'remaining_ids';
         const expansionRefs = (keys:string[])=>request.versions?keys.map(key=>versions.get(key)!):keys;
         if(expansion&&selected.length)result[remainingKey]=expansionRefs(selected);
-        if(profileTrace)profileTrace.add('candidates',Math.max(0,performance.now()-candidateStarted-['knn','fts_identifiers','ranking','candidate_sql'].reduce((n,k)=>n+(profileTrace.times[k]??0),0)));
+        if(profileTrace)profileTrace.add('candidates',Math.max(0,performance.now()-candidateStarted-['index_validation','knn','fts_identifiers','ranking','candidate_sql'].reduce((n,k)=>n+(profileTrace.times[k]??0),0)));
         const materializeStarted=performance.now();if(profileTrace)profileTrace.current='materialization';
         const fitted: string[] = [], candidateMap = new Map(pool.map(c => [c.id, c]));
         let blocked = false;
@@ -631,7 +661,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 ? db.prepare(`SELECT v.*,v.recorded_at verified_at,s.scope,s.project_id,s.revision current_revision,
                   (SELECT min(revision) FROM memory_versions WHERE memory_id=v.memory_id) history_start_revision,
                   (SELECT count(*) FROM memory_versions WHERE memory_id=v.memory_id) history_version_count
-                  FROM memory_versions v JOIN memory_search s ON s.memory_id=v.memory_id WHERE v.memory_id=? AND v.revision=?`).get(id,ref.revision) as any
+                  FROM memory_version_bodies v JOIN memory_search s ON s.memory_id=v.memory_id WHERE v.memory_id=? AND v.revision=?`).get(id,ref.revision) as any
                 : db.prepare(`SELECT s.revision,s.project_id,s.scope,s.profile_id,s.metadata,m.content_hash,m.written_by,m.verified_at${request.ids ? ',m.body' : ''} FROM memory_search s JOIN memories m ON m.id=s.memory_id WHERE s.memory_id=?`).get(id) as any;
             let body: any;
             if (expansion) {
@@ -768,7 +798,6 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
         }
         profileTrace?.add('state_persist',performance.now()-persistStarted);
-        ctx.checkpoint?.('recall:state_updated');
         const serializationStarted=performance.now();
         result.evidence_status = result.items.some((i: any) => i.evidence_strength === 'supported') ? 'related_evidence' : 'insufficient';
         result.empty_reason = result.items.length ? null : blocked ? 'item_exceeds_budget' : 'no_relevant_evidence';
@@ -785,14 +814,24 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         if (Buffer.byteLength(JSON.stringify(result)) > options.max_bytes)
             throw new MemoryError('PAGE_BUDGET_TOO_SMALL');
         profileTrace?.add('serialization',performance.now()-serializationStarted);
-        if(state)state.enforce(q);
+        if (state && !request.cursor && (result.has_more || result.feedback_receipt)) {
+            // Stage and serialize the entire page before reserving the shared writer.
+            const saving=performance.now(), initial=state.initialPage(q);
+            if(authority(config,db)!==auth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
+            durable=openState();
+            lockState(durable);
+            durable.saveInitialPage(initial);
+            profileTrace?.add('state_persist',performance.now()-saving);
+        }
+        ctx.checkpoint?.('recall:state_updated');
+        durable?.enforce(q);
         if(authority(config,db)!==auth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
         ctx.checkpoint?.('recall:before_commit');
         db.exec('COMMIT');
         ctx.checkpoint?.('recall:canonical_released');
-        const committing=performance.now();state?.commit();profileTrace?.add('state_persist',performance.now()-committing);
+        const committing=performance.now();durable?.commit();profileTrace?.add('state_persist',performance.now()-committing);
         ctx.checkpoint?.('recall:committed');
-        if(profileTrace&&debug){profileTrace.add('total',performance.now()-start);Object.assign(d,{stages_ms:profileTrace.times,state_lock:state?.timing,memory:process.memoryUsage()});
+        if(profileTrace&&debug){profileTrace.add('total',performance.now()-start);Object.assign(d,{stages_ms:profileTrace.times,state_lock:durable?.timing??{wait_ms:0,held_ms:0,transactions:0},memory:process.memoryUsage()});
             if(Buffer.byteLength(JSON.stringify(result))>options.max_bytes){delete (d as any).stages_ms;delete (d as any).state_lock;delete (d as any).memory;}
             for(let i=0;i<4;i++){d.response_bytes=Buffer.byteLength(JSON.stringify(result));d.estimated_tokens=estimateTokens(d.response_bytes);}
         }
@@ -801,13 +840,13 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
     catch (e) {
         if (db.isTransaction)
             db.exec('ROLLBACK');
-        state?.rollback();
+        durable?.rollback();
         if(e instanceof MemoryError && (e.code==='GRAPH_UNAVAILABLE'||e.code==='GRAPH_STALE')) {
             if(request.cursor)throw new MemoryError('CURSOR_GRAPH_CHANGED');
             if(request.graph&&!graphFallback)return retrieve(ctx,request,channel,e.code);
         }
-        if(state && (e instanceof MemoryError && /QUERY_CACHE/.test(e.code) || e instanceof Error && /database or disk is full/i.test(e.message))) {
-            try {state.rejected();}catch{}
+        if(durable && (e instanceof MemoryError && /QUERY_CACHE/.test(e.code) || e instanceof Error && /database or disk is full/i.test(e.message))) {
+            try {durable.rejected();}catch{}
             if(!(e instanceof MemoryError))throw new MemoryError('QUERY_CACHE_DISK_CAPACITY');
         }
         throw e;

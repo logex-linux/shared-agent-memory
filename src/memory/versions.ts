@@ -48,3 +48,33 @@ export function migrateVersions(db: DatabaseSync) {
     CREATE INDEX revoked_versions_by_hash ON revoked_version_hashes(content_hash);
   `);
 }
+
+export function compactVersionBodies(db: DatabaseSync) {
+  // A head row keeps its original revision metadata and foreign-key identity.
+  // Its empty body resolves to the current record until that record advances.
+  db.exec(`
+    DROP TRIGGER version_insert;
+    DROP TRIGGER version_advance;
+    DROP TRIGGER version_dependency_insert;
+    UPDATE memory_versions AS v SET body='' WHERE EXISTS (
+      SELECT 1 FROM memories m WHERE m.id=v.memory_id AND m.revision=v.revision AND m.body=v.body
+    );
+    CREATE VIEW memory_version_bodies AS
+      SELECT v.memory_id,v.revision,coalesce(nullif(v.body,''),m.body) AS body,
+        v.content_hash,v.recorded_at,v.profile_id,v.written_by
+      FROM memory_versions v LEFT JOIN memories m ON m.id=v.memory_id AND m.revision=v.revision;
+    CREATE TRIGGER version_insert AFTER INSERT ON memories BEGIN
+      INSERT INTO memory_versions VALUES(new.id,new.revision,'',new.content_hash,new.verified_at,new.profile_id,new.written_by);
+    END;
+    CREATE TRIGGER version_advance AFTER UPDATE OF revision ON memories WHEN new.revision <> old.revision BEGIN
+      UPDATE memory_versions SET body=old.body WHERE memory_id=old.id AND revision=old.revision AND body='';
+      INSERT INTO memory_versions VALUES(new.id,new.revision,'',new.content_hash,new.verified_at,new.profile_id,new.written_by);
+    END;
+    CREATE TRIGGER version_dependency_insert AFTER INSERT ON memory_versions BEGIN
+      INSERT OR IGNORE INTO version_dependencies
+        SELECT json_extract(d.value,'$.memory_id'),v.memory_id,v.revision
+        FROM memory_version_bodies v,json_each(v.body,'$.derived_from') d
+        WHERE v.memory_id=new.memory_id AND v.revision=new.revision;
+    END;
+  `);
+}

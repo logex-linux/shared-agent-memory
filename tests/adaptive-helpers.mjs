@@ -15,7 +15,7 @@ export function seed(s,projects,count,{relevant=true,valid_for={},start=0}={}){
    const project=projects[i%projects.length],id=randomUUID(),r=record(project,{kind:'preference',title:relevant?'设计偏好证据 '+(start+i):'园艺清单 '+i,content:relevant?`设计偏好：简洁排版、易读字体，场景${start+i}。这是独立证据，不是普遍结论。`:'花园种子的库存数量。',tags:[relevant?'设计'+i%5:'园艺'],valid_for});r.sources[0].checked_at=`2025-${String(i%12+1).padStart(2,'0')}-01T00:00:00.000Z`;
    s.db.prepare('INSERT INTO memories VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(id,project,project?'project':'global',JSON.stringify(r),1,'active',r.sources[0].checked_at,r.sources[0].checked_at,'adaptive-test','fixture:'+id,null,'test');
    const c=s.db.prepare('INSERT INTO memory_chunks(memory_id,revision,start,end,tokens,text,profile_id) VALUES(?,1,0,?,10,?,?)').run(id,r.content.length,r.content,'adaptive-test');const v=relevant?vector():vector(0,1);
-   s.db.prepare('INSERT INTO memory_vec VALUES(?,?,?)').run(BigInt(c.lastInsertRowid),Buffer.from(v.buffer),project??'global');indexChunk(s.db,{id:Number(c.lastInsertRowid),memory_id:id,text:r.content},r.title,r.tags);s.db.prepare('INSERT INTO memories_fts VALUES(?,?)').run(id,r.title+' '+r.content);ids.push(id);
+   s.db.prepare('INSERT INTO memory_vec VALUES(?,?,?)').run(BigInt(c.lastInsertRowid),Buffer.from(v.buffer),project??'global');indexChunk(s.db,{id:Number(c.lastInsertRowid),memory_id:id,text:r.content},r.title,r.tags);ids.push(id);
   }s.storage.advance();
  });return ids;
 }

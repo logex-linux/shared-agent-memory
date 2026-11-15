@@ -4,13 +4,13 @@ import { dirname } from 'node:path';
 import * as sqliteVec from 'sqlite-vec';
 import { MemoryError } from '../core/contracts.js';
 import { migrateSearch, migrateTemporalSearch } from '../retrieval/indexes.js';
-import { migrateVersions } from '../memory/versions.js';
+import { compactVersionBodies, migrateVersions } from '../memory/versions.js';
 import { migrateRelations } from '../memory/transitions.js';
 import { migrateGraph } from '../retrieval/graph.js';
 import { migrateErasure } from '../memory/erasure.js';
 import { indexAssociationWalk, migrateFeedback } from '../memory/feedback.js';
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export class Storage {
   db: DatabaseSync;
@@ -21,7 +21,7 @@ export class Storage {
       chmodSync(path,0o600);
       sqliteVec.load(this.db);
       this.db.enableLoadExtension(false);
-      this.db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON;');
+      this.db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=1048576;');
       const version=this.schema();
       if (version>SCHEMA_VERSION) throw new MemoryError('SCHEMA_TOO_NEW');
       if (version<SCHEMA_VERSION) {
@@ -31,6 +31,7 @@ export class Storage {
         });
         checkpoint('migration:after_commit');
       }
+      this.db.exec("CREATE VIRTUAL TABLE temp.recall_vocab USING fts5vocab(main,chunk_fts,'row')");
     } catch (error) {
       this.db.close();
       throw error;
@@ -103,6 +104,10 @@ export class Storage {
     if(version<11){
       migrateTemporalSearch(this.db);
       this.db.exec('PRAGMA user_version=11;');
+    }
+    if(version<12){
+      compactVersionBodies(this.db);
+      this.db.exec('DROP TABLE memories_fts; PRAGMA user_version=12;');
     }
   }
   transaction<T>(fn:()=>T):T {

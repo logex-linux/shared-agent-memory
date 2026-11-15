@@ -92,6 +92,20 @@ table and a partial exception index. The migration rebuilds only that derived
 table inside the canonical migration transaction. It preserves the old search
 projection columns and their values, FTS, vector bytes and record revisions.
 
+Schema 12 stores the latest body in `memories` and historical bodies in
+`memory_versions`. Latest revision rows retain their metadata and foreign keys.
+Use `memory_version_bodies` to read complete revisions. The migration removes
+the document-level FTS index, and proposal similarity hints use `chunk_fts`.
+The existing chunk index, vector data, and write receipts carry forward.
+
+The migration makes its freed pages reusable. To reclaim file size, use
+SQLite `VACUUM` during a maintenance window after taking a verified backup.
+A Schema 11 runtime returns `SCHEMA_TOO_NEW` when opening the upgraded database.
+
+Recall computes new pages in memory. Only pages with a cursor or feedback
+receipt need to write the query cache. Expired rows are cleaned when a request
+uses the cache or an operator runs maintenance.
+
 ## Rehearsed switch
 
 Run with an existing private output directory and the latest external ledger.

@@ -6,7 +6,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { backup, DatabaseSync } from 'node:sqlite';
 import * as vec from 'sqlite-vec';
-import { record, publish,dropTemporalProjection } from './helpers.mjs';
+import { record, publish, dropTemporalProjection, restoreSchema11Storage } from './helpers.mjs';
 import { fake, setupFake } from './adaptive-helpers.mjs';
 import { MemoryService } from '../dist/core/service.js';
 import { hash } from '../dist/core/contracts.js';
@@ -49,12 +49,12 @@ test('migration is atomic across interruption and racing opens, preserving Schem
   assert.equal(committed.signal,'SIGKILL',String(committed.stderr));
   const postCommit=new DatabaseSync(committedCopy,{readOnly:true,allowExtension:true});vec.load(postCommit);
   try {
-    assert.equal(postCommit.prepare('PRAGMA user_version').get().user_version,11);
+    assert.equal(postCommit.prepare('PRAGMA user_version').get().user_version,12);
     assert.equal(postCommit.prepare('SELECT count(*) n FROM memory_versions').get().n,1);
     assert.deepEqual(signature(postCommit),before);
   } finally {postCommit.close();}
   const runs=await Promise.all(Array.from({length:4},()=>inspectWorker(configPath)));
-  for(const run of runs){assert.equal(run.code,0,run.error);assert.equal(JSON.parse(run.output).schema,11);}
+  for(const run of runs){assert.equal(run.code,0,run.error);assert.equal(JSON.parse(run.output).schema,12);}
   const migrated=new MemoryService({...config,database:copy},fake);
   try {
     assert.deepEqual(signature(migrated.db),before);
@@ -67,6 +67,37 @@ test('migration is atomic across interruption and racing opens, preserving Schem
     assert.equal(current.episode,undefined);
     assert.equal(migrated.check().version_mismatch.n,0);
     assert.equal(migrated.db.prepare('SELECT count(*) n FROM memory_versions').get().n,1);
+  } finally {migrated.close();}
+});
+
+test('Schema 11 compacts only current bodies and reuses chunk FTS for scoped duplicate hints',async()=>{
+  const {service:s,config,project,other}=await setupFake();
+  const content='Standalone helix calibration dossier with ceramic spindle tooling.';
+  const fixture=record(project,{title:'Helix calibration dossier',content});
+  const parent=await publish(s,record(project));
+  const child=await publish(s,{...fixture,derived_from:[{memory_id:parent.memory_id,revision:1}]});
+  await publish(s,{...fixture,content:content+' Revised.',derived_from:[]},{target_id:child.memory_id,expected_revision:1});
+  await publish(s,{...fixture,project_id:other});
+  restoreSchema11Storage(s.db);
+  const ordered=(db,table)=>db.prepare(`SELECT * FROM ${table} ORDER BY 1,2`).all();
+  const before=ordered(s.db,'memory_versions'),dependencies=ordered(s.db,'version_dependencies');
+  const gen=s.storage.generation();
+  s.close();
+  const migrated=new MemoryService(config,fake);
+  try {
+    assert.equal(migrated.storage.schema(),12);
+    assert.equal(migrated.storage.generation(),gen);
+    assert.deepEqual(ordered(migrated.db,'memory_version_bodies'),before);
+    assert.deepEqual(ordered(migrated.db,'version_dependencies'),dependencies);
+    const physical=ordered(migrated.db,'memory_versions');
+    assert.equal(physical.filter(row=>row.body).length,1);
+    assert.equal(JSON.parse(physical.find(row=>row.body).body).content,content);
+    assert.equal(migrated.db.prepare("SELECT 1 FROM sqlite_master WHERE name='memories_fts'").get(),undefined);
+    const hint=await migrated.propose({request_id:randomUUID(),record:fixture});
+    assert.deepEqual(hint.similar_candidates.map(row=>[row.memory_id,row.revision]),[[child.memory_id,2]]);
+    await migrated.forget({request_id:randomUUID(),memory_id:parent.memory_id,expected_revision:1});
+    assert.deepEqual((await migrated.recall({ids:[child.memory_id]})).items,[]);
+    assert.equal(migrated.check().version_hash_errors.n,0);
   } finally {migrated.close();}
 });
 

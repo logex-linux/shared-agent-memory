@@ -10,6 +10,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { MemoryService } from '../../dist/core/service.js';
 import { BgeEncoder } from '../../dist/embedding/bge.js';
+import { SCHEMA_VERSION } from '../../dist/storage/database.js';
 
 const [output,sourceFile,ledgerFile,legacyDist]=process.argv.slice(2);
 if(!output||!sourceFile||!ledgerFile||!legacyDist)
@@ -121,7 +122,7 @@ for(const boundary of ['before_commit','after_commit']){
   try{
     assert.deepEqual(signed(db),report.signature);
     const schema=db.prepare('PRAGMA user_version').get().user_version;
-    assert.equal(schema,boundary==='before_commit'?5:11);
+    assert.equal(schema,boundary==='before_commit'?5:SCHEMA_VERSION);
     report[boundary]={signal:killed.signal,schema,signature_equal:true};
   }finally{db.close();}
 }
@@ -131,7 +132,7 @@ await copyFile(snapshot,upgraded);
 let migrated=new MemoryService(privateConfig(upgraded),encoder);
 try{
   assert.deepEqual(signed(migrated.db),report.signature);
-  assert.equal(migrated.storage.schema(),11);
+  assert.equal(migrated.storage.schema(),SCHEMA_VERSION);
   assert.equal(migrated.db.prepare('SELECT count(*) n FROM memory_versions').get().n,report.source_records);
 }finally{migrated.close();}
 migrated=new MemoryService(privateConfig(upgraded),encoder);

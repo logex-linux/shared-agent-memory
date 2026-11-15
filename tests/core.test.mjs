@@ -131,8 +131,8 @@ test('degraded read is explicit, failed embedding never publishes, rebuild recov
       await assert.rejects(fail.commit({request_id:randomUUID(),proposal_id:p.proposal_id,expected_revision:0}),{code:'EMBEDDING_UNAVAILABLE'});
       assert.equal(fail.db.prepare('SELECT count(*) n FROM memories').get().n,1);
     }finally{fail.close();}
-    s.db.exec('DELETE FROM memory_vec;DELETE FROM memories_fts');
-    assert.equal((await s.reindex()).reindexed,1);assert.equal(s.check().missing_vectors.n,0);
+    s.db.exec('DELETE FROM memory_vec;DELETE FROM chunk_fts');
+    assert.equal((await s.reindex()).reindexed,1);assert.equal(s.check().missing_vectors.n,0);assert.equal(s.check().missing_chunk_fts.n,0);
     assert.equal((await s.recall({project_id:project,query:'-67050'})).retrieval_mode,'hybrid');
   }finally{s.close();}
 });

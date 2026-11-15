@@ -1,4 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';
+import {access} from 'node:fs/promises';
 import {setup} from './helpers.mjs';import {fake,seed} from './adaptive-helpers.mjs';import {QueryState} from '../dist/retrieval/state.js';import {prepared} from '../dist/storage/statements.js';
 test('per-connection statement reuse has bounded capacity and never shares bindings between databases',()=>{
  const a=new DatabaseSync(':memory:'),b=new DatabaseSync(':memory:');try{const ca=prepared(a),cb=prepared(b),first=ca.prepare('SELECT ? value');assert.equal(ca.prepare('SELECT ? value'),first);assert.notEqual(cb.prepare('SELECT ? value'),first);assert.equal(first.get(1).value,1);assert.equal(first.get(2).value,2);for(let i=0;i<100;i++)ca.prepare('SELECT '+i+' value');assert.notEqual(ca.prepare('SELECT ? value'),first);}finally{a.close();b.close();}
@@ -6,6 +7,44 @@ test('per-connection statement reuse has bounded capacity and never shares bindi
 test('warm retrieval reuses sidecar; skips no-op cleanup writer and only materializes each hit chunk once per request',async()=>{
  const {service:s,project}=await setup();s.encoder=fake;seed(s,[project],80);
  try{const state=QueryState.open(s.db,s.config),r=await s.recall({query:'设计偏好',mode:'focused',view:'evidence',limit:4,debug:true});assert.equal(QueryState.open(s.db,s.config),state);assert.equal(r.diagnostics.state_lock.transactions,1);assert.equal(r.diagnostics.chunk_text_rows_read,0);assert.ok(r.diagnostics.ranking_chunk_rows_read>0);assert.equal(r.diagnostics.full_body_records_read,0);assert.ok(r.diagnostics.stages_ms.total>0);const next=await s.recall({cursor:r.next_cursor,debug:true});assert.equal(next.diagnostics.query_embeddings,0);assert.ok(next.items.every(i=>!r.items.some(j=>j.id===i.id)));}finally{s.close();}
+});
+test('single-page recall needs no sidecar, and paginated ranking leaves the sidecar writer free',async()=>{
+ const {service:s,project}=await setup();s.encoder=fake;seed(s,[project],1);
+ const request={query:'设计偏好',mode:'focused',view:'evidence',debug:true};
+ const path=s.config.database+'.retrieval.db';
+ let writer;
+ const prepare=DatabaseSync.prototype.prepare;
+ try {
+   const first=await s.recall(request);
+   assert.equal(first.items.length,1);
+   assert.equal(first.has_more,false);
+   assert.equal(first.diagnostics.state_lock.transactions,0);
+   await assert.rejects(access(path),{code:'ENOENT'});
+
+   QueryState.open(s.db,s.config);
+   writer=new DatabaseSync(path);
+   writer.exec('BEGIN IMMEDIATE');
+   assert.deepEqual((await s.recall(request)).items,first.items);
+   writer.exec('ROLLBACK');
+
+   seed(s,[project],80);
+   let freeDuringRanking=false;
+   DatabaseSync.prototype.prepare=function(sql){
+     if(!freeDuringRanking && sql.includes('FROM memory_vec WHERE embedding MATCH')) {
+       writer.exec('BEGIN IMMEDIATE; ROLLBACK');
+       freeDuringRanking=true;
+     }
+     return prepare.call(this,sql);
+   };
+   const paginated=await s.recall({...request,limit:2,as_of:'2026-01-01T00:00:00.000Z'});
+   assert.equal(paginated.retrieval_mode,'hybrid');
+   assert.ok(freeDuringRanking);
+   assert.equal(paginated.diagnostics.state_lock.transactions,1);
+   assert.ok(paginated.next_cursor);
+ } finally {
+   DatabaseSync.prototype.prepare=prepare;
+   writer?.close();s.close();
+ }
 });
 test('pooled state recovers after rolled-back page quota error and commits expiry cleanup independently',async()=>{
  const {service:s,project}=await setup({cache_query_max_bytes:16384,cache_cleanup_rows:8});s.encoder=fake;seed(s,[project],80);
@@ -20,7 +59,7 @@ test('disk quota failure is explicit and preserves the canonical database with a
 });
 
 test('multi-batch retrieval writes each unchanged candidate once and batches Seen/emitted updates',async()=>{
- const{service:s,project}=await setup();s.encoder=fake;seed(s,[project],240);const prepare=DatabaseSync.prototype.prepare,wrapped=new WeakSet(),counts={candidate:0,seen:0,emitted:0,query:0};
- DatabaseSync.prototype.prepare=function(sql){const st=prepare.call(this,sql);if(!wrapped.has(st)){wrapped.add(st);const key=/INSERT INTO candidates/.test(sql)?'candidate':/INSERT OR IGNORE INTO seen/.test(sql)?'seen':/UPDATE candidates SET emitted/.test(sql)?'emitted':/UPDATE queries/.test(sql)?'query':null;if(key){const run=st.run;st.run=function(...args){counts[key]++;return run.apply(this,args);};}}return st;};
- try{const r=await s.recall({query:'设计偏好',mode:'focused',limit:100,debug:true});assert.equal(r.diagnostics.full_body_records_read,0);assert.ok(r.diagnostics.candidate_ids>64);assert.ok(counts.candidate<=r.diagnostics.candidate_ids);assert.ok(counts.seen<=3);assert.equal(counts.emitted,1);assert.equal(counts.query,1);}finally{DatabaseSync.prototype.prepare=prepare;s.close();}
+ const{service:s,project}=await setup();s.encoder=fake;seed(s,[project],240);const prepare=DatabaseSync.prototype.prepare,wrapped=new WeakSet(),counts={candidate:0,savedCandidates:0,seen:0,savedSeen:0,emitted:0,query:0};
+ DatabaseSync.prototype.prepare=function(sql){const st=prepare.call(this,sql);if(!wrapped.has(st)){wrapped.add(st);const key=/INSERT INTO candidates SELECT/.test(sql)?'savedCandidates':/INSERT INTO candidates\(/.test(sql)?'candidate':/INSERT INTO seen SELECT/.test(sql)?'savedSeen':/INSERT OR IGNORE INTO seen/.test(sql)?'seen':/UPDATE candidates SET emitted/.test(sql)?'emitted':/UPDATE queries/.test(sql)?'query':null;if(key){const run=st.run;st.run=function(...args){counts[key]++;return run.apply(this,args);};}}return st;};
+ try{const r=await s.recall({query:'设计偏好',mode:'focused',limit:100,debug:true});assert.equal(r.diagnostics.full_body_records_read,0);assert.ok(r.diagnostics.candidate_ids>64);assert.ok(counts.candidate<=r.diagnostics.candidate_ids);assert.ok(counts.seen<=3);assert.equal(counts.emitted,1);assert.equal(counts.query,1);assert.equal(counts.savedCandidates,1);assert.equal(counts.savedSeen,1);}finally{DatabaseSync.prototype.prepare=prepare;s.close();}
 });

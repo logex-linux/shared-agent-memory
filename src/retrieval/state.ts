@@ -4,6 +4,15 @@ import { chmodSync, realpathSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { hash, MemoryError, type Config } from '../core/contracts.js';
 export const RANKING_VERSION = 'adaptive-v1-state';
+const QUERY_TABLES = `
+    CREATE TABLE IF NOT EXISTS queries(id TEXT PRIMARY KEY,authority TEXT NOT NULL,generation INTEGER NOT NULL,input TEXT NOT NULL,vector BLOB,profile TEXT,retrieval_mode TEXT NOT NULL,resolved TEXT NOT NULL,progress TEXT NOT NULL,expires INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS query_expiry ON queries(expires);
+    CREATE TABLE IF NOT EXISTS candidates(q TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,base REAL NOT NULL,admitted INTEGER NOT NULL,emitted INTEGER,project TEXT NOT NULL,topic TEXT NOT NULL,period TEXT NOT NULL,source TEXT NOT NULL,PRIMARY KEY(q,id));
+    CREATE INDEX IF NOT EXISTS pending ON candidates(q,emitted,admitted,base);
+    CREATE TABLE IF NOT EXISTS seen(q TEXT NOT NULL,channel TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(q,channel,id));
+    CREATE TABLE IF NOT EXISTS pages(q TEXT NOT NULL,n INTEGER NOT NULL,ids TEXT NOT NULL,options TEXT NOT NULL,plan TEXT NOT NULL,PRIMARY KEY(q,n));
+    CREATE UNIQUE INDEX IF NOT EXISTS page_feedback_receipt ON pages(json_extract(plan,'$.feedback.token'))
+        WHERE json_extract(plan,'$.feedback.token') IS NOT NULL;`;
 export function authority(config: Config, db: DatabaseSync) {
     return hash({ ranking: RANKING_VERSION, database: realpathSync(config.database), connection: config.connection_id, projects: [...config.allowed_projects].sort(), all: config.all_projects, global: config.allow_global, operations: [...config.operations].sort(), semantic: config.semantic_threshold, evidence: config.evidence_threshold, model: config.model_dir, dtype: config.dtype,
         ...(config.operations.includes('feedback')&&{feedback_policy:config.feedback_policy}),registry: db.prepare('SELECT id FROM projects ORDER BY id').all() });
@@ -12,30 +21,31 @@ export function authority(config: Config, db: DatabaseSync) {
 // A separate WAL writer serializes page creation without locking canonical memory writes.
 export class QueryState {
     private static instances=new WeakMap<DatabaseSync,QueryState>();private pooled=false;
-    static open(main:DatabaseSync,config:Config){let state=this.instances.get(main);if(!state){state=new QueryState(main,config);state.pooled=true;this.instances.set(main,state);}else state.attach(main);state.constructorConfig=config;state.timing={wait_ms:0,held_ms:0,transactions:0};return state;}
+    static open(main:DatabaseSync,config:Config){let state=this.instances.get(main);if(!state){state=new QueryState(config,realpathSync(config.database)+'.retrieval.db');state.pooled=true;this.instances.set(main,state);}state.constructorConfig=config;state.timing={wait_ms:0,held_ms:0,transactions:0};return state;}
+    static workspace(config:Config){return new QueryState(config,':memory:');}
     static dispose(main:DatabaseSync){const state=this.instances.get(main);if(state){state.db.close();this.instances.delete(main);}}
     cleanupIfExpired(){if(!this.db.prepare('SELECT 1 FROM queries WHERE expires<? LIMIT 1').get(Date.now()))return false;this.begin();try{this.cleanup();this.commit();return true;}catch(e){this.rollback();throw e;}}
 
     db: DatabaseSync;
     timing={wait_ms:0,held_ms:0,transactions:0};private heldAt=0;
-    path: string;
     constructorConfig: Config;
-    constructor(main: DatabaseSync, config: Config) {
+    private constructor(config: Config, public readonly path: string) {
         this.constructorConfig=config;
-        const path = this.path = realpathSync(config.database) + '.retrieval.db';
         this.db = prepared(new DatabaseSync(path));
+        try {
+            if(path===':memory:')this.db.exec(QUERY_TABLES+'BEGIN;');
+            else this.initializeFile();
+        } catch(error) {
+            this.db.close();
+            throw error;
+        }
+    }
+    private initializeFile() {
+        const {path,constructorConfig:config}=this;
         chmodSync(path, 0o600);
-        const initialize=()=>this.db.exec(`PRAGMA busy_timeout=5000;PRAGMA journal_mode=WAL;PRAGMA secure_delete=ON;PRAGMA wal_autocheckpoint=256;PRAGMA journal_size_limit=1048576;
-    CREATE TABLE IF NOT EXISTS queries(id TEXT PRIMARY KEY,authority TEXT NOT NULL,generation INTEGER NOT NULL,input TEXT NOT NULL,vector BLOB,profile TEXT,retrieval_mode TEXT NOT NULL,resolved TEXT NOT NULL,progress TEXT NOT NULL,expires INTEGER NOT NULL);
-    CREATE INDEX IF NOT EXISTS query_expiry ON queries(expires);
-    CREATE TABLE IF NOT EXISTS candidates(q TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,base REAL NOT NULL,admitted INTEGER NOT NULL,emitted INTEGER,project TEXT NOT NULL,topic TEXT NOT NULL,period TEXT NOT NULL,source TEXT NOT NULL,PRIMARY KEY(q,id));
-    CREATE INDEX IF NOT EXISTS pending ON candidates(q,emitted,admitted,base);
-    CREATE TABLE IF NOT EXISTS seen(q TEXT NOT NULL,channel TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(q,channel,id));
-    CREATE TABLE IF NOT EXISTS pages(q TEXT NOT NULL,n INTEGER NOT NULL,ids TEXT NOT NULL,options TEXT NOT NULL,plan TEXT NOT NULL,PRIMARY KEY(q,n));
-    CREATE UNIQUE INDEX IF NOT EXISTS page_feedback_receipt ON pages(json_extract(plan,'$.feedback.token'))
-        WHERE json_extract(plan,'$.feedback.token') IS NOT NULL;`);
+        const initialize=()=>this.db.exec('PRAGMA busy_timeout=5000;PRAGMA journal_mode=WAL;PRAGMA secure_delete=ON;PRAGMA wal_autocheckpoint=256;PRAGMA journal_size_limit=1048576;'+QUERY_TABLES);
         const deadline=Date.now()+5000;for(;;){try{initialize();break;}catch(e:any){if(!/busy|locked/i.test(e.message)||Date.now()>=deadline)throw e;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}}
-        // Additive, disposable sidecar migration. Canonical Schema 5 is untouched.
+        // Additive migration of disposable state.
         const initialized=this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='cache_meta'").get();
         if(!initialized) {
             this.begin();
@@ -60,9 +70,8 @@ export class QueryState {
         const pageSize=Number((this.db.prepare('PRAGMA page_size').get() as any).page_size);
         // Caps allocated DB pages, including freelist. WAL is separately checkpointed/reused.
         this.db.exec('PRAGMA max_page_count='+Math.max(1,Math.floor(config.cache_disk_max_bytes/pageSize)));
-        this.attach(main);
     }
-    private attach(main:DatabaseSync){
+    attach(main:DatabaseSync){
         if(!(main.prepare('PRAGMA database_list').all() as any[]).some(r=>r.name==='retrieval_state'))
             main.prepare('ATTACH DATABASE ? AS retrieval_state').run(this.path);
     }
@@ -123,6 +132,24 @@ export class QueryState {
         const id = randomUUID();
         this.db.prepare('INSERT INTO queries VALUES(?,?,?,?,?,?,?,?,?,?)').run(id, values.authority, values.generation, values.input, values.vector, values.profile, values.retrieval_mode, values.resolved, values.progress, values.expires);
         return id;
+    }
+    initialPage(q:string) {
+        return {
+            query: this.db.prepare('SELECT * FROM queries WHERE id=?').get(q)!,
+            candidates: JSON.stringify(this.db.prepare('SELECT id,data,base,admitted,emitted,project,topic,period,source FROM candidates WHERE q=?').all(q)),
+            seen: JSON.stringify(this.db.prepare('SELECT channel,id FROM seen WHERE q=?').all(q)),
+            page: this.db.prepare('SELECT * FROM pages WHERE q=? AND n=0').get(q)
+        };
+    }
+    saveInitialPage({query,candidates,seen,page}:ReturnType<QueryState['initialPage']>) {
+        this.db.prepare('INSERT INTO queries VALUES(?,?,?,?,?,?,?,?,?,?)').run(
+            query.id,query.authority,query.generation,query.input,query.vector,query.profile,query.retrieval_mode,query.resolved,query.progress,query.expires);
+        this.db.prepare(`INSERT INTO candidates SELECT ?,json_extract(value,'$.id'),json_extract(value,'$.data'),
+            json_extract(value,'$.base'),json_extract(value,'$.admitted'),json_extract(value,'$.emitted'),
+            json_extract(value,'$.project'),json_extract(value,'$.topic'),json_extract(value,'$.period'),json_extract(value,'$.source')
+            FROM json_each(?)`).run(query.id,candidates);
+        this.db.prepare("INSERT INTO seen SELECT ?,json_extract(value,'$.channel'),json_extract(value,'$.id') FROM json_each(?)").run(query.id,seen);
+        if(page)this.db.prepare('INSERT INTO pages VALUES(?,?,?,?,?)').run(page.q,page.n,page.ids,page.options,page.plan);
     }
     lookup(cursor: string) {
         const match = /^am4:([0-9a-f-]{36}):(\d+)$/.exec(cursor);
