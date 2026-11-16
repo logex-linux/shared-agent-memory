@@ -3,9 +3,12 @@
 import {readFile,writeFile,mkdir,cp,symlink,copyFile} from 'node:fs/promises';
 import {resolve,join} from 'node:path';import {pathToFileURL} from 'node:url';
 import {performance} from 'node:perf_hooks';import {createHash} from 'node:crypto';
-const [command,kernelArg='dist',sizeArg='100',outputArg='.local/retrieval-benchmark',corpusArg='.local/scale-benchmark']=process.argv.slice(2),output=resolve(outputArg),kernel=resolve(kernelArg),size=Number(sizeArg),corpus=resolve(corpusArg);
-await mkdir(output,{recursive:true});
+import {isolatedWorkspace,writeRunReport} from './artifacts.mjs';
+const work=await isolatedWorkspace('retrieval');
+const [command,kernelArg='dist',sizeArg='100',outputArg,corpusArg='.local/scale-benchmark']=process.argv.slice(2),kernel=resolve(kernelArg),size=Number(sizeArg),corpus=resolve(corpusArg);
 if(command==='freeze'){
+ const output=resolve(outputArg??'.local/retrieval-benchmark');
+ await mkdir(output,{recursive:true});
  const target=join(output,'baseline');await cp(kernel,join(target,'dist'),{recursive:true});await symlink(resolve('node_modules'),join(target,'node_modules'));
  const path=join(target,'dist/core/service.js'),code=await readFile(path,'utf8'),needle='rows.sort((a, b) =>';
  if(!code.includes(needle))throw Error('Expected 0.2.0 recall sort marker');
@@ -13,7 +16,7 @@ if(command==='freeze'){
  console.log(JSON.stringify({frozen:target,note:'Only a candidate counter was added to the disposable baseline.'}));process.exit(0);
 }
 if(command!=='measure')throw Error('Commands: freeze KERNEL SIZE OUTPUT; measure KERNEL SIZE OUTPUT [CORPUS]');
-const label=createHash('sha256').update(kernel).digest('hex').slice(0,8),database=join(output,`${label}-${size}.db`);
+const label=createHash('sha256').update(kernel).digest('hex').slice(0,8),database=join(work,'measure.db');
 await copyFile(join(corpus,size+'.db'),database);
 const {MemoryService}=await import(pathToFileURL(join(kernel,'core/service.js')).href);
 const config={database,model_dir:resolve('.local/models/bge-small-zh-v1.5'),allowed_projects:['12345678-1234-4234-8234-123456789abc'],allow_global:false,all_projects:false,operations:['recall'],semantic_threshold:0.425,evidence_threshold:0.575,dtype:'fp32',threads:2};
@@ -43,5 +46,6 @@ try{
  }
  const p=q=>samples.map(x=>x.ms).sort((a,b)=>a-b)[Math.ceil(samples.length*q)-1],mean=key=>samples.reduce((n,x)=>n+x[key],0)/samples.length;
  const report={size,samples:samples.length,kernel_label:label,protocol:'20 single-gold synthetic queries, 3 rounds, one warmup, core hybrid recall; includes optional observational counters, excludes cold start and MCP transport',p50_ms:p(.5),p95_ms:p(.95),recall_at_5:mean('hit'),mrr:mean('reciprocal_rank'),false_return_rate:samples.reduce((n,x)=>n+x.false_returned,0)/samples.reduce((n,x)=>n+x.returned,0),mean_full_bodies:mean('full_body_records'),mean_json_parses:mean('json_parses'),mean_record_json_parses:mean('record_json_parses'),mean_vector_rows:mean('vector_rows_returned'),mean_candidates:mean('candidate_ids'),mean_ranked_candidates:mean('candidates_ranked'),mean_response_bytes:mean('response_bytes'),mean_tokens:mean('estimated_tokens'),rss_bytes:process.memoryUsage().rss,max_rss_kib:process.resourceUsage().maxRSS,plan,measurements:samples};
- await writeFile(join(output,`${label}-${size}.json`),JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify({...report,measurements:undefined}));
+ await writeRunReport(work,report,{directory:outputArg,name:label+'-'+size+'.json'});
+ console.log(JSON.stringify({...report,measurements:undefined}));
 }finally{stats=null;JSON.parse=parse;service.close();}

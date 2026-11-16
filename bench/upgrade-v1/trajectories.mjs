@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash,randomUUID } from 'node:crypto';
-import { mkdtemp,realpath,writeFile } from 'node:fs/promises';
+import { mkdtemp } from 'node:fs/promises';
 import { join,resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { backup } from 'node:sqlite';
@@ -8,9 +8,10 @@ import { MemoryService } from '../../dist/core/service.js';
 import { BgeEncoder } from '../../dist/embedding/bge.js';
 import { fingerprint,tasks } from './tasks.mjs';
 
+import { isolatedWorkspace,reportDirectory,writeRunReport } from '../../scripts/artifacts.mjs';
+const root=await isolatedWorkspace('trajectories');
 const [output,baseline]=process.argv.slice(2);
 if(!output||!baseline)throw Error('Usage: trajectories.mjs EXISTING_OUTPUT_DIRECTORY BASELINE_DIST');
-const root=await mkdtemp(join(await realpath(output),'trajectories-'));
 const {MemoryService:Legacy}=await import(pathToFileURL(join(resolve(baseline),'core/service.js')));
 const options={model_dir:resolve('.local/models/bge-small-zh-v1.5'),dtype:'fp32',threads:2};
 const encoder=new BgeEncoder(options);
@@ -255,7 +256,8 @@ try {
     return [split,byCategory];
   });
   report.summary=Object.fromEntries(armsBySplit);
-  await writeFile(join(root,'report.json'),JSON.stringify(report,null,2),{mode:0o600});
-  console.log(JSON.stringify({root,raw_evidence_hash:report.raw_evidence_hash,held_out:report.summary.test,
+  const directory=await reportDirectory(output,'trajectories');
+  await writeRunReport(root,report,{directory});
+  console.log(JSON.stringify({root:directory,raw_evidence_hash:report.raw_evidence_hash,held_out:report.summary.test,
     learned:report.learned,derived:report.consolidated.length},null,2));
 } finally {for(const service of services.reverse())service.close();}

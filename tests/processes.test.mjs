@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir,writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { setup,record,publish,dropTemporalProjection } from './helpers.mjs';
 import { MemoryService } from '../dist/core/service.js';
-await mkdir('test-results',{recursive:true});
+import { writeRunReport } from '../scripts/artifacts.mjs';
+const report=(name,value)=>writeRunReport(process.env.SAM_TEST_WORKSPACE,value,{name,directory:process.env.SAM_TEST_REPORT_DIR});
 async function worker(config,operation,arg) {
   return new Promise((resolve,reject)=>{
     const child=spawn(process.execPath,['tests/process-worker.mjs',config,operation,arg]);let out='',err='';
@@ -19,7 +20,7 @@ test('four real processes publish 400 unique requests; retries preserve count an
   for(const r of responses)assert.equal(r.code,0,JSON.stringify(r));
   assert.equal(new Set(responses.flatMap(r=>r.result.ids)).size,400);
   const s=new MemoryService(config);
-  try{const count=s.db.prepare('SELECT count(*) n FROM memories').get().n;assert.equal(count,400);assert.equal(s.check().missing_vectors.n,0);assert.equal(s.check().orphan_vectors.n,0);await writeFile('test-results/concurrency.json',JSON.stringify({runtime:process.version,processes:responses.map(r=>r.result),count,unique_ids:new Set(responses.flatMap(r=>r.result.ids)).size,integrity:s.check()},null,2)+'\n');}finally{s.close();}
+  try{const count=s.db.prepare('SELECT count(*) n FROM memories').get().n;assert.equal(count,400);assert.equal(s.check().missing_vectors.n,0);assert.equal(s.check().orphan_vectors.n,0);await report('concurrency.json',{runtime:process.version,processes:responses.map(r=>r.result),count,unique_ids:new Set(responses.flatMap(r=>r.result.ids)).size,integrity:s.check()});}finally{s.close();}
 });
 test('two processes competing for same revision publish exactly once',async()=>{
   const {service:s,root,project,config}=await setup();
@@ -28,7 +29,7 @@ test('two processes competing for same revision publish exactly once',async()=>{
   s.close();const path=root+'/config.json';await writeFile(path,JSON.stringify(config));
   const results=await Promise.all(requests.map(p=>worker(path,'commit',p)));
   assert.equal(results.filter(r=>r.code===0).length,1);assert.equal(results.filter(r=>r.result?.error==='VERSION_CONFLICT').length,1);
-  await writeFile('test-results/revision-race.json',JSON.stringify({runtime:process.version,results:results.map(({code,result})=>({code,result}))},null,2)+'\n');
+  await report('revision-race.json',{runtime:process.version,results:results.map(({code,result})=>({code,result}))});
 });
 test('four clients concurrently migrate a legacy schema without losing records',async()=>{
   const {service:s,root,project,config}=await setup();const m=await publish(s,record(project));
@@ -49,5 +50,5 @@ test('ten SIGKILL interruption points leave no partial memory or orphan index',a
     const reopened=new MemoryService(config);
     try{const records=reopened.db.prepare('SELECT count(*) n FROM memories').get().n;assert.equal(records,0,point);const check=reopened.check();assert.equal(check.integrity[0].integrity_check,'ok',point);assert.equal(check.orphan_vectors.n,0,point);assert.equal(check.orphan_chunks.n,0,point);evidence.push({point,signal:result.signal,records,integrity:check});}finally{reopened.close();}
   }
-  await writeFile('test-results/fault-recovery.json',JSON.stringify({runtime:process.version,evidence},null,2)+'\n');
+  await report('fault-recovery.json',{runtime:process.version,evidence});
 });

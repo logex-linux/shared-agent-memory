@@ -1,11 +1,14 @@
 // Actual independent STDIO MCP servers, real local BGE; never deterministic encoders.
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
-import {mkdir,copyFile,writeFile} from 'node:fs/promises';
+import {copyFile,writeFile} from 'node:fs/promises';
 import {resolve,join} from 'node:path';import {execFileSync} from 'node:child_process';import {randomUUID} from 'node:crypto';import {pathToFileURL} from 'node:url';
 import {projects} from '../bench/adaptive/fixtures.mjs';
-const [kernelArg='dist',label='0.4.2',roundArg='30']=process.argv.slice(2),kernel=resolve(kernelArg),rounds=Number(roundArg),root=resolve(process.env.BENCH_OUTPUT??'.local/v042/real-'+label);
-await mkdir(root,{recursive:true});const database=join(root,'memory-'+Date.now()+'.db');await copyFile(resolve('.local/v041/eval/corpus.db'),database);
+import {isolatedWorkspace,writeRunReport} from './artifacts.mjs';
+const root=await isolatedWorkspace('real-mcp');
+const [kernelArg='dist',label='0.4.2',roundArg='30',corpusArg=process.env.BENCH_CORPUS??'.local/v041/eval/corpus.db']=process.argv.slice(2);
+const kernel=resolve(kernelArg),rounds=Number(roundArg),database=join(root,'memory.db');
+await copyFile(resolve(corpusArg),database);
 const base={database,model_dir:resolve('.local/models/bge-small-zh-v1.5'),allowed_projects:projects,allow_global:true,operations:['recall'],semantic_threshold:.425,evidence_threshold:.575,dtype:'fp32',threads:Number(process.env.BENCH_THREADS??2),query_ttl_seconds:1};
 const clients=[],observations=[],samples=[],events=[],probes=[],models=[];let peak=0;
 const timer=setInterval(()=>{const pids=clients.map(c=>c.transport.pid).filter(Boolean);if(!pids.length)return;try{const rows=execFileSync('/bin/ps',['-o','pid=,rss=,%cpu=','-p',pids.join(',')],{encoding:'utf8'}).trim().split('\n').map(x=>{const [pid,rss,cpu]=x.trim().split(/\s+/).map(Number);return {pid,rss_kib:rss,cpu_percent:cpu};});observations.push({ms:performance.now(),rows});peak=Math.max(peak,rows.reduce((n,r)=>n+r.rss_kib,0));}catch{}},100);
@@ -29,5 +32,7 @@ try{
  const dead=four[3].transport.pid;process.kill(dead,'SIGKILL');await Promise.all(four.slice(0,3).map(c=>call(c,'memory_recall',focused,'survive_sigkill')));
  const summary=Object.fromEntries([...new Set(samples.map(x=>x.scenario))].map(k=>{const a=samples.filter(x=>x.scenario===k),sorted=a.map(x=>x.ms).sort((a,b)=>a-b),avg=f=>a.reduce((n,x)=>n+(x[f]??0),0)/a.length;return [k,{requests:a.length,p50_ms:sorted[Math.ceil(a.length*.5)-1],p95_ms:sorted[Math.ceil(a.length*.95)-1],retries:avg('retries'),bodies:avg('bodies'),chunks:avg('chunks'),ranking_chunks:avg('ranking_chunks'),tokens:avg('tokens')}];}));
  const per_pid=Object.fromEntries([...new Set(observations.flatMap(x=>x.rows.map(r=>r.pid)))].map(pid=>{const rows=observations.flatMap(x=>x.rows.filter(r=>r.pid===pid));return [pid,{peak_rss_kib:Math.max(...rows.map(x=>x.rss_kib)),mean_cpu_percent:rows.reduce((n,x)=>n+x.cpu_percent,0)/rows.length}];}));
- const report={label,encoder:'real BGE fp32 CPU '+base.threads+' threads per MCP process',rounds,cold,coverage,summary,per_pid,aggregate_sampled_peak_rss_kib:peak,resource_sampling:observations.length?'ps RSS and lifetime CPU percentage sampled every 100ms; aggregate peaks are simultaneous samples':'unavailable',successes:samples.length,events,maintenance,expiredMaintenance,samples,observations,probes,snapshots,models,cleanupTimes};await writeFile(join(root,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({...report,samples:undefined,observations:undefined,probes:undefined,snapshots:undefined,models:undefined,cleanupTimes:undefined}));
+ const report={label,encoder:'real BGE fp32 CPU '+base.threads+' threads per MCP process',rounds,cold,coverage,summary,per_pid,aggregate_sampled_peak_rss_kib:peak,resource_sampling:observations.length?'ps RSS and lifetime CPU percentage sampled every 100ms; aggregate peaks are simultaneous samples':'unavailable',successes:samples.length,events,maintenance,expiredMaintenance,samples,observations,probes,snapshots,models,cleanupTimes};
+ await writeRunReport(root,report,{directory:process.env.BENCH_OUTPUT});
+ console.log(JSON.stringify({...report,samples:undefined,observations:undefined,probes:undefined,snapshots:undefined,models:undefined,cleanupTimes:undefined}));
 }finally{clearInterval(timer);await Promise.allSettled(clients.map(c=>c.client.close()));}

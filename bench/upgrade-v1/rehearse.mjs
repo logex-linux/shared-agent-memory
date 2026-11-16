@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash,randomUUID } from 'node:crypto';
-import { copyFile,mkdir,mkdtemp,readFile,realpath,writeFile } from 'node:fs/promises';
+import { copyFile,mkdir,readFile,writeFile } from 'node:fs/promises';
 import { dirname,join,resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync,backup } from 'node:sqlite';
@@ -11,11 +11,12 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { MemoryService } from '../../dist/core/service.js';
 import { BgeEncoder } from '../../dist/embedding/bge.js';
 import { SCHEMA_VERSION } from '../../dist/storage/database.js';
+import { isolatedWorkspace,reportDirectory,writeRunReport } from '../../scripts/artifacts.mjs';
 
+const root=await isolatedWorkspace('rehearsal');
 const [output,sourceFile,ledgerFile,legacyDist]=process.argv.slice(2);
 if(!output||!sourceFile||!ledgerFile||!legacyDist)
   throw Error('Usage: rehearse.mjs EXISTING_OUTPUT_DIRECTORY SOURCE_SCHEMA5_DB LATEST_REVOCATIONS_JSONL BASELINE_DIST');
-const root=await mkdtemp(join(await realpath(output),'rehearsal-'));
 const legacy=resolve(legacyDist),runtime=resolve('dist');
 const {MemoryService:Legacy}=await import(pathToFileURL(join(legacy,'core/service.js')));
 const {version}=JSON.parse(await readFile('package.json','utf8'));
@@ -27,7 +28,7 @@ const encoder=new BgeEncoder({model_dir,dtype:'fp32',threads:2});
 const base={model_dir,allowed_projects:[project],all_projects:true,allow_global:true,
   operations:['recall','propose','commit','forget','manage','verify'],connection_id:'isolated-v1-rehearsal'};
 const digest=value=>createHash('sha256').update(value).digest('hex');
-const report={root,source_open:'read-only',ledger_sha256:digest(ledger),ledger_entries:revocations.length,clients:[]};
+const report={source_open:'read-only',ledger_sha256:digest(ledger),ledger_entries:revocations.length,clients:[]};
 function open(path){
   const db=new DatabaseSync(path,{readOnly:true,allowExtension:true});
   sqliteVec.load(db);
@@ -193,6 +194,7 @@ for(const {name,definition} of await readLaunchers(generated)){
   await call(definition,version,original,true);
   report.clients.push({template:name,before,after,historical_revision:original.revision});
 }
-await writeFile(join(root,'report.json'),JSON.stringify(report,null,2),{mode:0o600});
-console.log(JSON.stringify({root,source_records:report.source_records,schema:report.reopen.schema,legacy_open:report.legacy_open,
+const directory=await reportDirectory(output,'rehearsal');
+const saved=await writeRunReport(root,{...report,root:directory},{directory});
+console.log(JSON.stringify({root:directory,report:saved,source_records:report.source_records,schema:report.reopen.schema,legacy_open:report.legacy_open,
   revocations:report.revocations,templates:report.clients.length,compatibility_fallback:report.compatibility_fallback},null,2));

@@ -1,24 +1,25 @@
-import {mkdtemp,copyFile,readFile,writeFile,realpath} from 'node:fs/promises';
+import {copyFile,readFile} from 'node:fs/promises';
 import {resolve,join,dirname} from 'node:path';
 import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 import {BgeEncoder} from '../../dist/embedding/bge.js';
+import {isolatedWorkspace,reportDirectory,writeRunReport} from '../../scripts/artifacts.mjs';
+const root=await isolatedWorkspace('phase-probe');
 const [output,corpus,baseline,modern='dist']=process.argv.slice(2);
 if(!output||!corpus||!baseline)throw Error('Usage: phase-probe.mjs OUTPUT CORPUS_DB BASELINE_DIST [CURRENT_DIST]');
-const root=await mkdtemp(join(await realpath(output),'phase-probe-'));
 const options={model_dir:resolve('.local/models/bge-small-zh-v1.5'),dtype:'fp32',threads:2,operations:['recall'],
   allowed_projects:['12345678-1234-4234-8234-123456789abc']};
 const encoder=new BgeEncoder(options),cases=JSON.parse(await readFile('bench/cases.json'));
 const services={};
-for(const [arm,kernel] of [['A',baseline],['B',modern]]){
- const database=join(root,arm+'.db');
- assert.equal(dirname(database),root);
- await copyFile(corpus,database);
- const {MemoryService}=await import(pathToFileURL(resolve(kernel,'core/service.js')));
- services[arm]=new MemoryService({...options,database},encoder);
-}
 const stats={A:[],B:[]};
 try{
+ for(const [arm,kernel] of [['A',baseline],['B',modern]]){
+  const database=join(root,arm+'.db');
+  assert.equal(dirname(database),root);
+  await copyFile(corpus,database);
+  const {MemoryService}=await import(pathToFileURL(resolve(kernel,'core/service.js')));
+  services[arm]=new MemoryService({...options,database},encoder);
+ }
  const input=c=>({query:c[2],debug:true,mode:'focused',view:'evidence',limit:5});
  for(const service of Object.values(services))await service.recall(input(cases[0]));
  for(let round=0;round<3;round++)for(const c of cases.slice(0,12)){
@@ -33,6 +34,7 @@ try{
  const summary=Object.fromEntries(Object.entries(stats).map(([arm,rows])=>[arm,Object.fromEntries(
    [...new Set(rows.flatMap(row=>Object.keys(row)))].map(stage=>[stage, [.5,.95].map(p=>quantile(rows.map(row=>row[stage]??0),p))])
  )]));
- await writeFile(join(root,'report.json'),JSON.stringify({summary,stats},null,2),{mode:0o600});
- console.log(JSON.stringify({root,summary},null,2));
+ const directory=await reportDirectory(output,'phase-probe');
+ await writeRunReport(root,{summary,stats},{directory});
+ console.log(JSON.stringify({root:directory,summary},null,2));
 }finally{Object.values(services).forEach(service=>service.close());}

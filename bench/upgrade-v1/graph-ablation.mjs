@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, realpath, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { MemoryService } from '../../dist/core/service.js';
 import { fingerprint, tasks } from './tasks.mjs';
+import { isolatedWorkspace,reportDirectory,writeRunReport } from '../../scripts/artifacts.mjs';
 
-if (!process.argv[2]) throw Error('Pass an existing output directory for a new isolated graph fixture.');
-const root = await mkdtemp(join(await realpath(process.argv[2]), 'graph-ablation-'));
+const root = await isolatedWorkspace('graph-ablation');
+if (!process.argv[2]) throw Error('Pass an output directory for the graph report.');
 const database = join(root, 'memory.db');
 const project = '7cb6c80a-1452-4d97-8f59-dfbd102b50da';
 const scenarios = tasks.filter(task => task.category === 'cross-event');
@@ -102,5 +102,6 @@ const summary={tasks:scenarios.length,held_out:heldOut.length,
   paired_delta:mean(deltas),ci95:[quantile(bootstrap,.025),quantile(bootstrap,.975)],
   improved:deltas.filter(delta => delta>0).length,regressed:deltas.filter(delta => delta<0).length};
 const report={fingerprint,summary,runs};
-await writeFile(join(root,'report.json'),JSON.stringify(report,null,2),{mode:0o600});
-console.log(JSON.stringify({root,summary,runs:runs.map(({round,byArm}) => ({round,byArm}))},null,2));
+const directory=await reportDirectory(process.argv[2],'graph-ablation');
+await writeRunReport(root,report,{directory});
+console.log(JSON.stringify({root:directory,summary,runs:runs.map(({round,byArm}) => ({round,byArm}))},null,2));

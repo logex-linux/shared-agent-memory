@@ -1,17 +1,18 @@
 import assert from 'node:assert/strict';
 import { createHash,randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdtemp,readFile,realpath,stat,writeFile,copyFile } from 'node:fs/promises';
+import { mkdtempDisposable,readFile,stat,writeFile,copyFile } from 'node:fs/promises';
 import { dirname,join,resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { MemoryService } from '../../dist/core/service.js';
 import { BgeEncoder } from '../../dist/embedding/bge.js';
+import { isolatedWorkspace,reportDirectory,writeRunReport } from '../../scripts/artifacts.mjs';
 
+const root=await isolatedWorkspace('scale-matrix');
 const [out,corpora,baseline,sizeFilter,clientFilter]=process.argv.slice(2);
 if(!out||!corpora||!baseline)throw Error('Usage: scale-matrix.mjs OUTPUT SCALE_CORPORA BASELINE_DIST [SIZE] [CLIENTS]');
-const root=await mkdtemp(join(await realpath(out),'scale-matrix-'));
 const kernels={A:resolve(baseline),B:resolve('dist'),C:resolve('dist')};
 const {MemoryService:Legacy}=await import(pathToFileURL(join(kernels.A,'core/service.js')));
 const model_dir=resolve('.local/models/bge-small-zh-v1.5');
@@ -40,12 +41,12 @@ const snapshotSize=async database=>Object.fromEntries(await Promise.all(
     catch(e){if(e.code!=='ENOENT')throw e;return [suffix||'canonical',0];}
   })));
 function open(Service,dbConfig,shared) {
-  assert.equal(dirname(dbConfig.database),root);
+  assert.equal(dirname(dirname(dbConfig.database)),root);
   return new Service(dbConfig,shared);
 }
-async function prepare(size,arm,count) {
+async function prepare(size,arm,directory) {
   const src=join(corpora,size+'.db');
-  const database=join(root,[size,count,arm].join('-')+'.db');
+  const database=join(directory,'memory.db');
   await copyFile(src,database);
   const dbConfig={...config,database,...(arm!=='A'&&{graph_enabled:arm==='C'})};
   const started=performance.now();
@@ -124,10 +125,11 @@ async function projectProbe(dbConfig) {
   }finally{trainer.close();reader.close();}
 }
 async function cell(size,count,arm){
-  const {dbConfig,prepare_ms}=await prepare(size,arm,count);
+  await using work=await mkdtempDisposable(join(root,'cell-'));
+  const {dbConfig,prepare_ms}=await prepare(size,arm,work.path);
   const {database}=dbConfig;
   const before=await snapshotSize(database);
-  const paths=Array.from({length:count},(_,i)=>join(root,[size,count,arm,i].join('-')+'.json'));
+  const paths=Array.from({length:count},(_,i)=>join(work.path,'client-'+i+'.json'));
   await Promise.all(paths.map(path=>writeFile(path,JSON.stringify(dbConfig),{mode:0o600})));
   const state={count,latest:new Map(),processes:{},peak:null};
   const clients=[];
@@ -200,6 +202,7 @@ async function cell(size,count,arm){
   return {size,clients:count,arm,prepare_ms,cold_ms:cold,summary,before,after,closed:await snapshotSize(database),
     processes:state.processes,concurrent_sampled_rss_bytes:state.peak,replay_trials:replayTrials,projection,samples,failures};
 }
+let directory;
 for(const size of sizes){
   const path=join(corpora,size+'.db');
   stats.corpora[size]={bytes:(await stat(path)).size,sha256:await digest(path)};
@@ -209,8 +212,9 @@ for(const size of sizes){
     for(const arm of fixedOrder??[...arms.slice(offset),...arms.slice(0,offset)]){
       const result=await cell(size,count,arm);
       stats.cells.push(result);
-      await writeFile(join(root,'report.json'),JSON.stringify(stats,null,2),{mode:0o600});
-      console.log(JSON.stringify({root,size,clients:count,arm,cold_ms:result.cold_ms,rounds:result.summary,
+      directory??=await reportDirectory(out,'scale-matrix');
+      await writeRunReport(root,stats,{directory});
+      console.log(JSON.stringify({root:directory,size,clients:count,arm,cold_ms:result.cold_ms,rounds:result.summary,
         projection:result.projection,concurrent_sampled_rss_bytes:result.concurrent_sampled_rss_bytes}));
     }
   }

@@ -1,17 +1,15 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isolatedWorkspace } from '../../scripts/artifacts.mjs';
 
+const root = await isolatedWorkspace('baseline-risks');
 const kernel = resolve(process.argv[2] ?? '.local/upgrade-v1/p0/baseline/dist');
 const { MemoryService } = await import(pathToFileURL(join(kernel, 'core/service.js')));
 const { factState } = await import(pathToFileURL(join(kernel, 'retrieval/evidence.js')));
-const temp = await realpath(tmpdir());
-const root = await mkdtemp(join(temp, 'sam-baseline-risks-'));
 const database = join(root, 'memory.db');
-assert.equal(dirname(root), temp);
 assert.equal(dirname(database), root);
 
 const project = randomUUID();
@@ -65,5 +63,4 @@ try {
   }));
 } finally {
   s.close();
-  await rm(root, {recursive:true, force:true});
 }

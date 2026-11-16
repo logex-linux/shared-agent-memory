@@ -8,7 +8,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test --test-concurrency=1 tests/*.test.mjs",
+    "test": "npm run build && node scripts/run-tests.mjs",
+    "artifacts:prune": "node scripts/artifacts.mjs",
     "start": "node dist/mcp/server.js",
     "cli": "node dist/cli/main.js",
     "setup": "node scripts/install-local.mjs",

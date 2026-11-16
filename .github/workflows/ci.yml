@@ -21,6 +21,12 @@ jobs:
       - run: npm ci
       - run: npm run model:download
       - run: npm test
+      - name: Verify the adaptive benchmark builds and measures a disposable corpus
+        run: |
+          node scripts/benchmark-adaptive.mjs build "$RUNNER_TEMP/sam-adaptive" dist
+          node scripts/benchmark-adaptive.mjs measure "$RUNNER_TEMP/sam-adaptive" dist
+          find "$RUNNER_TEMP/sam-adaptive" -type f -name '*.db*' | sort > "$RUNNER_TEMP/sam-adaptive-dbs"
+          test "$(cat "$RUNNER_TEMP/sam-adaptive-dbs")" = "$RUNNER_TEMP/sam-adaptive/corpus.db"
       - name: Verify generic installer and CLI
         run: |
           mkdir -p "$RUNNER_TEMP/work-project"
