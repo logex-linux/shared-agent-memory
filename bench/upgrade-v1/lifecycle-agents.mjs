@@ -20,6 +20,14 @@ const results=[];
 const names=['exception','injection','exclude','environment','project','draft','quarantine','readonly','conflict','permanent'];
 const requested=only?[only]:names;
 assert.ok(requested.every(name=>names.includes(name)));
+const resume=process.env.SAM_LIFECYCLE_RESUME;
+const previous=new Map();
+if(resume) {
+  const report=JSON.parse(await readFile(resolve(resume),'utf8'));
+  assert.equal(report.client,client);
+  for(const result of report.results)if(result.passed && result.code===0 && result.actual===result.expected &&
+    result.recalled && result.preserved && result.excluded)previous.set(result.round+'/'+result.name,result);
+}
 
 function run(work,config,prompt,tools) {
   const env={...process.env,SHARED_MEMORY_CONFIG:config,SHARED_MEMORY_NODE:process.execPath};
@@ -150,7 +158,10 @@ async function scenario(name,round) {
 }
 for(let round=1;round<=rounds;round++) {
   for(let offset=0;offset<requested.length;offset+=2) {
-    const batch=await Promise.all(requested.slice(offset,offset+2).map(name=>scenario(name,round)));
+    const batch=await Promise.all(requested.slice(offset,offset+2).map(name=>{
+      const passed=previous.get(round+'/'+name);
+      return passed?{...passed,reused:true}:scenario(name,round);
+    }));
     results.push(...batch);
     for(const {name,passed,...details} of batch)console.log(JSON.stringify({client,round,name,passed,...(!passed&&details)}));
   }
