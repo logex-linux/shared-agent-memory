@@ -13,6 +13,12 @@ const QUERY_TABLES = `
     CREATE TABLE IF NOT EXISTS pages(q TEXT NOT NULL,n INTEGER NOT NULL,ids TEXT NOT NULL,options TEXT NOT NULL,plan TEXT NOT NULL,PRIMARY KEY(q,n));
     CREATE UNIQUE INDEX IF NOT EXISTS page_feedback_receipt ON pages(json_extract(plan,'$.feedback.token'))
         WHERE json_extract(plan,'$.feedback.token') IS NOT NULL;`;
+const LEASE_TABLES = `
+    CREATE TABLE IF NOT EXISTS frontier_leases(
+      kind TEXT NOT NULL,id TEXT NOT NULL,authority TEXT NOT NULL,generation INTEGER NOT NULL,
+      payload TEXT NOT NULL,expires INTEGER NOT NULL,PRIMARY KEY(kind,id,authority));
+    CREATE INDEX IF NOT EXISTS frontier_lease_expiry ON frontier_leases(expires);`;
+type LeaseKind='admission'|'task';
 export function authority(config: Config, db: DatabaseSync) {
     return hash({ ranking: RANKING_VERSION, database: realpathSync(config.database), connection: config.connection_id, projects: [...config.allowed_projects].sort(), all: config.all_projects, global: config.allow_global, operations: [...config.operations].sort(), semantic: config.semantic_threshold, evidence: config.evidence_threshold, model: config.model_dir, dtype: config.dtype,
         ...(config.operations.includes('feedback')&&{feedback_policy:config.feedback_policy}),registry: db.prepare('SELECT id FROM projects ORDER BY id').all() });
@@ -24,7 +30,7 @@ export class QueryState {
     static open(main:DatabaseSync,config:Config){let state=this.instances.get(main);if(!state){state=new QueryState(config,realpathSync(config.database)+'.retrieval.db');state.pooled=true;this.instances.set(main,state);}state.constructorConfig=config;state.timing={wait_ms:0,held_ms:0,transactions:0};return state;}
     static workspace(config:Config){return new QueryState(config,':memory:');}
     static dispose(main:DatabaseSync){const state=this.instances.get(main);if(state){state.db.close();this.instances.delete(main);}}
-    cleanupIfExpired(){if(!this.db.prepare('SELECT 1 FROM queries WHERE expires<? LIMIT 1').get(Date.now()))return false;this.begin();try{this.cleanup();this.commit();return true;}catch(e){this.rollback();throw e;}}
+    cleanupIfExpired(){const now=Date.now();if(!this.db.prepare('SELECT 1 FROM queries WHERE expires<? UNION ALL SELECT 1 FROM frontier_leases WHERE expires<? LIMIT 1').get(now,now))return false;this.begin();try{this.cleanup();this.commit();return true;}catch(e){this.rollback();throw e;}}
 
     db: DatabaseSync;
     timing={wait_ms:0,held_ms:0,transactions:0};private heldAt=0;
@@ -43,7 +49,7 @@ export class QueryState {
     private initializeFile() {
         const {path,constructorConfig:config}=this;
         chmodSync(path, 0o600);
-        const initialize=()=>this.db.exec('PRAGMA busy_timeout=5000;PRAGMA journal_mode=WAL;PRAGMA secure_delete=ON;PRAGMA wal_autocheckpoint=256;PRAGMA journal_size_limit=1048576;'+QUERY_TABLES);
+        const initialize=()=>this.db.exec('PRAGMA busy_timeout=5000;PRAGMA journal_mode=WAL;PRAGMA secure_delete=ON;PRAGMA wal_autocheckpoint=256;PRAGMA journal_size_limit=1048576;'+QUERY_TABLES+LEASE_TABLES);
         const deadline=Date.now()+5000;for(;;){try{initialize();break;}catch(e:any){if(!/busy|locked/i.test(e.message)||Date.now()>=deadline)throw e;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}}
         // Additive migration of disposable state.
         const initialized=this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='cache_meta'").get();
@@ -85,6 +91,8 @@ export class QueryState {
     } }
     cleanup() {
         const started=performance.now(),now=Date.now();let remaining=this.constructorConfig.cache_cleanup_rows,deleted=0;
+        const leases=this.db.prepare('DELETE FROM frontier_leases WHERE rowid IN (SELECT rowid FROM frontier_leases WHERE expires<? LIMIT ?)').run(now,remaining);
+        remaining-=Number(leases.changes);deleted+=Number(leases.changes);
         // One small transaction, no VACUUM. Partial expiry keeps the query unresumable.
         for (const table of ['candidates', 'seen', 'pages']) {
             if(!remaining)break;
@@ -115,9 +123,35 @@ export class QueryState {
     diskBytes() {return ['', '-wal', '-shm'].reduce((n,suffix)=>{try{return n+statSync(this.path+suffix).size;}catch{return n;}},0);}
     inspect() {
         const now=Date.now(),counts=this.db.prepare('SELECT sum(expires>=?) active,sum(expires<?) expired FROM queries').get(now,now) as any;
-        return {active_queries:counts.active??0,expired_queries:counts.expired??0,disk_bytes:this.diskBytes(),logical_bytes:(this.db.prepare('SELECT coalesce(sum(bytes),0) n FROM cache_usage').get() as any).n,candidates:(this.db.prepare('SELECT count(*) n FROM candidates').get() as any).n,limits:{logical:this.constructorConfig.cache_max_bytes,query:this.constructorConfig.cache_query_max_bytes,allocated_database:this.constructorConfig.cache_disk_max_bytes},stats:Object.fromEntries((this.db.prepare('SELECT key,value FROM cache_meta').all() as any[]).map(r=>[r.key,r.value]))};
+        return {active_queries:counts.active??0,expired_queries:counts.expired??0,disk_bytes:this.diskBytes(),logical_bytes:(this.db.prepare('SELECT coalesce(sum(bytes),0) n FROM cache_usage').get() as any).n,candidates:(this.db.prepare('SELECT count(*) n FROM candidates').get() as any).n,frontier_leases:this.db.prepare('SELECT kind,count(*) count,sum(expires>=?) active FROM frontier_leases GROUP BY kind').all(now),limits:{logical:this.constructorConfig.cache_max_bytes,query:this.constructorConfig.cache_query_max_bytes,allocated_database:this.constructorConfig.cache_disk_max_bytes},stats:Object.fromEntries((this.db.prepare('SELECT key,value FROM cache_meta').all() as any[]).map(r=>[r.key,r.value]))};
     }
     checkpoint() {return this.db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get();}
+    lease(kind:LeaseKind,id:string,authority:string) {
+        return this.db.prepare('SELECT generation,payload,expires FROM frontier_leases WHERE kind=? AND id=? AND authority=? AND expires>?')
+            .get(kind,id,authority,Date.now()) as {generation:number;payload:string;expires:number}|undefined;
+    }
+    saveLease(kind:LeaseKind,id:string,authority:string,generation:number,payload:string,expires:number) {
+        this.begin();
+        try {
+            const current=this.lease(kind,id,authority);
+            if(current) {
+                if(current.payload!==payload)throw new MemoryError('TASK_OVERRIDE_EXISTS');
+                this.commit();
+                return current.expires;
+            }
+            this.cleanup();
+            const erased=this.db.prepare("SELECT value FROM cache_meta WHERE key='erased_before_generation'").get();
+            if(erased&&generation<Number(erased.value))throw new MemoryError('VIEW_STALE');
+            // Reserve a small, fixed share of the existing disposable store.
+            const usage=this.db.prepare('SELECT coalesce(sum(length(CAST(payload AS BLOB))+512),0) bytes,count(*) size FROM frontier_leases').get()!;
+            if(Number(usage.size)>=512 || Number(usage.bytes)+Buffer.byteLength(payload)+512>Math.min(this.constructorConfig.cache_max_bytes/4,524288) ||
+              this.diskBytes()>this.constructorConfig.cache_disk_max_bytes+2097152)
+                throw new MemoryError('FRONTIER_CACHE_CAPACITY');
+            this.db.prepare('INSERT OR REPLACE INTO frontier_leases VALUES(?,?,?,?,?,?)').run(kind,id,authority,generation,payload,expires);
+            this.commit();
+            return expires;
+        } catch(error) {this.rollback();throw error;}
+    }
     create(values: {
         authority: string;
         generation: number;
@@ -159,6 +193,7 @@ export class QueryState {
             for(const table of ['candidates','seen','pages'])this.db.prepare(`DELETE FROM ${table} WHERE q IN
                 (SELECT id FROM queries WHERE generation<?)`).run(generation);
             this.db.prepare('DELETE FROM queries WHERE generation<?').run(generation);
+            this.db.prepare('DELETE FROM frontier_leases WHERE generation<?').run(generation);
             this.db.exec('DELETE FROM cache_usage WHERE bytes=0');
             this.db.prepare(`INSERT INTO cache_meta VALUES('erased_before_generation',?)
                 ON CONFLICT(key) DO UPDATE SET value=max(value,excluded.value)`).run(generation);

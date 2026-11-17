@@ -13,7 +13,7 @@ test('official SDK STDIO: schemas, instructions, cross-process updates, restart,
   async function call(client,name,args){const result=await client.callTool({name,arguments:args});assert.ok(!result.isError,JSON.stringify(result));return JSON.parse(result.content[0].text);}
   try{
     const tools=(await a.listTools()).tools;
-    assert.equal(tools.length,7);assert.ok(a.getInstructions().includes(project));
+    assert.equal(tools.length,12);assert.ok(a.getInstructions().includes(project));
     assert.ok(!tools.find(t=>t.name==='memory_recall').inputSchema.required?.includes('project_id'));
     const p=await call(a,'memory_propose',{request_id:randomUUID(),record:record(project)});
     const m=await call(a,'memory_commit',{request_id:randomUUID(),proposal_id:p.proposal_id,expected_revision:0});
@@ -48,7 +48,7 @@ test('independent writer identities share revisions but cannot reuse each other\
  async function denied(c,input,code){const r=await c.callTool({name:'memory_recall',arguments:input});assert.ok(r.isError);assert.equal(JSON.parse(r.content[0].text).error.code,code);}
  let a=await connect('a');const b=await connect('b');
  try{
-  assert.deepEqual((await b.listTools()).tools.map(t=>t.name).sort(),['memory_commit','memory_propose','memory_recall','memory_renew_proposal','memory_resolve_project']);
+  assert.deepEqual((await b.listTools()).tools.map(t=>t.name).sort(),['memory_admission_preview','memory_browse','memory_commit','memory_explain','memory_inspect','memory_propose','memory_recall','memory_renew_proposal','memory_resolve_project','memory_task_override']);
   const input={query:'稳定代码签名与屏幕录制权限排错经验',mode:'broad',view:'evidence',limit:1};
   const first=await call(a,'memory_recall',input);assert.ok(first.has_more);
   const [next,replay]=await Promise.all([call(a,'memory_recall',{cursor:first.next_cursor}),call(a,'memory_recall',{cursor:first.next_cursor})]);assert.deepEqual(next.items,replay.items);assert.ok(next.items.every(i=>!first.items.some(j=>i.id===j.id)));

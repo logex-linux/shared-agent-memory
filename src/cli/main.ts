@@ -91,7 +91,13 @@ async function main() {
     switch(command) {
       case 'cache-inspect':return service.cache();
       case 'cache-maintenance':return service.cache(true);
-      case 'inspect':return await service.inspect();
+      case 'inspect':return flag('input')?await service.inspectMemory(await input()):service.inspect();
+      case 'browse':return service.browse(await input());
+      case 'explain':return service.explainMemory(await input());
+      case 'admission-preview':return await service.admissionPreview(await input());
+      case 'task-override':return service.taskOverride(await input());
+      case 'context-pack':return await service.contextPack(await input());
+      case 'classify':return service.classify(await input(),args.includes('--apply'));
       case 'check':return await service.check();
       case 'maintenance':return await service.maintenance();
       case 'reindex':return await service.reindex();

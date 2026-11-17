@@ -49,12 +49,12 @@ test('migration is atomic across interruption and racing opens, preserving Schem
   assert.equal(committed.signal,'SIGKILL',String(committed.stderr));
   const postCommit=new DatabaseSync(committedCopy,{readOnly:true,allowExtension:true});vec.load(postCommit);
   try {
-    assert.equal(postCommit.prepare('PRAGMA user_version').get().user_version,13);
+    assert.equal(postCommit.prepare('PRAGMA user_version').get().user_version,14);
     assert.equal(postCommit.prepare('SELECT count(*) n FROM memory_versions').get().n,1);
     assert.deepEqual(signature(postCommit),before);
   } finally {postCommit.close();}
   const runs=await Promise.all(Array.from({length:4},()=>inspectWorker(configPath)));
-  for(const run of runs){assert.equal(run.code,0,run.error);assert.equal(JSON.parse(run.output).schema,13);}
+  for(const run of runs){assert.equal(run.code,0,run.error);assert.equal(JSON.parse(run.output).schema,14);}
   const migrated=new MemoryService({...config,database:copy},fake);
   try {
     assert.deepEqual(signature(migrated.db),before);
@@ -85,7 +85,7 @@ test('Schema 11 compacts only current bodies and reuses chunk FTS for scoped dup
   s.close();
   const migrated=new MemoryService(config,fake);
   try {
-    assert.equal(migrated.storage.schema(),13);
+    assert.equal(migrated.storage.schema(),14);
     assert.equal(migrated.storage.generation(),gen);
     assert.deepEqual(ordered(migrated.db,'memory_version_bodies').map(({body_state,pruned_context,...row})=>row),before.map(row=>({...row})));
     assert.deepEqual(ordered(migrated.db,'version_dependencies').map(({parent_revision,...row})=>{

@@ -6,6 +6,7 @@ import { answerIntent, factState, focusTerms, evidenceWindow, referenceEvidence,
 import { prepared } from '../storage/statements.js';
 import { RetrievalProfile } from './profile.js';
 import { QueryState, authority } from './state.js';
+import { taskExclusions } from './task-override.js';
 import { extendedMetadata } from '../memory/versions.js';
 import { coversEffectiveTime, declaredFactState, decisionIntent, temporalPredicate } from '../memory/temporal.js';
 import { destination, graphBonus, graphEpoch, graphVersion, GraphReader, GRAPH_PAGE_WORK, GRAPH_SEEDS, readGraph, startGraph,
@@ -79,13 +80,21 @@ function validateIndex(db:DatabaseSync, snapshot:IndexSnapshot, profile:string, 
 // These describe the request, rather than its subject; they must not dominate IDF anchors.
 const salienceScaffolding=new Set(terms('用户 已 废弃 改用 决定 配置 入口 最近 排错 记录 相关 当前 已有 既有'));
 export const estimateTokens = (bytes: number) => Math.ceil(bytes / 3);
-function eligibility(db:DatabaseSync,input: RecallInput, config: Config, effectiveAt:string) {
+export function readScopePredicate(input: Pick<RecallInput,'project_id'|'include_global'|'exclude_ids'>,config:Config,taskIds?:string[]) {
     const params: SQLInputValue[] = [Number(!input.project_id && config.all_projects), JSON.stringify(input.project_id ? [input.project_id] : config.allowed_projects), Number(input.include_global ?? (!input.project_id && config.allow_global))];
     let sql = "s.status='active' AND ((s.scope='project' AND s.project_id IN (SELECT p.id FROM projects p WHERE ?=1 OR p.id IN (SELECT value FROM json_each(?)))) OR (?=1 AND s.scope='global'))";
     if(input.exclude_ids?.length) {
         sql+=' AND s.memory_id NOT IN (SELECT value FROM json_each(?))';
         params.push(JSON.stringify(input.exclude_ids));
     }
+    if(taskIds?.length) {
+        sql+=' AND s.memory_id NOT IN (SELECT value FROM json_each(?))';
+        params.push(JSON.stringify(taskIds));
+    }
+    return {sql,params};
+}
+export function eligibility(db:DatabaseSync,input: RecallInput, config: Config, effectiveAt:string,taskIds?:string[]) {
+    let {sql,params}=readScopePredicate(input,config,taskIds);
     if (input.versions) return {sql,params};
     for(const key of ['subject_id','context_key'] as const)if(input[key]!==undefined) {
         sql+=` AND s.${key}=?`;
@@ -200,7 +209,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             progress = parse(found.row.progress);
             effectiveAt=progress.effectiveAt??input.as_of??effectiveAt;
             warnings = progress.warnings;
-            for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state', 'graph','subject_id','context_key'] as const)
+            for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state', 'graph','subject_id','context_key','task_id'] as const)
                 if (request[key] !== undefined && request[key] !== input[key])
                     throw new MemoryError('CURSOR_QUERY_MISMATCH');
             if(request.exclude_ids!==undefined && hash(request.exclude_ids)!==hash(input.exclude_ids??[]))
@@ -210,7 +219,10 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         // Freeze expiry after query encoding; all channels and materialization share this snapshot.
         const candidateStarted=performance.now();db.exec('BEGIN');
-        const gen = ctx.generation(), auth = authority(config, db), eligible = eligibility(db,input,config,effectiveAt);
+        const gen = ctx.generation(), auth = authority(config, db);
+        const overlay=input.task_id?taskExclusions(ctx.db,config,gen,input.task_id):undefined;
+        if(request.cursor && overlay?.binding!==progress.task_binding)throw new MemoryError('CURSOR_TASK_CHANGED');
+        const eligible = eligibility(db,input,config,effectiveAt,overlay?.ids);
         const snapshot=expansion?undefined:indexSnapshot(ctx.db,db,gen);
         if(!expansion && !request.cursor) {
             ctx.checkpoint?.('recall:read_snapshot');
@@ -242,6 +254,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 progress.idDone = !identifiers(input.query!).length || (channel === 'vector' && !input.exact_only && retrievalMode !== 'lexical_degraded');
                 progress.warnings = warnings;
                 progress.effectiveAt=effectiveAt;
+                if(overlay)progress.task_binding=overlay.binding;
                 if(input.graph) {
                     if(graphFallback)progress.graphReason=graphFallback;
                     else if(!config.graph_enabled)progress.graphReason='GRAPH_DISABLED';

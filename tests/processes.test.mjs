@@ -37,7 +37,7 @@ test('four clients concurrently migrate a legacy schema without losing records',
   s.db.exec('DROP TRIGGER version_dependency_insert; DROP TABLE version_dependencies; DROP TABLE revoked_aliases; DROP INDEX version_content_hash; DROP TABLE association_edges; DROP TABLE projection_jobs; DROP TABLE learning_events; DELETE FROM meta WHERE key=\'learning_watermark\'; DROP INDEX tombstones_hash; DELETE FROM meta WHERE key=\'graph_epoch\'; DROP TABLE memory_relations; DROP TABLE proposal_transitions; DROP TRIGGER version_insert; DROP TRIGGER version_advance; DROP TABLE memory_versions; DROP TABLE revoked_version_hashes; ALTER TABLE memories DROP COLUMN written_by; ALTER TABLE proposals DROP COLUMN connection_id; ALTER TABLE events DROP COLUMN connection_id; PRAGMA user_version=3;');s.close();
   const path=root+'/config.json';await writeFile(path,JSON.stringify(config));
   const results=await Promise.all([0,1,2,3].map(()=>worker(path,'inspect','unused')));
-  for(const result of results){assert.equal(result.code,0,result.stderr);assert.equal(result.result.schema,13);}
+  for(const result of results){assert.equal(result.code,0,result.stderr);assert.equal(result.result.schema,14);}
   const check=new MemoryService(config);try{assert.equal((await check.recall({ids:[m.memory_id]})).items.length,1);assert.equal(check.check().missing_vectors.n,0);}finally{check.close();}
 });
 test('ten SIGKILL interruption points leave no partial memory or orphan index',async()=>{

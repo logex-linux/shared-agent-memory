@@ -6,7 +6,16 @@ import { MemoryService } from '../dist/core/service.js';
 import { after } from 'node:test';
 export const MODEL=resolve('.local/models/bge-small-zh-v1.5');
 const removeFixture=path=>rm(path,{recursive:true,force:true,maxRetries:3});
+export function restoreSchema13Storage(db) {
+  db.exec(`DROP VIEW subject_claims;
+    DROP TRIGGER claim_projection_invalidate;
+    DROP INDEX history_subject;
+    DROP TABLE claim_projection;
+    ALTER TABLE proposals DROP COLUMN admission_id;
+    PRAGMA user_version=13;`);
+}
 export function restoreSchema11Storage(db) {
+  restoreSchema13Storage(db);
   db.exec(`DROP TRIGGER current_rule_insert;
     DROP TRIGGER current_rule_update;
     DROP INDEX search_current_rules;

@@ -101,6 +101,7 @@ export const consolidationPreviewSchema=z.object({
   context:validSchema.omit({expires_at:true}).default({}),evidence:consolidationSchema
 }).strict();
 export const proposeSchema = z.object({ request_id: request, record: recordSchema,
+  admission_id:z.string().uuid().optional().describe('Optional current admission receipt for this exact proposed write.'),
   target_id: z.string().uuid().optional(), expected_revision: z.number().int().positive().optional().describe('Updates only: current positive revision, together with target_id. For a new proposal omit both fields; revision 0 belongs to memory_commit.'),
   work_directory: z.string().startsWith('/').max(4096).optional().describe('Actual working directory for a project write. Resolve it first with memory_resolve_project.'),
   transition:z.enum(['new','reinforce','supersede','branch','quarantine']).optional(),
@@ -144,6 +145,7 @@ export const recallSchema = z.object({
   query: text(512).optional(), ids: z.array(z.string().uuid()).min(1).max(10).optional(),
   versions:z.array(versionRefSchema).min(1).max(10).optional(),
   exclude_ids:z.array(z.string().uuid()).max(64).optional().describe('Task-local exclusions. Applies before candidate selection and to exact reads. A continuation keeps its original exclusions.'),
+  task_id:z.string().uuid().optional().describe('Bound task exclusions created from the current request. Continue using the same task ID for all reads.'),
   subject_id:text(256).optional(), context_key:text(256).optional(),
   graph:z.boolean().optional(),
   as_of:z.string().datetime().optional(), include_history:z.boolean().optional(), decision_state:decisionStateSchema.optional(),
@@ -188,6 +190,7 @@ export const configSchema = z.object({
   cache_cleanup_rows:z.number().int().min(1).max(4096).default(256),
   diagnostics:z.boolean().default(false),
   graph_enabled:z.boolean().default(false),
+  context_pack_enabled:z.boolean().default(false),
   learned_graph_enabled:z.boolean().default(false),
   feedback_policy:z.enum(['observe','trusted_outcomes']).default('observe')
 }).strict();

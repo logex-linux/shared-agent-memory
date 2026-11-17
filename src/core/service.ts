@@ -6,6 +6,8 @@ import { Storage } from '../storage/database.js';
 import { indexChunk } from '../retrieval/indexes.js';
 import { QueryState, authority } from '../retrieval/state.js';
 import { retrieve } from '../retrieval/recall.js';
+import { startTaskOverride,taskExclusions } from '../retrieval/task-override.js';
+import { packEvidence } from '../retrieval/context-pack.js';
 import { BgeEncoder } from '../embedding/bge.js';
 import { ftsQuery, terms, identifiers } from '../retrieval/lexical.js';
 import { recordHash } from '../memory/versions.js';
@@ -16,19 +18,26 @@ import { projectFeedback, recordFeedback } from '../memory/feedback.js';
 import { erasureTree, revokeVersions } from '../memory/erasure.js';
 import { previewConsolidation } from '../memory/consolidation.js';
 import { checkCurrentRule, checkDuplicate, sameMemoryMaterial } from '../memory/writes.js';
+import { ADMISSION_POLICY,admissionDecision,admissionDigest,checkAdmission } from '../memory/admission.js';
+import { browseCatalog,catalogRoute,explainVisibility } from '../memory/catalog.js';
+import { validateSubjectAliases, type AnchoredClaim } from '../memory/subjects.js';
+import { sourceStatus } from '../memory/source-status.js';
 import { managedExports, ownershipAdvances, ownershipImpact, relatedProposals, sameOwnership } from '../memory/ownership.js';
 import { appendAction, currentMaintenance, maintenancePath, parseMaintenance, prefixOf, readMaintenance, readRevocations,
   revocationSubset, revocationsPath, syncMaintenance, type MaintenanceLedger, type RecoveryAction } from '../memory/recovery.js';
 import { cutoff, expires, pinned, pruneBody, retainedSourceKeys, versionCandidate } from '../memory/retention.js';
 import { MemoryError, applicability, hash, stable, configSchema, proposeSchema, recallSchema, commitSchema, forgetSchema, feedbackSchema,
   recordSchema, consolidationPreviewSchema, forgetPreviewSchema, projectAliasesSchema, reassignSchema,retentionSchema,proposalRenewSchema,
-  type Config, type Encoder, type MemoryRecord, type Chunk, type Ownership } from './contracts.js';
+  type Config, type Encoder, type MemoryRecord, type Chunk, type Ownership, type ProposeInput } from './contracts.js';
+import { admissionSchema,browseSchema,classifySchema,contextPackSchema,inspectMemorySchema,taskOverrideSchema,type ViewScope } from './frontier-contracts.js';
 
 type Row=Ownership&{id:string;body:string;revision:number;status:string;created_at:string;verified_at:string;profile_id:string;content_hash:string;import_key:string|null;written_by:string};
 type Project={id:string;name:string;aliases:string};
 const now=()=>new Date().toISOString();
 const blob=(v:Float32Array)=>Buffer.from(v.buffer,v.byteOffset,v.byteLength);
 const versionHead=(row:Row)=>({memory_id:row.id,revision:row.revision,content_hash:row.content_hash});
+const transitionPlan=(input:ProposeInput):TransitionPlan|undefined=>input.transition||input.expected_refs||input.relations
+  ? {transition:input.transition,expected_refs:input.expected_refs,relations:input.relations,version_evolution:input.version_evolution}:undefined;
 
 export async function readConfig(path:string):Promise<Config> {
   const raw=JSON.parse(await readFile(path,'utf8'));
@@ -192,7 +201,7 @@ export class MemoryService {
       this.db.prepare("UPDATE exports SET status='pending_cleanup' WHERE id=?").run(e.id);
   }
   private clearProposal(id:string,status:string) {
-    this.db.prepare("UPDATE proposals SET body=NULL,work_directory=NULL,status=? WHERE id=? AND status='pending'").run(status,id);
+    this.db.prepare("UPDATE proposals SET body=NULL,work_directory=NULL,admission_id=NULL,status=? WHERE id=? AND status='pending'").run(status,id);
     this.db.prepare('DELETE FROM proposal_transitions WHERE proposal_id=?').run(id);
     this.db.prepare('DELETE FROM import_targets WHERE proposal_id=?').run(id);
   }
@@ -337,7 +346,7 @@ export class MemoryService {
        hash(record.valid_time??null)!==hash(('valid_time' in candidate?candidate.valid_time:null)??null))
       throw new MemoryError('CONSOLIDATION_EVIDENCE_CHANGED');
   }
-  private transitionTargets(record:MemoryRecord,plan:TransitionPlan|undefined,source?:string) {
+  private transitionTargets(record:MemoryRecord,plan:TransitionPlan|undefined,source?:string,preview=false) {
     const targets=new Map<string,Row>();
     if(plan?.version_evolution) {
       this.sourceCheck({...record,sources:plan.version_evolution.sources});
@@ -352,7 +361,7 @@ export class MemoryService {
       const identity=this.legacyIdentity(record,plan);
       validateTransition(record,{...previous,subject_id:previous.subject_id??identity?.subject_id,
         context_key:previous.context_key??identity?.context_key},plan?.transition,plan?.version_evolution);
-      if(plan?.transition==='supersede' && previous.verification.status==='verified')this.permission('verify');
+      if(!preview&&plan?.transition==='supersede' && previous.verification.status==='verified')this.permission('verify');
       targets.set(row.id,row);
     }
     const seen=new Set<string>();
@@ -380,41 +389,173 @@ export class MemoryService {
     const row=this.db.prepare('SELECT plan FROM proposal_transitions WHERE proposal_id=?').get(id);
     return row?String(row.plan):null;
   }
+  private prepareRevision(input:ProposeInput,supplied:object,plan:TransitionPlan|undefined,preview=false) {
+    if(!input.target_id)return;
+    const {record}=input,target=this.find(input.target_id);
+    if(target.status!=='active'||target.revision!==input.expected_revision)throw new MemoryError('VERSION_CONFLICT');
+    if(!sameOwnership(target,record))throw new MemoryError('SCOPE_IMMUTABLE');
+    const previous=JSON.parse(target.body) as MemoryRecord;
+    for(const key of ['tags','valid_for','derived_from','import_key','memory_form','episode','valid_time','decision_state','lifecycle','subject_id','context_key','consolidation'] as const) {
+      if(!Object.hasOwn(supplied,key)&&previous[key]!==undefined)(record as any)[key]=previous[key];
+    }
+    if(previous.lifecycle==='historical'&&record.lifecycle==='current')throw new MemoryError('HISTORICAL_REACTIVATION');
+    if(plan?.transition==='supersede') {
+      if((previous.lifecycle??'current')!=='current')throw new MemoryError('TRANSITION_LIFECYCLE_CONFLICT');
+      if(!preview&&previous.verification.status==='verified')this.permission('verify');
+      if(previous.subject_id&&previous.subject_id!==record.subject_id || previous.context_key&&previous.context_key!==record.context_key ||
+        (['branch','environment','commit'] as const).some(key=>previous.valid_for[key]&&previous.valid_for[key]!==record.valid_for[key]))
+        throw new MemoryError('TRANSITION_SUCCESSOR_IDENTITY');
+    }
+    if(record.consolidation&&!previous.consolidation)throw new MemoryError('CONSOLIDATION_REQUIRES_NEW_RECORD');
+    return previous;
+  }
+  async admissionPreview(raw:unknown) {
+    this.permission('recall');
+    const {candidate,intent,suggestions}=admissionSchema.parse(raw),{record}=candidate;
+    this.scope(record.project_id,record.scope);
+    this.sourceCheck(record);
+    const supplied=(raw as {candidate:{record:object}}).candidate.record,digest=admissionDigest(candidate,supplied);
+    const before=this.storage.generation();
+    const analogues=suggestions&&!['progress','receipt','temporary'].includes(intent)
+      ? await this.recall({query:(record.title+' '+record.content).slice(0,512),project_id:record.project_id??undefined,
+        include_global:record.scope==='global',context:{branch:record.valid_for.branch,commit:record.valid_for.commit,environment:record.valid_for.environment},
+        view:'evidence',limit:6}) : undefined;
+    return this.snapshot(()=>{
+      const generation=this.storage.generation(),plan=transitionPlan(candidate);
+      const previous=this.prepareRevision(candidate,supplied,plan,true);
+      const decision=admissionDecision(this.db,candidate,record,intent,previous);
+      const comparable=analogues?.generation===before&&before===generation
+        ? analogues.items.filter((item:any)=>sameOwnership(item,record))
+          .map((item:any)=>({memory_id:item.id,revision:item.revision,evidence_strength:item.evidence_strength})):undefined;
+      const {ready,...details}=decision;
+      const result={...details,generation,policy:ADMISSION_POLICY,advisory:true,
+        ...(analogues&&{suggestions:comparable??[],suggestion_mode:comparable&&analogues.retrieval_mode})};
+      if(!ready)return result;
+      const targets=this.transitionTargets(record,plan,candidate.target_id,true);
+      this.validateConsolidation(record,plan);
+      this.dependencies(record,candidate.target_id);
+      if(this.isRevoked(candidate.target_id??'',record.import_key,[recordHash(record)],record.sources))throw new MemoryError('REVOKED_IMPORT');
+      checkCurrentRule(this.db,record,[...(candidate.target_id?[candidate.target_id]:[]),
+        ...(plan?.transition==='supersede'?[...targets.keys()]:[])],previous);
+      const required_operations:Config['operations']=['propose','commit'];
+      if(record.verification.status==='verified'||plan?.transition==='supersede'&&
+        (previous?.verification.status==='verified'||[...targets.values()].some(r=>JSON.parse(r.body).verification.status==='verified')))
+        required_operations.push('verify');
+      const blockers=required_operations.filter(op=>!this.config.operations.includes(op)).map(op=>'OPERATION_DENIED:'+op);
+      if(this.config.require_work_directory&&record.scope==='project'&&!candidate.target_id&&!candidate.work_directory&&
+        !this.config.operations.includes('manage'))blockers.push('WORK_DIRECTORY_REQUIRED');
+      this.checkWorkDirectory(record,candidate.work_directory);
+      if(blockers.length)return {...result,required_operations,blockers};
+      const refs=[...(candidate.target_id?[{memory_id:candidate.target_id,revision:candidate.expected_revision!}]:[]),
+        ...candidate.expected_refs??[],...record.derived_from,...decision.related];
+      const admission_id=randomUUID(),state=QueryState.open(this.db,this.config);
+      const until=state.saveLease('admission',admission_id,authority(this.config,this.db),generation,
+        JSON.stringify({policy:ADMISSION_POLICY,digest,refs}),Date.now()+600_000);
+      return {...result,required_operations,admission_id,expires_at:new Date(until).toISOString()};
+    });
+  }
+  taskOverride(raw:unknown) {
+    this.permission('recall');
+    const input=taskOverrideSchema.parse(raw);
+    for(const exclusion of input.exclude_subjects)this.scope(exclusion.owner.project_id,exclusion.owner.scope);
+    return this.snapshot(()=>startTaskOverride(this.db,this.config,this.storage.generation(),input.task_id,
+      {ids:input.exclude_ids.map(id=>id.toLowerCase()),subjects:input.exclude_subjects},input.ttl_seconds));
+  }
+  private validateAdmission(id:string,digest?:string) {
+    return checkAdmission(this.db,QueryState.open(this.db,this.config),this.config,this.storage.generation(),id,digest);
+  }
+  private validateViewScope(input:Pick<ViewScope,'project_id'|'include_global'>) {
+    if(input.project_id)this.scope(input.project_id,'project');
+    if(input.include_global??(!input.project_id&&this.config.allow_global))this.scope(null,'global');
+  }
+  browse(raw:unknown) {
+    this.permission('recall');
+    const input=browseSchema.parse(raw),route=catalogRoute(input.uri);
+    if(input.exclude_ids)input.exclude_ids=[...new Set(input.exclude_ids.map(id=>id.toLowerCase()))].sort();
+    if(route.global&&(input.project_id||input.include_global===false)||
+      route.project_id&&(input.project_id&&input.project_id!==route.project_id||input.include_global===true))
+      throw new MemoryError('CATALOG_SCOPE_MISMATCH');
+    this.validateViewScope(route.global?{include_global:true}:route.project_id?{project_id:route.project_id}:input);
+    return this.snapshot(()=>browseCatalog(this.db,this.config,this.storage.generation(),input,route));
+  }
+  async inspectMemory(raw:unknown) {
+    const {memory_id,revision,...scope}=inspectMemorySchema.parse(raw);
+    return this.recall({...scope,...(revision?{versions:[{memory_id,revision}]}:{ids:[memory_id]})});
+  }
+  async contextPack(raw:unknown) {
+    this.permission('recall');
+    if(!this.config.context_pack_enabled)throw new MemoryError('CONTEXT_PACK_DISABLED');
+    const {read,needed}=contextPackSchema.parse(raw);
+    if(!needed)return {pack:'deterministic-v1',evidence_status:'not_needed',items:[]};
+    const input={...read!,view:read!.view??'evidence' as const};
+    const page=await this.recall(input);
+    return this.snapshot(()=>{
+      if(page.generation!==this.storage.generation())throw new MemoryError('VIEW_STALE');
+      if(input.task_id)taskExclusions(this.db,this.config,page.generation,input.task_id);
+      return packEvidence(this.db,this.config,input,page);
+    });
+  }
+  explainMemory(raw:unknown) {
+    this.permission('recall');
+    const input=inspectMemorySchema.parse(raw);
+    if(input.exclude_ids)input.exclude_ids=input.exclude_ids.map(id=>id.toLowerCase());
+    this.validateViewScope(input);
+    return this.snapshot(()=>explainVisibility(this.db,this.config,this.storage.generation(),input));
+  }
+  classify(raw:unknown,apply=false) {
+    this.permission('manage');
+    const {plan_hash,records}=classifySchema.parse(raw);
+    const project=()=>{
+      const changed:AnchoredClaim[]=[];
+      const audited=records.map(ref=>{
+        const row=this.find(ref.memory_id);
+        if(row.revision!==ref.revision||row.status!=='active')throw new MemoryError('VERSION_CONFLICT');
+        const {project_id,scope,content_hash}=row;
+        const old=this.db.prepare('SELECT subject_id,context_key,aliases,start,end FROM claim_projection WHERE memory_id=?').get(ref.memory_id);
+        const before=old?{...old,aliases:JSON.parse(String(old.aliases))}:null;
+        if('remove' in ref)return {...ref,project_id,scope,content_hash,before};
+        const record=JSON.parse(row.body) as MemoryRecord;
+        if((record.lifecycle??'current')!=='current')throw new MemoryError('PROJECTION_REQUIRES_CURRENT');
+        if(record.subject_id&&record.subject_id!==ref.subject_id||record.context_key&&record.context_key!==ref.context_key)
+          throw new MemoryError('PROJECTION_CANONICAL_IDENTITY');
+        if(ref.end>record.content.length||/[\uDC00-\uDFFF]/.test(record.content[ref.start]??'')||
+          /[\uD800-\uDBFF]/.test(record.content[ref.end-1]??''))throw new MemoryError('PROJECTION_SPAN_INVALID');
+        const change={...ref,project_id,scope,content_hash,kind:record.kind,decision_state:record.decision_state,environment:record.valid_for?.environment};
+        changed.push(change);
+        return {...change,before,valid_time:record.valid_time,valid_for:record.valid_for,
+          span:record.content.slice(ref.start,ref.end),sources:record.sources.map(sourceStatus)};
+      });
+      const ids=records.map(ref=>ref.memory_id);
+      validateSubjectAliases(this.db,changed,ids);
+      const digest=this.planHash('classify',records,audited);
+      if(!apply)return {records:audited,generation:this.storage.generation(),plan_hash:digest,dry_run:true};
+      if(plan_hash!==digest)throw new MemoryError(plan_hash?'PLAN_STALE':'PLAN_REQUIRED');
+      const counts={attached:0,removed:0};
+      const del=this.db.prepare('DELETE FROM claim_projection WHERE memory_id=?');
+      for(const ref of records)counts.removed+=Number(del.run(ref.memory_id).changes);
+      const insert=this.db.prepare('INSERT INTO claim_projection VALUES(?,?,?,?,?,?,?,?)');
+      for(const ref of changed){
+        insert.run(ref.memory_id,ref.revision,ref.content_hash,ref.subject_id,ref.context_key,JSON.stringify(ref.aliases),ref.start,ref.end);
+        counts.attached++;
+      }
+      return {...counts,generation:counts.attached||counts.removed?this.storage.advance():this.storage.generation(),dry_run:false};
+    };
+    return apply?this.storage.transaction(project):this.snapshot(project);
+  }
   async propose(raw:unknown,importTarget?:{id:string;revision:number}) {
     this.permission('propose');
     if(importTarget)this.permission('manage');
     const input=proposeSchema.parse(raw),record=input.record;
     const fingerprint={...input,record:{...record}};
-    const plan:TransitionPlan|undefined=input.transition||input.expected_refs||input.relations
-      ? {transition:input.transition,expected_refs:input.expected_refs,relations:input.relations,version_evolution:input.version_evolution}:undefined;
+    const plan=transitionPlan(input),supplied=(raw as {record:object}).record;
     this.scope(record.project_id,record.scope); this.sourceCheck(record);
     return this.storage.transaction(()=>{
       const retry=this.event(input.request_id,'propose',fingerprint); if(retry)return retry;
+      const admissionExpires=input.admission_id?this.validateAdmission(input.admission_id,admissionDigest(input,supplied)):undefined;
       if(this.config.require_work_directory && record.scope==='project'&&!input.target_id&&!input.work_directory&&
         !this.config.operations.includes('manage'))throw new MemoryError('WORK_DIRECTORY_REQUIRED');
       this.checkWorkDirectory(record,input.work_directory);
-      let previous:MemoryRecord|undefined;
-      if(input.target_id) {
-        const target=this.find(input.target_id);
-        if(target.status!=='active' || target.revision!==input.expected_revision)throw new MemoryError('VERSION_CONFLICT');
-        if(target.scope!==record.scope || target.project_id!==record.project_id)throw new MemoryError('SCOPE_IMMUTABLE');
-        previous=JSON.parse(target.body) as MemoryRecord;
-        const supplied=(raw as any).record;
-        for(const key of ['tags','valid_for','derived_from','import_key','memory_form','episode','valid_time','decision_state','lifecycle','subject_id','context_key','consolidation'] as const) {
-          if(!Object.hasOwn(supplied,key) && previous[key]!==undefined)(record as any)[key]=previous[key];
-        }
-        if(previous.lifecycle==='historical'&&record.lifecycle==='current')
-          throw new MemoryError('HISTORICAL_REACTIVATION');
-        if(plan?.transition==='supersede') {
-          if((previous.lifecycle??'current')!=='current')throw new MemoryError('TRANSITION_LIFECYCLE_CONFLICT');
-          if(previous.verification.status==='verified')this.permission('verify');
-          if(previous.subject_id && previous.subject_id!==record.subject_id ||
-            previous.context_key && previous.context_key!==record.context_key ||
-            (['branch','environment','commit'] as const).some(key=>previous!.valid_for[key] && previous!.valid_for[key]!==record.valid_for[key]))
-            throw new MemoryError('TRANSITION_SUCCESSOR_IDENTITY');
-        }
-        if(record.consolidation&&!previous.consolidation)throw new MemoryError('CONSOLIDATION_REQUIRES_NEW_RECORD');
-      }
+      const previous=this.prepareRevision(input,supplied,plan);
       if(record.verification.status==='verified'){
         this.permission('verify');
         if(['source_claim','model_inference'].includes(record.verification.basis) || !record.verification.evidence)throw new MemoryError('VERIFICATION_EVIDENCE_REQUIRED');
@@ -446,9 +587,10 @@ export class MemoryService {
       const words=new Set(terms(record.title+' '+record.content));
       const similar=candidates.map(x=>({memory_id:x.id,revision:x.revision,overlap:terms(JSON.parse(x.body).title+' '+JSON.parse(x.body).content).filter(w=>words.has(w)).length})).filter(x=>x.overlap>=3).sort((a,b)=>b.overlap-a.overlap).slice(0,5);
       const id=randomUUID();
-      const expires_at=expires(this.config.retention.proposal_days);
-      this.db.prepare(`INSERT INTO proposals(id,project_id,scope,body,target_id,expected_revision,status,created_at,connection_id,work_directory,expires_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(id,record.project_id,record.scope,JSON.stringify(record),input.target_id??null,input.expected_revision??0,'pending',now(),this.config.connection_id,input.work_directory??null,expires_at);
+      const regular=expires(this.config.retention.proposal_days);
+      const expires_at=admissionExpires?new Date(Math.min(admissionExpires,Date.parse(regular))).toISOString():regular;
+      this.db.prepare(`INSERT INTO proposals(id,project_id,scope,body,target_id,expected_revision,status,created_at,connection_id,work_directory,expires_at,admission_id)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id,record.project_id,record.scope,JSON.stringify(record),input.target_id??null,input.expected_revision??0,'pending',now(),this.config.connection_id,input.work_directory??null,expires_at,input.admission_id??null);
       if(plan)this.db.prepare('INSERT INTO proposal_transitions VALUES(?,?)').run(id,JSON.stringify(plan));
       if(importTarget)this.db.prepare('INSERT INTO import_targets VALUES(?,?,?)').run(id,importTarget.id,importTarget.revision);
       const result={proposal_id:id,expected_revision:input.expected_revision??0,expires_at,similar_candidates:similar,missing_fields:[],
@@ -475,7 +617,8 @@ export class MemoryService {
       const retry=this.event(input.request_id,'renew_proposal',input);if(retry)return retry;
       const proposal=this.pendingProposal(input.proposal_id);
       if(proposal.connection_id!==this.config.connection_id)throw new MemoryError('PROPOSAL_OWNER_MISMATCH');
-      const expires_at=expires(this.config.retention.proposal_days);
+      const regular=expires(this.config.retention.proposal_days),limit=proposal.admission_id?this.validateAdmission(proposal.admission_id):undefined;
+      const expires_at=limit?new Date(Math.min(limit,Date.parse(regular))).toISOString():regular;
       this.db.prepare('UPDATE proposals SET expires_at=? WHERE id=?').run(expires_at,proposal.id);
       const result={proposal_id:proposal.id,expires_at};
       this.receipt(input.request_id,'renew_proposal',input,proposal.project_id,proposal.scope,result);
@@ -550,6 +693,7 @@ export class MemoryService {
     const retry=this.event(input.request_id,'commit',input); if(retry)return retry.lifecycle_changed?{...retry,...this.syncLifecycle()}:retry;
     const proposal=this.pendingProposal(input.proposal_id);
     if(proposal.expected_revision!==input.expected_revision)throw new MemoryError('VERSION_CONFLICT');
+    if(proposal.admission_id)this.validateAdmission(proposal.admission_id);
     const record:MemoryRecord=JSON.parse(proposal.body); if(record.verification.status==='verified')this.permission('verify'); this.sourceCheck(record);this.dependencies(record,proposal.target_id);
     const storedPlan=this.readTransition(proposal.id);
     const plan:TransitionPlan|undefined=storedPlan?JSON.parse(storedPlan):undefined;
@@ -563,7 +707,8 @@ export class MemoryService {
       this.checkpoint('begin');
       const repeated=this.event(input.request_id,'commit',input);if(repeated)return repeated;
       const current=this.pendingProposal(input.proposal_id);
-      if(current.body!==proposal.body || this.readTransition(proposal.id)!==storedPlan)throw new MemoryError('PROPOSAL_NOT_PENDING');
+      if(current.body!==proposal.body || current.admission_id!==proposal.admission_id || this.readTransition(proposal.id)!==storedPlan)throw new MemoryError('PROPOSAL_NOT_PENDING');
+      if(current.admission_id)this.validateAdmission(current.admission_id);
       this.scope(record.project_id,record.scope); this.dependencies(record,proposal.target_id);
       this.checkWorkDirectory(record,current.work_directory);
       this.validateConsolidation(record,plan);
@@ -644,8 +789,7 @@ export class MemoryService {
     this.permission('recall');const input=recallSchema.parse(raw);
     if(input.exclude_ids)input.exclude_ids=[...new Set(input.exclude_ids.map(id=>id.toLowerCase()))].sort();
     if(input.exact_only && (!input.query || identifiers(input.query).length===0))throw new MemoryError('EXACT_IDENTIFIER_REQUIRED');
-    if(input.project_id)this.scope(input.project_id,'project');
-    if(input.include_global??(!input.project_id&&this.config.allow_global))this.scope(null,'global');
+    this.validateViewScope(input);
     return retrieve({db:this.db,config:this.config,encoder:this.encoder,generation:()=>this.storage.generation(),checkpoint:this.checkpoint},input,mode);
   }
   async feedback(raw:unknown) {
@@ -959,6 +1103,8 @@ export class MemoryService {
     const unindexed=this.db.prepare("SELECT count(*) AS n FROM memories m WHERE status='active' AND NOT EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=m.id)").get();
     const search_mismatch=this.db.prepare(`SELECT count(*) n FROM memories m LEFT JOIN memory_search s ON s.memory_id=m.id
       WHERE s.memory_id IS NULL OR s.revision!=m.revision OR s.status!=m.status OR s.profile_id!=m.profile_id OR s.project_id IS NOT m.project_id OR s.scope!=m.scope OR s.metadata!=json_remove(m.body,'$.content')`).get();
+    const projection_mismatch=this.db.prepare(`SELECT count(*) n FROM claim_projection p LEFT JOIN memories m ON m.id=p.memory_id
+      WHERE m.id IS NULL OR m.revision<>p.revision OR m.content_hash<>p.content_hash OR m.status<>'active'`).get();
     const missing_chunk_fts=this.db.prepare("SELECT count(*) n FROM memory_chunks c JOIN memories m ON m.id=c.memory_id WHERE m.status='active' AND NOT EXISTS(SELECT 1 FROM chunk_fts f WHERE f.chunk_id=c.id AND f.memory_id=c.memory_id)").get();
     const orphan_chunk_fts=this.db.prepare('SELECT count(*) n FROM chunk_fts f LEFT JOIN memory_chunks c ON c.id=f.chunk_id WHERE c.id IS NULL OR c.memory_id!=f.memory_id').get();
     const orphan_identifiers=this.db.prepare('SELECT count(*) n FROM chunk_identifiers i LEFT JOIN memory_chunks c ON c.id=i.chunk_id WHERE c.id IS NULL OR c.memory_id!=i.memory_id').get();
@@ -986,7 +1132,7 @@ export class MemoryService {
       try { if(recordHash(JSON.parse(String(row.body)))!==row.content_hash)version_hash_errors++; }
       catch { version_hash_errors++; }
     }
-    return {integrity,orphan_chunks,orphan_vectors,missing_vectors,unindexed,search_mismatch,missing_chunk_fts,orphan_chunk_fts,orphan_identifiers,
+    return {integrity,orphan_chunks,orphan_vectors,missing_vectors,unindexed,search_mismatch,projection_mismatch,missing_chunk_fts,orphan_chunk_fts,orphan_identifiers,
       version_mismatch,invalid_versions,version_gaps,missing_version_dependencies,version_hash_errors:{n:version_hash_errors},relation_scope_errors,vector_scope_errors};
   }
   private archivedVersions(id:string) {

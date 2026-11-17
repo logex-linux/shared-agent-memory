@@ -4,6 +4,8 @@
 
 A local shared-memory service for AI agents on the same machine. It exposes a standard MCP STDIO server and CLI backed by one SQLite database, with local embeddings, keyword retrieval, versioned records and traceable sources.
 
+`1.0.0-beta.4` (Schema 14) adds admission previews, a subject catalog and bounded task overrides. See [the subject catalog and evidence contract](docs/upgrade-v1/frontier-contract.md).
+
 Agents search the whole library with task-specific queries, receive relevant excerpts, then expand selected records by ID. Project IDs are optional search filters, not a required preselection of task memories. Integrate the server into your own agent harness.
 
 ## Quick start

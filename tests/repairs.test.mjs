@@ -78,13 +78,13 @@ test('P1 migration keeps legacy records unverified and marks unknown writer hone
  dropTemporalProjection(s.db);
  s.db.exec("DROP TRIGGER version_dependency_insert; DROP TABLE version_dependencies; DROP TABLE revoked_aliases; DROP INDEX version_content_hash; DROP TABLE association_edges; DROP TABLE projection_jobs; DROP TABLE learning_events; DELETE FROM meta WHERE key='learning_watermark'; DROP INDEX tombstones_hash; DELETE FROM meta WHERE key='graph_epoch'; DROP TABLE memory_relations; DROP TABLE proposal_transitions; DROP TRIGGER version_insert; DROP TRIGGER version_advance; DROP TABLE memory_versions; DROP TABLE revoked_version_hashes; ALTER TABLE memories DROP COLUMN written_by; ALTER TABLE proposals DROP COLUMN connection_id; ALTER TABLE events DROP COLUMN connection_id; PRAGMA user_version=3;");
  const row=s.db.prepare('SELECT body FROM memories WHERE id=?').get(m.memory_id),body=JSON.parse(row.body);body.verification={method:'legacy claims checked',summary:'Old metadata'};s.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(body),m.memory_id);s.close();
- const reopened=new MemoryService(config);try{const item=(await reopened.recall({ids:[m.memory_id]})).items[0];assert.equal(item.verification.status,'unverified');assert.equal(item.written_by,'legacy:unknown');assert.equal(reopened.inspect().schema,13);assert.equal(reopened.check().integrity[0].integrity_check,'ok');}finally{reopened.close();}
+ const reopened=new MemoryService(config);try{const item=(await reopened.recall({ids:[m.memory_id]})).items[0];assert.equal(item.verification.status,'unverified');assert.equal(item.written_by,'legacy:unknown');assert.equal(reopened.inspect().schema,14);assert.equal(reopened.check().integrity[0].integrity_check,'ok');}finally{reopened.close();}
 });
 
-test('P1 readonly MCP exposes only recall and rejects hidden write tools',async()=>{
+test('readonly MCP exposes views and rejects durable write tools',async()=>{
  const {service:s,config,root}=await setup();s.close();const path=join(root,'reader.json');await writeFile(path,JSON.stringify({...config,operations:['recall'],connection_id:'reader:wire'}));
  const c=new Client({name:'self-declared-admin',version:'test'});await c.connect(new StdioClientTransport({command:process.execPath,args:[resolve('dist/mcp/server.js')],env:{SHARED_MEMORY_CONFIG:path},stderr:'pipe'}));
- try{assert.deepEqual((await c.listTools()).tools.map(t=>t.name),['memory_recall','memory_resolve_project']);assert.match(c.getInstructions(),/reader:wire/);const denied=await c.callTool({name:'memory_forget',arguments:{request_id:randomUUID(),memory_id:randomUUID(),expected_revision:1}});assert.equal(denied.isError,true);}finally{await c.close();}
+ try{assert.deepEqual((await c.listTools()).tools.map(t=>t.name),['memory_recall','memory_resolve_project','memory_admission_preview','memory_browse','memory_inspect','memory_explain','memory_task_override']);assert.match(c.getInstructions(),/reader:wire/);const denied=await c.callTool({name:'memory_forget',arguments:{request_id:randomUUID(),memory_id:randomUUID(),expected_revision:1}});assert.equal(denied.isError,true);}finally{await c.close();}
 });
 
 test('P2 installer separates work directory; profiles and Codex mapping select actual UUID',async()=>{

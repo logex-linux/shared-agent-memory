@@ -11,8 +11,9 @@ import { migrateErasure } from '../memory/erasure.js';
 import { indexAssociationWalk, migrateFeedback } from '../memory/feedback.js';
 import { migrateMaintenance } from '../memory/recovery.js';
 import { migrateProposalExpiry } from '../memory/retention.js';
+import { migrateSubjectCatalog } from '../memory/subjects.js';
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 export class Storage {
   db: DatabaseSync;
@@ -120,6 +121,10 @@ export class Storage {
         ALTER TABLE proposals ADD COLUMN work_directory TEXT;
         PRAGMA user_version=13;
       `);
+    }
+    if(version<14) {
+      migrateSubjectCatalog(this.db);
+      this.db.exec('ALTER TABLE proposals ADD COLUMN admission_id TEXT; PRAGMA user_version=14;');
     }
   }
   transaction<T>(fn:()=>T):T {

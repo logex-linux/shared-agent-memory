@@ -1,10 +1,13 @@
 import type {DatabaseSync} from 'node:sqlite';
 import {MemoryError, stable, type MemoryRecord} from '../core/contracts.js';
 import {CURRENT_RULE} from '../retrieval/indexes.js';
+import {resolveSubject} from './subjects.js';
 
 export function checkCurrentRule(db:DatabaseSync,record:MemoryRecord,except:string[],previouslyAdopted?:MemoryRecord) {
-  if((record.kind!=='preference'&&record.kind!=='decision') || record.decision_state!=='adopted' ||
-    (record.lifecycle??'current')!=='current')return;
+  if((record.lifecycle??'current')!=='current')return;
+  if(record.subject_id&&record.context_key&&resolveSubject(db,record,record.subject_id,record.context_key).match==='alias')
+    throw new MemoryError('RULE_CANONICAL_SUBJECT_REQUIRED');
+  if((record.kind!=='preference'&&record.kind!=='decision')||record.decision_state!=='adopted')return;
   if(!record.subject_id?.trim()||!record.context_key?.trim()) {
     if(previouslyAdopted?.decision_state==='adopted' && previouslyAdopted.kind===record.kind &&
       previouslyAdopted.subject_id===record.subject_id && previouslyAdopted.context_key===record.context_key)return;
@@ -19,6 +22,12 @@ export function checkCurrentRule(db:DatabaseSync,record:MemoryRecord,except:stri
     AND memory_id NOT IN (SELECT value FROM json_each(?)) LIMIT 1`)
     .get(record.scope,record.project_id,record.subject_id,record.context_key,record.valid_for.environment??null,JSON.stringify(except)))
     throw new MemoryError('CURRENT_RULE_CONFLICT');
+  if(db.prepare(`SELECT 1 FROM claim_projection p JOIN subject_claims i USING(memory_id)
+    WHERE i.scope=? AND i.project_id IS ? AND i.subject_id=? AND i.context_key=? AND i.environment IS ?
+    AND i.lifecycle='current' AND i.decision_state='adopted' AND i.kind IN ('preference','decision')
+    AND i.memory_id NOT IN (SELECT value FROM json_each(?)) LIMIT 1`)
+    .get(record.scope,record.project_id,record.subject_id,record.context_key,record.valid_for.environment??null,JSON.stringify(except)))
+    throw new MemoryError('CURRENT_RULE_CONFLICT');
 }
 
 const normalizedText=(value:string)=>value.normalize('NFC').replace(/\r\n?/g,'\n').trim();
@@ -27,8 +36,10 @@ function sourcesOf(record:MemoryRecord) {
   return [...new Set(record.sources.map(({checked_at,...source})=>stable(source)))].sort();
 }
 function duplicateKey(record:MemoryRecord) {
+  const episode=record.episode;
   return stable([normalizedText(record.title),normalizedText(record.content),sourcesOf(record),record.valid_for??{},record.valid_time??null,
-    record.subject_id??null,record.context_key??null,record.lifecycle??'current',record.decision_state??'unknown',record.derived_from??[]]);
+    record.subject_id??null,record.context_key??null,record.lifecycle??'current',record.decision_state??'unknown',record.derived_from??[],
+    episode?.conversation_ref??null,episode?.session_ref??null,episode?.event_ref??null,episode?.event_time??null]);
 }
 export const sameMemoryMaterial=(a:MemoryRecord,b:MemoryRecord)=>a.kind===b.kind&&duplicateKey(a)===duplicateKey(b);
 function unchangedKey(record:MemoryRecord) {
@@ -42,12 +53,17 @@ export function checkDuplicate(db:DatabaseSync,record:MemoryRecord,previous?:Mem
     if(!transition&&unchangedKey(previous)===unchangedKey(record))throw new MemoryError('NO_CHANGES');
     return;
   }
+  if(findExactDuplicate(db,record))throw new MemoryError('DUPLICATE_RECORD');
+}
+
+export function findExactDuplicate(db:DatabaseSync,record:MemoryRecord) {
   const first=record.sources[0];
-  const matches=db.prepare(`SELECT m.body FROM memory_search s JOIN memories m ON m.id=s.memory_id
+  const matches=db.prepare(`SELECT m.id,m.revision,m.body FROM memory_search s JOIN memories m ON m.id=s.memory_id
     WHERE s.scope=? AND s.project_id IS ? AND s.status='active' AND s.kind=?
     AND EXISTS(SELECT 1 FROM json_each(s.metadata,'$.sources') src WHERE json_extract(src.value,'$.uri')=?
       AND json_extract(src.value,'$.locator')=? AND json_extract(src.value,'$.revision_ref')=?)`)
     .iterate(record.scope,record.project_id,record.kind,first.uri,first.locator,first.revision_ref);
   const key=duplicateKey(record);
-  for(const candidate of matches)if(duplicateKey(JSON.parse(String(candidate.body)))===key)throw new MemoryError('DUPLICATE_RECORD');
+  for(const candidate of matches)if(duplicateKey(JSON.parse(String(candidate.body)))===key)
+    return {memory_id:String(candidate.id),revision:Number(candidate.revision)};
 }
