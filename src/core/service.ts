@@ -16,7 +16,7 @@ import { projectFeedback, recordFeedback } from '../memory/feedback.js';
 import { erasureTree, revokeVersions } from '../memory/erasure.js';
 import { previewConsolidation } from '../memory/consolidation.js';
 import { checkCurrentRule, checkDuplicate, sameMemoryMaterial } from '../memory/writes.js';
-import { managedExports, ownershipImpact, relatedProposals, sameOwnership } from '../memory/ownership.js';
+import { managedExports, ownershipAdvances, ownershipImpact, relatedProposals, sameOwnership } from '../memory/ownership.js';
 import { appendAction, currentMaintenance, maintenancePath, parseMaintenance, prefixOf, readMaintenance, readRevocations,
   revocationSubset, revocationsPath, syncMaintenance, type MaintenanceLedger, type RecoveryAction } from '../memory/recovery.js';
 import { cutoff, expires, pinned, pruneBody, retainedSourceKeys, versionCandidate } from '../memory/retention.js';
@@ -278,11 +278,12 @@ export class MemoryService {
     if(!resolved.project_id)throw new MemoryError('PROJECT_UNRESOLVED');
     if(resolved.project_id!==record.project_id)throw new MemoryError('PROJECT_MAPPING_MISMATCH');
   }
-  private dependencies(record:MemoryRecord,target?:string,allowStale=false) {
+  private dependencies(record:MemoryRecord,target?:string,allowStale=false,matchingRevision?:(id:string,expected:number,current:number)=>boolean) {
     for(const dep of record.derived_from) {
       const parent=this.find(dep.memory_id);
       const evidence:MemoryRecord=JSON.parse(parent.body);
-      if(!allowStale && (parent.status!=='active' || parent.revision!==dep.revision ||
+      if(!allowStale && (parent.status!=='active' ||
+        (matchingRevision?!matchingRevision(parent.id,dep.revision,parent.revision):parent.revision!==dep.revision) ||
         (evidence.lifecycle??'current')!=='current' || !coversEffectiveTime(evidence.valid_time,now()) ||
         applicability(evidence.valid_for,{})==='excluded'))throw new MemoryError('DEPENDENCY_STALE');
       if(record.scope==='global' && parent.scope!=='global')throw new MemoryError('DEPENDENCY_SCOPE');
@@ -309,10 +310,10 @@ export class MemoryService {
   private isRetired(id:string) {
     return Boolean(id && this.db.prepare('SELECT 1 FROM retired_memories WHERE id=?').get(id));
   }
-  private consolidationPackage(raw:unknown) {
+  private consolidationPackage(raw:unknown,matchingRevision?:(id:string,expected:number,current:number)=>boolean) {
     const input=consolidationPreviewSchema.parse(raw);
     this.scope(input.project_id,input.scope);
-    return previewConsolidation(this.db,input,(id,record,digest)=>this.isRevoked(id,record.import_key,[digest],record.sources));
+    return previewConsolidation(this.db,input,(id,record,digest)=>this.isRevoked(id,record.import_key,[digest],record.sources),matchingRevision);
   }
   consolidate(raw:unknown) {
     this.permission('manage');
@@ -320,12 +321,12 @@ export class MemoryService {
     try { return this.consolidationPackage(raw); }
     finally { this.db.exec('ROLLBACK'); }
   }
-  private validateConsolidation(record:MemoryRecord,plan?:TransitionPlan) {
+  private validateConsolidation(record:MemoryRecord,plan?:TransitionPlan,matchingRevision?:(id:string,expected:number,current:number)=>boolean) {
     if(!record.consolidation)return;
     if(plan?.transition&&plan.transition!=='new')throw new MemoryError('CONSOLIDATION_TRANSITION');
     const {expires_at,...context}=record.valid_for;
     const report=this.consolidationPackage({project_id:record.project_id,scope:record.scope,title:record.title,
-      claim:record.content,kind:record.kind,context,evidence:record.consolidation});
+      claim:record.content,kind:record.kind,context,evidence:record.consolidation},matchingRevision);
     const candidate=report.candidate;
     if(!candidate)throw new MemoryError('CONSOLIDATION_INSUFFICIENT');
     if(report.status==='conflict'&&record.lifecycle!=='quarantined')throw new MemoryError('CONSOLIDATION_CONFLICT');
@@ -1128,9 +1129,10 @@ export class MemoryService {
         const chunks=encoded.get(entry.id);
         if(chunks)this.indexChunks(entry.id,version.revision,profile.id,record,chunks);
       }
+      const matchingRevision=ownershipAdvances(this.db,[...(this.importMaintenance?.entries??[]),...currentMaintenance(this.db).entries].map(e=>e.action));
       for(const entry of pending) {
-        this.dependencies(entry.latest.record,entry.id,entry.status==='invalidated');
-        if(entry.status==='active')this.validateConsolidation(entry.latest.record);
+        this.dependencies(entry.latest.record,entry.id,entry.status==='invalidated',matchingRevision);
+        if(entry.status==='active')this.validateConsolidation(entry.latest.record,undefined,matchingRevision);
       }
       return {restored:pending.length,unchanged:entries.length-pending.length,generation:this.storage.advance()};
     });

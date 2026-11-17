@@ -1,7 +1,28 @@
 import type {DatabaseSync} from 'node:sqlite';
-import {MemoryError, type Ownership} from '../core/contracts.js';
+import {MemoryError, type MemoryRecord, type Ownership} from '../core/contracts.js';
+import type {RecoveryAction} from './recovery.js';
+import {recordHash} from './versions.js';
 
 export const sameOwnership=(a:Ownership,b:Ownership)=>a.scope===b.scope && a.project_id===b.project_id;
+
+export function ownershipAdvances(db:DatabaseSync,actions:RecoveryAction[]) {
+  const moves=new Map<string,{before:string;after:string;destination:Ownership;previous:Ownership}>();
+  for(const action of actions)if(action.kind==='reassign')for(const row of action.records)
+    moves.set(row.memory_id+':'+row.revision,{before:row.content_hash,after:row.next_hash,destination:action.destination,previous:row.previous});
+  const revision=db.prepare('SELECT body,content_hash FROM memory_version_bodies WHERE memory_id=? AND revision=?');
+  return (id:string,previous:number,current:number)=>{
+    if(previous>current)return false;
+    for(let at=previous;at<current;at++) {
+      const move=moves.get(id+':'+at);
+      if(!move)return false;
+      const from=revision.get(id,at),to=revision.get(id,at+1);
+      if(!from?.body||!to?.body||from.content_hash!==move.before||to.content_hash!==move.after)return false;
+      const record=JSON.parse(String(from.body)) as MemoryRecord;
+      if(!sameOwnership(record,move.previous)||recordHash({...record,...move.destination})!==move.after)return false;
+    }
+    return true;
+  };
+}
 
 export function relatedProposals(db:DatabaseSync,ids:string[]) {
   const scope=JSON.stringify(ids);

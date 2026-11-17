@@ -190,6 +190,34 @@ test('forget preview binds the entire accessible closure and retries managed fil
   } finally {s.close();}
 });
 
+test('a versioned export of a relocated derivation retains trusted historical references on restore',async()=>{
+  const src=await setupFake({all_projects:true}),dst=await setupFake({all_projects:true});
+  const {service:s,project,other,root}=src;
+  try {
+    const evidence={...sameFixture(project,'explicit user observation'),sources:[{...source('direct'),source_type:'user'}],
+      verification:{method:'direct user statement',summary:'Synthetic direct evidence',basis:'user_confirmation'}};
+    const parent=await publish(s,evidence);
+    const statement=s.consolidate({project_id:project,scope:'project',title:'Consolidated fixture',claim:evidence.content,
+      kind:'procedure',evidence:{mode:'direct_statement',citations:[{...ref(parent),start:0,end:evidence.content.length}]}});
+    const child=await publish(s,{...statement.candidate,author_client:'test',author_session:'reassign-archive'});
+    const move={request_id:id(),records:[ref(parent),ref(child)],destination:{project_id:other,scope:'project'},reason:'Grouped fixture relocation'};
+    await s.reassign({...move,plan_hash:(await s.reassign(move)).plan_hash},true);
+    await assert.rejects(propose(s,{...sameFixture(other,'new record with retired evidence'),derived_from:[ref(parent)]}),{code:'DEPENDENCY_STALE'});
+    const archive=JSON.parse(await readFile((await s.export(other,false,'versioned')).path,'utf8'));
+    await dst.service.project(other,'reassigned fixtures',join(root,'other'));
+    await dst.service.applyRevocations([]);
+    await assert.rejects(dst.service.restoreArchive(archive),{code:'DEPENDENCY_STALE'});
+    assert.equal(dst.service.db.prepare('SELECT count(*) n FROM memories').get().n,0);
+    dst.service.selectImportMaintenance(currentMaintenance(s.db));
+    await dst.service.applyRevocations([]);
+    assert.equal((await dst.service.restoreArchive(archive)).restored,2);
+    assert.equal((await dst.service.recall({ids:[child.memory_id],project_id:other})).items[0].revision,2);
+    const original=(await dst.service.recall({versions:[ref(parent)],project_id:other})).items[0];
+    assert.equal(original.recorded_ownership.project_id,project);
+    verify(dst.service);
+  } finally {dst.service.close();s.close();}
+});
+
 test('pending expiry rejects commit, permits owner renewal and clears candidates idempotently',async()=>{
   const {service:s,config,project}=await setupFake();
   const other=new MemoryService({...config,connection_id:'other-editor'},fake);

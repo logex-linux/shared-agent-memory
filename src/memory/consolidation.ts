@@ -8,7 +8,8 @@ type Ref=z.infer<typeof versionRefSchema>;
 type Evidence={ref:Ref;record:MemoryRecord;origins:Set<string>};
 
 export function previewConsolidation(db:DatabaseSync,input:Input,
-  revoked:(id:string,record:MemoryRecord,contentHash:string)=>boolean) {
+  revoked:(id:string,record:MemoryRecord,contentHash:string)=>boolean,
+  matchingRevision:(id:string,expected:number,current:number)=>boolean=(_id,expected,current)=>expected===current) {
   const at=new Date().toISOString();
   const visited=new Map<string,Evidence>(), roots=new Map<string,Evidence>(), path=new Set<string>();
   const memory=db.prepare('SELECT body,revision,status,project_id,scope,content_hash FROM memories WHERE id=?');
@@ -21,7 +22,8 @@ export function previewConsolidation(db:DatabaseSync,input:Input,
     }
     if(visited.size>=20)throw new MemoryError('CONSOLIDATION_SPLIT_REQUIRED');
     const row=memory.get(ref.memory_id);
-    if(!row || row.revision!==ref.revision || row.status!=='active')throw new MemoryError('CONSOLIDATION_SOURCE_STALE');
+    if(!row || !matchingRevision(ref.memory_id,ref.revision,Number(row.revision)) || row.status!=='active')
+      throw new MemoryError('CONSOLIDATION_SOURCE_STALE');
     if(row.scope!==input.scope || row.project_id!==input.project_id)throw new MemoryError('CONSOLIDATION_SCOPE');
     const record=JSON.parse(String(row.body)) as MemoryRecord;
     if((record.lifecycle??'current')!=='current' || !coversEffectiveTime(record.valid_time,at) ||

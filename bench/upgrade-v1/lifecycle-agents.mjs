@@ -29,7 +29,7 @@ if(resume) {
     result.recalled && result.preserved && result.excluded)previous.set(result.round+'/'+result.name,result);
 }
 
-function run(work,config,prompt,tools) {
+function run(work,config,prompt,tools,afterRecall) {
   const env={...process.env,SHARED_MEMORY_CONFIG:config,SHARED_MEMORY_NODE:process.execPath};
   const cli=client==='codex'?
     process.env.SAM_CODEX_BIN??'codex':process.env.SAM_STEP_BIN??join(homedir(),'.stepcode/bin/step');
@@ -51,12 +51,31 @@ function run(work,config,prompt,tools) {
   ];
   return new Promise((done,reject)=>{
     const child=spawn(cli,args,{cwd:work,env,stdio:['ignore','pipe','pipe']});
-    let stdout='',stderr='';
-    child.stdout.on('data',part=>stdout+=part);child.stderr.on('data',part=>stderr+=part);
+    child.stdout.setEncoding('utf8');
+    let stdout='',stderr='',pending='',race;
+    child.stdout.on('data',part=>{
+      stdout+=part;
+      if(!afterRecall||race)return;
+      pending+=part;
+      const lines=pending.split('\n');
+      pending=lines.pop()??'';
+      for(const line of lines) {
+        let event;
+        try {event=JSON.parse(line);}catch {continue;}
+        if(event.type==='item.completed'&&event.item?.type==='mcp_tool_call'&&event.item.tool==='memory_recall' ||
+          event.type==='tool_execution_end'&&event.toolName?.endsWith('memory_recall')) {
+          race=afterRecall();
+          race.catch(()=>{});
+          break;
+        }
+      }
+    });
+    child.stderr.on('data',part=>stderr+=part);
     const timer=setTimeout(()=>child.kill('SIGTERM'),150_000);
     child.on('error',error=>{clearTimeout(timer);reject(error);});
-    child.on('close',(code,signal)=>{
+    child.on('close',async(code,signal)=>{
       clearTimeout(timer);
+      try {await race;}catch(error){reject(error);return;}
       const events=stdout.split('\n').flatMap(line=>{try{return [JSON.parse(line)];}catch{return [];}});
       const codex=events.filter(e=>e.type==='item.completed').map(e=>e.item);
       const step=events.filter(e=>e.type==='message_end').map(e=>e.message);
@@ -94,7 +113,7 @@ async function scenario(name,round) {
       name==='draft'?{...base,decision_state:'proposed',content:'Draft quote says adopted '+old+'; status is proposed.'}:
       name==='quarantine'?{...base,lifecycle:'quarantined'}:base);
     const read={ids:[a.memory_id],project_id:p};
-    let expected=newValue,request='这次明确用 '+newValue+'，按该值生成本次发布标记。';
+    let expected=newValue,request='这次明确用 '+newValue+'，按该值生成本次发布标记。',afterRecall;
     const readOnly=name!=='permanent'&&name!=='conflict';
     const tools=readOnly?['memory_recall','memory_resolve_project']:
       ['memory_recall','memory_resolve_project','memory_propose','memory_commit'];
@@ -118,9 +137,11 @@ async function scenario(name,round) {
       request='本次和今后用 '+newValue+'。如果连接无长期写权限，仍输出本次标记并在末尾加 |UPDATE_UNAVAILABLE。';
     }
     if(name==='conflict') {
-      const b=await publish({...base,content:'A concurrent correction changed the regular output marker to COBALT.'},
-        {target_id:a.memory_id,expected_revision:1});
-      assert.equal(b.revision,2);
+      afterRecall=async()=>{
+        const b=await publish({...base,content:'A concurrent correction changed the regular output marker to COBALT.'},
+          {target_id:a.memory_id,expected_revision:1});
+        assert.equal(b.revision,2);
+      };
       expected=newValue+'|UPDATE_CONFLICT';
       request='本次用 '+newValue+'，并尝试把已经对照的旧 revision 1 实施永久更新。明确要求遇并发冲突时停止此次长期写入，仍输出本次标记并在末尾加 |UPDATE_CONFLICT。要提交的提议参数为 '+JSON.stringify({
         request_id:randomUUID(),record:{...base,content:'Use '+newValue+' for the long term.'},
@@ -139,7 +160,7 @@ async function scenario(name,round) {
     const prompt='合成任务。先用 shared_memory 的 memory_recall 读取 '+JSON.stringify(read)+'。'+request+
       ' 此任务的实际交付是调用 write_fixture_result 写出标记。value 只含实际标记及已明确要求的状态后缀，' +
       '没有后缀要求时只写标记。不要把证据引用或解释放进 value。写完再告知结果。';
-    const runResult=await run(work,harnessConfig,prompt,tools);
+    const runResult=await run(work,harnessConfig,prompt,tools,afterRecall);
     const artifact=await readFile(join(work,'fixture-result.txt'),'utf8').catch(error=>{
       if(error.code==='ENOENT')return null;
       throw error;
