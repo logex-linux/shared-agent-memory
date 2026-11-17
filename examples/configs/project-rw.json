@@ -6,11 +6,11 @@
   ],
   "all_projects": false,
   "allow_global": false,
+  "require_work_directory": true,
   "operations": [
     "recall",
     "propose",
-    "commit",
-    "forget"
+    "commit"
   ],
   "connection_id": "example:project-rw"
 }

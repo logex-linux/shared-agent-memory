@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { record, publish } from './helpers.mjs';
+import { forget, record, publish } from './helpers.mjs';
 import { fake, setupFake } from './adaptive-helpers.mjs';
 import { MemoryService } from '../dist/core/service.js';
 
@@ -25,7 +25,7 @@ test('supersession moves every predecessor atomically and keeps source revisions
   const {service:s,project}=await setupFake();
   try {
     const left=await publish(s,oldRecord(project));
-    const right=await publish(s,oldRecord(project,{content:'The earlier review approved the old queue limit.'}));
+    const right=await publish(s,oldRecord(project,{kind:'fact',content:'The earlier review approved the old queue limit.'}));
     const derived=await publish(s,record(project,{derived_from:[ref(left)],content:'Derived from the first record.'}));
     const p=await plan(s,replacement(project),'supersede',[left,right]);
     const before=s.storage.generation(), input=commitInput(p);
@@ -59,7 +59,7 @@ test('stale second predecessor and an interrupted multi-target transaction leave
   const racing=new MemoryService(config,fake);
   try {
     const left=await publish(s,oldRecord(project));
-    const right=await publish(s,oldRecord(project));
+    const right=await publish(s,oldRecord(project,{kind:'fact',content:'A second source recorded the earlier rule.'}));
     const p=await plan(s,replacement(project),'supersede',[left,right]);
     let resume, entered;
     const barrier=new Promise(resolve=>resume=resolve);
@@ -68,7 +68,7 @@ test('stale second predecessor and an interrupted multi-target transaction leave
     const committing=s.commit(commitInput(p));
     const rejected=assert.rejects(committing,{code:'VERSION_CONFLICT'});
     await encoding;
-    const updated=await publish(racing,oldRecord(project,{content:'Concurrent correction.'}),{target_id:right.memory_id,expected_revision:1});
+    const updated=await publish(racing,oldRecord(project,{kind:'fact',content:'Concurrent correction.'}),{target_id:right.memory_id,expected_revision:1});
     resume();
     await rejected;
     assert.equal((await racing.recall({ids:[left.memory_id]})).items[0].revision,1);
@@ -117,7 +117,7 @@ test('branches need distinct context, scoped relations need exact endpoints, and
     assert.equal(reviewed.lifecycle,'quarantined');
     assert.equal(reviewed.decision_state,'rejected');
     assert.equal(reviewed.applicability,'requires_check');
-    await s.forget({request_id:randomUUID(),memory_id:base.memory_id,expected_revision:2});
+    await forget(s,{request_id:randomUUID(),memory_id:base.memory_id,expected_revision:2});
     assert.equal(s.db.prepare('SELECT count(*) n FROM memory_relations').get().n,0);
     assert.equal((await s.recall({ids:[production.memory_id]})).items.length,1);
   } finally {s.close();}

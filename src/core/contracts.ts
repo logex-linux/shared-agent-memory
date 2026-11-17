@@ -11,6 +11,7 @@ export function stable(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 const text = (max: number) => z.string().trim().min(1).max(max);
+const request = z.string().uuid().describe('A fresh real UUID per tool operation; propose and commit need different UUIDs. Reuse only for an identical retry of the same operation, never send a placeholder.');
 export const sourceSchema = z.object({
   source_type: z.enum(['user', 'code', 'document', 'web', 'test']),
   uri: text(2048), locator: text(500), revision_ref: text(256),
@@ -36,6 +37,25 @@ const effectiveTimeSchema = z.object({ valid_from:eventTime, valid_to:eventTime 
   {message:'valid_from must precede valid_to'}
 );
 export const versionRefSchema = z.object({memory_id:z.string().uuid(),revision:z.number().int().positive().safe()}).strict();
+export const ownershipSchema=z.object({project_id:z.string().uuid().nullable(),scope:z.enum(['project','global'])}).strict()
+  .refine(x=>(x.scope==='global')===(x.project_id===null),'global requires null project_id; project requires UUID');
+export const planHashSchema=z.string().regex(/^[0-9a-f]{64}$/);
+export const reassignSchema=z.object({
+  request_id:request,records:z.array(versionRefSchema).min(1).max(64),destination:ownershipSchema,
+  reason:text(500),plan_hash:planHashSchema.optional()
+}).strict().refine(x=>new Set(x.records.map(r=>r.memory_id)).size===x.records.length,'record IDs must be distinct');
+export const projectAliasesSchema=z.object({
+  request_id:request,project_id:z.string().uuid(),aliases:z.array(z.string().startsWith('/').max(4096)).max(64),
+  plan_hash:planHashSchema.optional()
+}).strict();
+export type Ownership=z.infer<typeof ownershipSchema>;
+export const proposalRenewSchema=z.object({request_id:request,proposal_id:z.string().uuid()}).strict();
+const retentionBase=z.object({request_id:request,plan_hash:planHashSchema.optional()});
+export const retentionSchema=z.discriminatedUnion('action',[
+  retentionBase.extend({action:z.literal('expire'),proposal_ids:z.array(z.string().uuid()).min(1).max(100)}).strict(),
+  retentionBase.extend({action:z.literal('prune'),versions:z.array(versionRefSchema).min(1).max(100)}).strict(),
+  retentionBase.extend({action:z.literal('retire'),record:versionRefSchema,reason:z.enum(['redundant','expired_history']),replacement:versionRefSchema.optional()}).strict()
+]);
 const citationSchema=versionRefSchema.extend({
   start:z.number().int().min(0).max(4000),end:z.number().int().min(1).max(4000),
   role:z.enum(['support','counterexample']).default('support')
@@ -80,12 +100,16 @@ export const consolidationPreviewSchema=z.object({
   title:text(180),claim:text(1000),kind:z.enum(['preference','fact','decision','procedure','lesson']),
   context:validSchema.omit({expires_at:true}).default({}),evidence:consolidationSchema
 }).strict();
-const request = z.string().uuid().describe('A fresh real UUID per tool operation; propose and commit need different UUIDs. Reuse only for an identical retry of the same operation, never send a placeholder.');
 export const proposeSchema = z.object({ request_id: request, record: recordSchema,
   target_id: z.string().uuid().optional(), expected_revision: z.number().int().positive().optional().describe('Updates only: current positive revision, together with target_id. For a new proposal omit both fields; revision 0 belongs to memory_commit.'),
+  work_directory: z.string().startsWith('/').max(4096).optional().describe('Actual working directory for a project write. Resolve it first with memory_resolve_project.'),
   transition:z.enum(['new','reinforce','supersede','branch','quarantine']).optional(),
   expected_refs:z.array(versionRefSchema).min(1).max(10).optional(),
-  relations:z.array(relationDraftSchema).min(1).max(10).optional()
+  relations:z.array(relationDraftSchema).min(1).max(10).optional(),
+  version_evolution:z.object({
+    from_commit:text(128),to_commit:text(128),sources:z.array(sourceSchema).min(2).max(12),
+    adopt_legacy_identity:z.boolean().optional()
+  }).strict().optional().describe('Explicit supersession across recorded code versions in the same context, backed by both revisions.')
 }).strict().superRefine((r,ctx) => {
   if (Boolean(r.target_id) !== Boolean(r.expected_revision)) ctx.addIssue({code:'custom', message:'target_id and expected_revision required together'});
   const refs=new Set(r.expected_refs?.map(ref=>ref.memory_id));
@@ -93,13 +117,18 @@ export const proposeSchema = z.object({ request_id: request, record: recordSchem
     ctx.addIssue({code:'custom',message:'expected_refs must use distinct memory IDs'});
   if (r.relations?.some(relation=>!refs.has(relation.target_id)))
     ctx.addIssue({code:'custom',message:'every relation target requires an expected_refs revision'});
-  if (r.transition==='quarantine' ? !r.target_id : Boolean(r.transition&&r.target_id))
-    ctx.addIssue({code:'custom',message:'quarantine updates a target, other transitions create a new memory'});
+  if (r.transition==='quarantine' ? !r.target_id : Boolean(r.transition&&r.transition!=='supersede'&&r.target_id))
+    ctx.addIssue({code:'custom',message:'quarantine requires target_id; supersede accepts an existing or new successor'});
+  if (r.transition==='supersede' && r.target_id && refs.has(r.target_id))
+    ctx.addIssue({code:'custom',message:'an existing successor cannot replace itself'});
+  if(r.version_evolution&&r.transition!=='supersede')
+    ctx.addIssue({code:'custom',message:'version_evolution requires supersede'});
   if (r.transition && ['reinforce','supersede','branch'].includes(r.transition) && !refs.size)
     ctx.addIssue({code:'custom',message:'reinforce, supersede and branch require expected_refs'});
 });
 export const commitSchema = z.object({ request_id: request, proposal_id: z.string().uuid(), expected_revision: z.number().int().nonnegative() }).strict();
-export const forgetSchema = z.object({ request_id: request, memory_id: z.string().uuid(), expected_revision: z.number().int().positive() }).strict();
+export const forgetPreviewSchema=z.object({memory_id:z.string().uuid(),expected_revision:z.number().int().positive()}).strict();
+export const forgetSchema=forgetPreviewSchema.extend({request_id:request,plan_hash:planHashSchema.optional()}).strict();
 export const feedbackSchema = z.object({
   request_id:request, task_id:z.string().uuid(), page_receipt:z.string().uuid(),
   used:z.array(versionRefSchema).min(1).max(2),
@@ -114,6 +143,8 @@ export const feedbackSchema = z.object({
 export const recallSchema = z.object({
   query: text(512).optional(), ids: z.array(z.string().uuid()).min(1).max(10).optional(),
   versions:z.array(versionRefSchema).min(1).max(10).optional(),
+  exclude_ids:z.array(z.string().uuid()).max(64).optional().describe('Task-local exclusions. Applies before candidate selection and to exact reads. A continuation keeps its original exclusions.'),
+  subject_id:text(256).optional(), context_key:text(256).optional(),
   graph:z.boolean().optional(),
   as_of:z.string().datetime().optional(), include_history:z.boolean().optional(), decision_state:decisionStateSchema.optional(),
   project_id: z.string().uuid().optional(), include_global: z.boolean().optional(),
@@ -127,8 +158,18 @@ export const recallSchema = z.object({
   if(r.exact_only && !r.query)ctx.addIssue({code:'custom',message:'exact_only requires query'});
   if(r.graph && !r.query && !r.cursor)ctx.addIssue({code:'custom',message:'graph requires query or cursor'});
 });
+export const resolveProjectSchema=z.object({path:z.string().startsWith('/').max(4096)}).strict();
 export const configSchema = z.object({
   database: z.string().startsWith('/'), model_dir: z.string().startsWith('/'),
+  maintenance_state:z.string().startsWith('/').optional(),
+  installation_manifest:z.string().startsWith('/').optional(),
+  require_work_directory:z.boolean().default(false),
+  retention:z.object({
+    proposal_days:z.number().int().min(1).max(365).default(7),
+    history_days:z.number().int().min(1).max(3650).default(90),
+    recovery_days:z.number().int().min(1).max(3650).default(90),
+    keep_revisions:z.number().int().min(1).max(100).default(5)
+  }).strict().default({}),
   allowed_projects: z.array(z.string().uuid()).min(1), all_projects: z.boolean().default(false), allow_global: z.boolean().default(false),
   operations: z.array(z.enum(['recall','propose','commit','forget','manage','verify','feedback'])).min(1).default(['recall']),
   connection_id:text(256).default('local-core'),

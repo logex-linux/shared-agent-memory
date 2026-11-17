@@ -7,7 +7,7 @@ import { backup } from 'node:sqlite';
 import { MemoryService } from '../dist/core/service.js';
 import { hash } from '../dist/core/contracts.js';
 import { setupFake,fake } from './adaptive-helpers.mjs';
-import { publish,record } from './helpers.mjs';
+import { forget, publish,record } from './helpers.mjs';
 
 const ref=result=>({memory_id:result.memory_id,revision:result.revision});
 const id=randomUUID;
@@ -40,10 +40,10 @@ test('forget removes historical derivations and exact reimports and revokes old 
     assert.ok(cursor);
     assert.equal(s.check().missing_version_dependencies.n,0);
     const request={request_id:id(),memory_id:root2.memory_id,expected_revision:2};
-    const forgotten=await s.forget(request);
+    const forgotten=await forget(s,request);
     assert.equal(forgotten.derived_erased,3);
-    assert.equal((await s.forget(request)).generation,forgotten.generation);
-    await assert.rejects(s.recall({cursor}),{code:'CURSOR_STALE'});
+    assert.equal((await forget(s,request)).generation,forgotten.generation);
+    await assert.rejects(s.recall({cursor}),{code:'CURSOR_EXPIRED'});
     await assert.rejects(readFile(path),{code:'ENOENT'});
     const erased=[root1,child,grandchild,exactCopy];
     assert.deepEqual((await s.recall({ids:erased.map(r=>r.memory_id)})).items,[]);

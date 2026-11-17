@@ -3,7 +3,7 @@ import {randomUUID} from 'node:crypto';import {writeFile,copyFile,mkdir} from 'n
 import {DatabaseSync,backup} from 'node:sqlite';import * as vec from 'sqlite-vec';
 import {spawnSync} from 'node:child_process';
 import {MemoryService} from '../dist/core/service.js';import {indexChunk} from '../dist/retrieval/indexes.js';
-import {setup,record,publish,restoreSchema11Storage} from './helpers.mjs';
+import { forget,setup,record,publish,restoreSchema11Storage} from './helpers.mjs';
 const vector=(a=1,b=0)=>{const v=new Float32Array(512);v[0]=a;v[1]=b;return v;};
 const fake={profile:async()=>({id:'deterministic-test',manifest:{test:true}}),query:async()=>vector(),chunks:async(title,text)=>[{start:0,end:text.length,text,tokens:10,vector:vector()}]};
 function seed(s,project,count,{start=0,gold=false,body='无关库存登记',v=vector(0,1),valid_for={}}={}){
@@ -97,7 +97,7 @@ test('updates, invalidation, reindex and forget remove old chunks, metadata and 
   assert.equal((await s.recall({query:'ERR_OLD_PATH',exact_only:true})).items.length,0);assert.equal((await s.recall({query:'ERR_CHILD_PATH',exact_only:true})).items.length,0);
   let r=await s.recall({query:'ERR_NEW_PATH',exact_only:true});assert.equal(r.items[0].revision,2);assert.ok(!r.items[0].content.includes('ERR_OLD_PATH'));
   await s.reindex();assert.equal((await s.recall({query:'ERR_NEW_PATH',exact_only:true})).items[0].revision,2);
-  await s.forget({request_id:randomUUID(),memory_id:m.memory_id,expected_revision:2});
+  await forget(s,{request_id:randomUUID(),memory_id:m.memory_id,expected_revision:2});
   for(const id of [m.memory_id,child.memory_id]){assert.equal(s.db.prepare('SELECT count(*) n FROM chunk_fts WHERE memory_id=?').get(id).n,0);assert.equal(s.db.prepare('SELECT count(*) n FROM chunk_identifiers WHERE memory_id=?').get(id).n,0);}
   assert.equal(s.db.prepare('SELECT count(*) n FROM memory_search WHERE memory_id=?').get(m.memory_id).n,0);assert.equal((await s.recall({query:'ERR_NEW_PATH',exact_only:true})).items.length,0);
   for(const key of ['search_mismatch','missing_chunk_fts','orphan_chunk_fts','orphan_identifiers'])assert.equal(s.check()[key].n,0);
@@ -121,6 +121,6 @@ test('schema4 migration and backup rollback preserve IDs, revisions, canonical b
  const code=`import {DatabaseSync} from 'node:sqlite';import * as vec from 'sqlite-vec';import {migrateSearch} from './dist/retrieval/indexes.js';const db=new DatabaseSync(process.argv[1],{allowExtension:true});vec.load(db);db.exec('BEGIN IMMEDIATE');migrateSearch(db);process.kill(process.pid,'SIGKILL');`;
  const interrupted=spawnSync(process.execPath,['--input-type=module','-e',code,config.database]);assert.equal(interrupted.signal,'SIGKILL');
  let db=new DatabaseSync(config.database,{allowExtension:true});vec.load(db);assert.equal(db.prepare('PRAGMA user_version').get().user_version,4);assert.deepEqual(signature(db),before);assert.equal(db.prepare("SELECT count(*) n FROM sqlite_master WHERE name='memory_search'").get().n,0);db.close();
- const migrated=new MemoryService(config,fake);try{assert.equal(migrated.inspect().schema,12);assert.deepEqual(signature(migrated.db),before);assert.ok(migrated.db.prepare("SELECT sql FROM sqlite_master WHERE name='memory_vec'").get().sql.includes('distance_metric=cosine'));assert.ok(!Object.hasOwn(JSON.parse(migrated.db.prepare('SELECT metadata FROM memory_search LIMIT 1').get().metadata),'content'));assert.equal((await migrated.recall({query:'语义任务'},'vector')).items.length,3);}finally{migrated.close();}
+ const migrated=new MemoryService(config,fake);try{assert.equal(migrated.inspect().schema,13);assert.deepEqual(signature(migrated.db),before);assert.ok(migrated.db.prepare("SELECT sql FROM sqlite_master WHERE name='memory_vec'").get().sql.includes('distance_metric=cosine'));assert.ok(!Object.hasOwn(JSON.parse(migrated.db.prepare('SELECT metadata FROM memory_search LIMIT 1').get().metadata),'content'));assert.equal((await migrated.recall({query:'语义任务'},'vector')).items.length,3);}finally{migrated.close();}
  await copyFile(root+'/before.db',root+'/rolled-back.db');db=new DatabaseSync(root+'/rolled-back.db',{allowExtension:true});vec.load(db);try{assert.equal(db.prepare('PRAGMA user_version').get().user_version,4);assert.deepEqual(signature(db),before);}finally{db.close();}
 });

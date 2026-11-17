@@ -7,7 +7,7 @@ import {spawnSync} from 'node:child_process';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
 import {MemoryService,readConfig} from '../dist/core/service.js';
-import {setup,record,publish,MODEL,dropTemporalProjection} from './helpers.mjs';
+import { forget,setup,record,publish,MODEL,dropTemporalProjection} from './helpers.mjs';
 const run=(script,args)=>spawnSync(process.execPath,[resolve(script),...args],{encoding:'utf8'});
 
 test('P0 identifier boost retains paraphrases; exact_only is explicit',async()=>{
@@ -31,8 +31,8 @@ test('P0 object, exported array and raw bodies all require external revocations;
   const retained=await publish(a.service,record(a.project,{content:'仍应恢复的独特内容。',import_key:'restore:retained'}));
   const naked=a.service.db.prepare("SELECT id FROM memories WHERE json_extract(body,'$.content')=?").get('没有导入键的旧正文。').id;
   const exported=await a.service.export(a.project),data=JSON.parse(await readFile(exported.path,'utf8'));
-  await a.service.forget({request_id:randomUUID(),memory_id:forgotten.memory_id,expected_revision:1});
-  await a.service.forget({request_id:randomUUID(),memory_id:naked,expected_revision:1});
+  await forget(a.service,{request_id:randomUUID(),memory_id:forgotten.memory_id,expected_revision:1});
+  await forget(a.service,{request_id:randomUUID(),memory_id:naked,expected_revision:1});
   b.config.allowed_projects.push(a.project);b.service.config.allowed_projects.push(a.project);await b.service.project(a.project,'source',a.root);
   const config=join(b.root,'config.json');await writeFile(config,JSON.stringify(b.config));
   for(const [i,input]of [data,data.memories,data.memories.map(e=>e.record)].entries()){
@@ -42,7 +42,7 @@ test('P0 object, exported array and raw bodies all require external revocations;
    else {const fresh=run('dist/cli/main.js',['import','--config',config,'--input',path,'--commit','--mode','new']);assert.equal(fresh.status,1);assert.match(fresh.stderr,/LATEST_REVOCATIONS_REQUIRED/);}
   }
   await assert.rejects(b.service.importEntry(data.memories[0]),{code:'LATEST_REVOCATIONS_REQUIRED'});
-  const path=join(b.root,'restore-1.json'),args=['import','--config',config,'--input',path,'--commit','--mode','restore','--revocations',join(a.root,'revocations.jsonl')];
+  const path=join(b.root,'restore-1.json'),args=['import','--config',config,'--input',path,'--commit','--mode','restore','--revocations',join(a.root,'revocations.jsonl'),'--maintenance',join(a.root,'maintenance.json')];
   const restored=run('dist/cli/main.js',args);assert.equal(restored.status,0,restored.stderr);
   assert.equal((await b.service.recall({ids:[forgotten.memory_id]})).items.length,0);
   assert.equal((await b.service.recall({ids:[retained.memory_id]})).items[0].revision,1);
@@ -78,13 +78,13 @@ test('P1 migration keeps legacy records unverified and marks unknown writer hone
  dropTemporalProjection(s.db);
  s.db.exec("DROP TRIGGER version_dependency_insert; DROP TABLE version_dependencies; DROP TABLE revoked_aliases; DROP INDEX version_content_hash; DROP TABLE association_edges; DROP TABLE projection_jobs; DROP TABLE learning_events; DELETE FROM meta WHERE key='learning_watermark'; DROP INDEX tombstones_hash; DELETE FROM meta WHERE key='graph_epoch'; DROP TABLE memory_relations; DROP TABLE proposal_transitions; DROP TRIGGER version_insert; DROP TRIGGER version_advance; DROP TABLE memory_versions; DROP TABLE revoked_version_hashes; ALTER TABLE memories DROP COLUMN written_by; ALTER TABLE proposals DROP COLUMN connection_id; ALTER TABLE events DROP COLUMN connection_id; PRAGMA user_version=3;");
  const row=s.db.prepare('SELECT body FROM memories WHERE id=?').get(m.memory_id),body=JSON.parse(row.body);body.verification={method:'legacy claims checked',summary:'Old metadata'};s.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(body),m.memory_id);s.close();
- const reopened=new MemoryService(config);try{const item=(await reopened.recall({ids:[m.memory_id]})).items[0];assert.equal(item.verification.status,'unverified');assert.equal(item.written_by,'legacy:unknown');assert.equal(reopened.inspect().schema,12);assert.equal(reopened.check().integrity[0].integrity_check,'ok');}finally{reopened.close();}
+ const reopened=new MemoryService(config);try{const item=(await reopened.recall({ids:[m.memory_id]})).items[0];assert.equal(item.verification.status,'unverified');assert.equal(item.written_by,'legacy:unknown');assert.equal(reopened.inspect().schema,13);assert.equal(reopened.check().integrity[0].integrity_check,'ok');}finally{reopened.close();}
 });
 
 test('P1 readonly MCP exposes only recall and rejects hidden write tools',async()=>{
  const {service:s,config,root}=await setup();s.close();const path=join(root,'reader.json');await writeFile(path,JSON.stringify({...config,operations:['recall'],connection_id:'reader:wire'}));
  const c=new Client({name:'self-declared-admin',version:'test'});await c.connect(new StdioClientTransport({command:process.execPath,args:[resolve('dist/mcp/server.js')],env:{SHARED_MEMORY_CONFIG:path},stderr:'pipe'}));
- try{assert.deepEqual((await c.listTools()).tools.map(t=>t.name),['memory_recall']);assert.match(c.getInstructions(),/reader:wire/);const denied=await c.callTool({name:'memory_forget',arguments:{request_id:randomUUID(),memory_id:randomUUID(),expected_revision:1}});assert.equal(denied.isError,true);}finally{await c.close();}
+ try{assert.deepEqual((await c.listTools()).tools.map(t=>t.name),['memory_recall','memory_resolve_project']);assert.match(c.getInstructions(),/reader:wire/);const denied=await c.callTool({name:'memory_forget',arguments:{request_id:randomUUID(),memory_id:randomUUID(),expected_revision:1}});assert.equal(denied.isError,true);}finally{await c.close();}
 });
 
 test('P2 installer separates work directory; profiles and Codex mapping select actual UUID',async()=>{

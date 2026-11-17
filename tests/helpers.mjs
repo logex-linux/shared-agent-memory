@@ -7,9 +7,36 @@ import { after } from 'node:test';
 export const MODEL=resolve('.local/models/bge-small-zh-v1.5');
 const removeFixture=path=>rm(path,{recursive:true,force:true,maxRetries:3});
 export function restoreSchema11Storage(db) {
-  db.exec(`UPDATE memory_versions AS v SET body=(SELECT m.body FROM memories m WHERE m.id=v.memory_id AND m.revision=v.revision) WHERE v.body='';
+  db.exec(`DROP TRIGGER current_rule_insert;
+    DROP TRIGGER current_rule_update;
+    DROP INDEX search_current_rules;
+    DROP INDEX search_subject;
+    ALTER TABLE memory_search DROP COLUMN subject_id;
+    ALTER TABLE memory_search DROP COLUMN context_key;
+    ALTER TABLE memory_search DROP COLUMN kind;
+    ALTER TABLE proposals DROP COLUMN work_directory;
+    DROP INDEX pending_proposal_expiry;
+    ALTER TABLE proposals DROP COLUMN expires_at;
+    DROP TABLE retired_memories;
+    DROP TABLE maintenance_actions;
+    DELETE FROM meta WHERE key IN ('maintenance_pending','recovery_pending');
+    UPDATE memory_versions AS v SET body=(SELECT m.body FROM memories m WHERE m.id=v.memory_id AND m.revision=v.revision) WHERE v.body_state='head';
+    DROP TRIGGER version_insert;
+    DROP TRIGGER version_advance;
     DROP TRIGGER version_dependency_insert;
+    DROP VIEW version_body_aliases;
     DROP VIEW memory_version_bodies;
+    DROP TABLE version_aliases;
+    DROP INDEX record_versions_by_time;
+    ALTER TABLE memory_versions DROP COLUMN body_state;
+    ALTER TABLE memory_versions DROP COLUMN pruned_context;
+    ALTER TABLE version_dependencies DROP COLUMN parent_revision;
+    CREATE TRIGGER version_insert AFTER INSERT ON memories BEGIN
+      INSERT INTO memory_versions VALUES(new.id,new.revision,new.body,new.content_hash,new.verified_at,new.profile_id,new.written_by);
+    END;
+    CREATE TRIGGER version_advance AFTER UPDATE OF revision ON memories WHEN new.revision<>old.revision BEGIN
+      INSERT INTO memory_versions VALUES(new.id,new.revision,new.body,new.content_hash,new.verified_at,new.profile_id,new.written_by);
+    END;
     CREATE TRIGGER version_dependency_insert AFTER INSERT ON memory_versions BEGIN
       INSERT OR IGNORE INTO version_dependencies SELECT json_extract(d.value,'$.memory_id'),new.memory_id,new.revision
       FROM json_each(new.body,'$.derived_from') d;
@@ -48,4 +75,9 @@ export function record(project,overrides={}) {
 export async function publish(service,record,update={}) {
   const p=await service.propose({request_id:randomUUID(),record,...update});
   return service.commit({request_id:randomUUID(),proposal_id:p.proposal_id,expected_revision:p.expected_revision});
+}
+export function forget(service,input) {
+  const {memory_id,expected_revision}=input;
+  input.plan_hash??=service.forgetPreview({memory_id,expected_revision}).plan_hash;
+  return service.forget(input);
 }

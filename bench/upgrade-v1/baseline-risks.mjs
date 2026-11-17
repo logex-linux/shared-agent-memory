@@ -52,7 +52,8 @@ try {
   assert.equal(s.db.prepare('SELECT count(*) n FROM events').get().n, eventCount);
   assert.equal(typeof s.feedback, 'undefined');
 
-  await s.forget({request_id:randomUUID(), memory_id:parent.memory_id, expected_revision:2});
+  const target={memory_id:parent.memory_id,expected_revision:2};
+  await s.forget({request_id:randomUUID(),...target,...(s.forgetPreview&&{plan_hash:s.forgetPreview(target).plan_hash})});
   assert.equal(s.previewImport(oldExport).action, 'blocked_revoked');
   assert.equal(s.previewImport({...oldExport, id:randomUUID()}).action, 'create');
   console.log(JSON.stringify({

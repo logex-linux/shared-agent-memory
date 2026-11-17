@@ -3,14 +3,16 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as sqliteVec from 'sqlite-vec';
 import { MemoryError } from '../core/contracts.js';
-import { migrateSearch, migrateTemporalSearch } from '../retrieval/indexes.js';
-import { compactVersionBodies, migrateVersions } from '../memory/versions.js';
+import { migrateSearch, migrateSubjects, migrateTemporalSearch } from '../retrieval/indexes.js';
+import { compactVersionBodies, migrateVersionLifecycle, migrateVersions } from '../memory/versions.js';
 import { migrateRelations } from '../memory/transitions.js';
 import { migrateGraph } from '../retrieval/graph.js';
 import { migrateErasure } from '../memory/erasure.js';
 import { indexAssociationWalk, migrateFeedback } from '../memory/feedback.js';
+import { migrateMaintenance } from '../memory/recovery.js';
+import { migrateProposalExpiry } from '../memory/retention.js';
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 export class Storage {
   db: DatabaseSync;
@@ -109,6 +111,16 @@ export class Storage {
       compactVersionBodies(this.db);
       this.db.exec('DROP TABLE memories_fts; PRAGMA user_version=12;');
     }
+    if(version<13){
+      migrateSubjects(this.db);
+      migrateVersionLifecycle(this.db);
+      migrateMaintenance(this.db);
+      migrateProposalExpiry(this.db);
+      this.db.exec(`
+        ALTER TABLE proposals ADD COLUMN work_directory TEXT;
+        PRAGMA user_version=13;
+      `);
+    }
   }
   transaction<T>(fn:()=>T):T {
     try {
@@ -120,6 +132,7 @@ export class Storage {
       try { const result=fn(); this.db.exec('COMMIT'); return result; }
       catch(error) { this.db.exec('ROLLBACK'); throw error; }
     } catch(error:any) {
+      if (error.message==='CURRENT_RULE_CONFLICT')throw new MemoryError('CURRENT_RULE_CONFLICT');
       if (error.code==='ERR_SQLITE_ERROR' && /locked|busy/i.test(error.message)) throw new MemoryError('BUSY_RETRYABLE');
       throw error;
     }

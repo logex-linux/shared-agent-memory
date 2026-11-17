@@ -64,6 +64,31 @@ export function migrateTemporalSearch(db:DatabaseSync) {
   `);
 }
 
+export const CURRENT_RULE = "status='active' AND lifecycle='current' AND decision_state='adopted' AND kind IN ('preference','decision') AND length(trim(subject_id))>0 AND length(trim(context_key))>0";
+
+export function migrateSubjects(db:DatabaseSync) {
+  db.exec(`
+    ALTER TABLE memory_search ADD COLUMN subject_id TEXT GENERATED ALWAYS AS (json_extract(metadata,'$.subject_id')) VIRTUAL;
+    ALTER TABLE memory_search ADD COLUMN context_key TEXT GENERATED ALWAYS AS (json_extract(metadata,'$.context_key')) VIRTUAL;
+    ALTER TABLE memory_search ADD COLUMN kind TEXT GENERATED ALWAYS AS (json_extract(metadata,'$.kind')) VIRTUAL;
+    CREATE INDEX search_subject ON memory_search(subject_id,context_key);
+    CREATE INDEX search_current_rules ON memory_search(scope,project_id,subject_id,context_key,environment) WHERE ${CURRENT_RULE};
+  `);
+  // Existing rows are preserved even if a previous runtime admitted duplicates.
+  // New revisions must close conflicting rules within the same SQLite transaction.
+  for(const operation of ['INSERT','UPDATE'] as const)db.exec(`
+    CREATE TRIGGER current_rule_${operation.toLowerCase()} AFTER ${operation} ON memory_search
+    ${operation==='UPDATE'?"WHEN old.revision<>new.revision OR old.scope<>new.scope OR old.project_id IS NOT new.project_id":''}
+    BEGIN
+      SELECT RAISE(ABORT,'CURRENT_RULE_CONFLICT') WHERE
+        (SELECT 1 FROM memory_search WHERE memory_id=new.memory_id AND ${CURRENT_RULE}) AND
+        EXISTS(SELECT 1 FROM memory_search WHERE ${CURRENT_RULE} AND scope=new.scope
+          AND project_id IS new.project_id AND subject_id=new.subject_id AND context_key=new.context_key
+          AND environment IS new.environment AND memory_id<>new.memory_id);
+    END;
+  `);
+}
+
 export function indexChunk(db:DatabaseSync,chunk:{id:number;memory_id:string;text:string},title:string,tags:string[]) {
   db.prepare('INSERT INTO chunk_fts VALUES(?,?,?)').run(chunk.id,chunk.memory_id,terms(title+' '+chunk.text+' '+tags.join(' ')).join(' '));
   const insert=db.prepare('INSERT INTO chunk_identifiers VALUES(?,?,?,?)');

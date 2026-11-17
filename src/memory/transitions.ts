@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { MemoryError, type MemoryRecord, type ProposeInput } from '../core/contracts.js';
 
-export type TransitionPlan = Pick<ProposeInput,'transition'|'expected_refs'|'relations'>;
+export type TransitionPlan = Pick<ProposeInput,'transition'|'expected_refs'|'relations'|'version_evolution'>;
 
 export function migrateRelations(db:DatabaseSync) {
   db.exec(`
@@ -26,15 +26,24 @@ export function migrateRelations(db:DatabaseSync) {
   `);
 }
 
-export function validateTransition(record:MemoryRecord, previous:MemoryRecord, type:TransitionPlan['transition']) {
+export function validateTransition(record:MemoryRecord, previous:MemoryRecord, type:TransitionPlan['transition'], evolution?:TransitionPlan['version_evolution']) {
   if (type!=='reinforce' && type!=='supersede' && type!=='branch') return;
   if (!record.subject_id || record.subject_id!==previous.subject_id)throw new MemoryError('TRANSITION_SUBJECT_MISMATCH');
   if ((previous.lifecycle??'current')!=='current' || (record.lifecycle??'current')!=='current')
     throw new MemoryError('TRANSITION_LIFECYCLE_CONFLICT');
   const contextPairs = [
     [record.context_key,previous.context_key],
-    ...(['branch','commit','environment'] as const).map(k=>[record.valid_for[k],previous.valid_for[k]])
+    ...(['branch','environment'] as const).map(k=>[record.valid_for[k],previous.valid_for[k]])
   ];
+  if(!evolution)contextPairs.push([record.valid_for.commit,previous.valid_for.commit]);
+  else {
+    const {from_commit,to_commit,sources}=evolution;
+    const supports=(commit:string)=>sources.some(s=>s.revision_ref===commit && ['code','test'].includes(s.source_type));
+    if(!record.context_key || from_commit===to_commit || !supports(from_commit)||!supports(to_commit) ||
+      previous.valid_for.commit && previous.valid_for.commit!==from_commit ||
+      record.valid_for.commit && record.valid_for.commit!==to_commit)
+      throw new MemoryError('TRANSITION_VERSION_EVIDENCE_REQUIRED');
+  }
   if(type==='branch') {
     if(!contextPairs.some(([a,b])=>a&&b&&a!==b))throw new MemoryError('TRANSITION_CONTEXT_NOT_DISTINCT');
     return;

@@ -28,9 +28,14 @@ export function migrateErasure(db:DatabaseSync) {
 
 export function revokeVersions(db:DatabaseSync,id:string) {
   db.prepare('INSERT OR IGNORE INTO revoked_version_hashes SELECT memory_id,content_hash FROM memory_versions WHERE memory_id=?').run(id);
-  db.prepare(`INSERT OR IGNORE INTO revoked_aliases SELECT memory_id,'import_key',json_extract(body,'$.import_key')
-    FROM memory_version_bodies WHERE memory_id=? AND json_extract(body,'$.import_key') IS NOT NULL`).run(id);
-  db.prepare(`INSERT OR IGNORE INTO revoked_aliases SELECT v.memory_id,'source_hash',json_extract(s.value,'$.source_hash')
-    FROM memory_version_bodies v,json_each(v.body,'$.sources') s WHERE v.memory_id=?
-    AND json_extract(s.value,'$.source_hash') IS NOT NULL`).run(id);
+  db.prepare('INSERT OR IGNORE INTO revoked_aliases SELECT memory_id,kind,value FROM version_aliases WHERE memory_id=?').run(id);
+}
+
+export function erasureTree(db:DatabaseSync,id:string) {
+  return db.prepare(`WITH RECURSIVE children(id) AS (
+    VALUES(?) UNION SELECT d.child_id FROM dependencies d JOIN children c ON d.parent_id=c.id
+    UNION SELECT d.child_id FROM version_dependencies d JOIN children c ON d.parent_id=c.id
+    UNION SELECT copy.memory_id FROM children c JOIN memory_versions v ON v.memory_id=c.id
+      JOIN memory_versions copy ON copy.content_hash=v.content_hash
+  ) SELECT id FROM children ORDER BY id`).all(id).map(row=>String(row.id));
 }

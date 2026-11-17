@@ -39,16 +39,16 @@ npm run cli -- check
 ```sh
 npm run cli -- export --project "$PROJECT_ID"
 npm run cli -- import --input /absolute/path/export.json
-npm run cli -- import --mode restore --input /absolute/path/export.json --revocations /absolute/path/latest-revocations.jsonl --commit
+npm run cli -- import --mode restore --input /absolute/path/export.json --revocations /absolute/path/latest-revocations.jsonl --maintenance /absolute/path/maintenance.json --commit
 ```
 
-import 默认只预览。提交必须显式选择 `--mode new`（新的外部原始记录数组，不允许导出身份字段）或 `--mode restore`（恢复导出，可为对象、导出数组或记录正文数组）。为避免改输入结构绕过校验，所有 `--commit` 均须提供外部 `--revocations` 最新清单，连原始正文数组也不例外。全新且没有撤销历史的资料库可显式提供空清单；系统不能凭文件名证明清单最新，操作者必须取得真实最新版本。导出对象重导保留 ID/revision，并要求最新的外部撤销清单，先应用撤销再导入。不能把旧导出自带清单当成最新清单，也不能在有版本冲突时强行覆盖。重复导入保持幂等，已撤销记录不得因旧导出复活。
+import 默认只预览。提交时选择 `--mode new` 导入新的外部记录数组，或选择 `--mode restore` 恢复导出。两种模式都使用活跃安装的最新 `--revocations` 和 `--maintenance` 文件。全新库可显式用空清单。恢复保留 ID 和 revision，有冲突时返回错误。 [Schema 13 维护和恢复](upgrade-v1/lifecycle.md)
 
 `sources[].source_hash` 是来源文件 hash；导入预览中的 source_hash 是整个来源描述集合的摘要，二者含义不同。
 
 导出文件登记在库内，遗忘会触发受管理副本清理。文件清理失败返回 pending，可修复权限或路径问题后重跑 maintenance。撤销清单同步失败时，`REVOCATIONS_UNSYNCED_RESTORE_FORBIDDEN` 表示尚不能进行恢复。数据库 tombstone 是权威，外部清单通过可重试维护同步。
 
-本系统不提供覆盖在线数据库的 restore 命令。需要文件级备份时，应停写并完成 checkpoint，且单独保存最新撤销清单。不要把正在写入的 SQLite 文件直接通过网盘同步成多机共享数据库。
+文件级恢复用 `restore-backup` 生成隔离副本。使用 SQLite 一致性备份，独立保存最新撤销和维护清单。通过核验后按安装清单切换运行库。 [恢复步骤](upgrade-v1/lifecycle.md#installation-archives-and-recovery)
 
 ## 停用
 

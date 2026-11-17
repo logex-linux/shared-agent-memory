@@ -82,7 +82,15 @@ export const estimateTokens = (bytes: number) => Math.ceil(bytes / 3);
 function eligibility(db:DatabaseSync,input: RecallInput, config: Config, effectiveAt:string) {
     const params: SQLInputValue[] = [Number(!input.project_id && config.all_projects), JSON.stringify(input.project_id ? [input.project_id] : config.allowed_projects), Number(input.include_global ?? (!input.project_id && config.allow_global))];
     let sql = "s.status='active' AND ((s.scope='project' AND s.project_id IN (SELECT p.id FROM projects p WHERE ?=1 OR p.id IN (SELECT value FROM json_each(?)))) OR (?=1 AND s.scope='global'))";
+    if(input.exclude_ids?.length) {
+        sql+=' AND s.memory_id NOT IN (SELECT value FROM json_each(?))';
+        params.push(JSON.stringify(input.exclude_ids));
+    }
     if (input.versions) return {sql,params};
+    for(const key of ['subject_id','context_key'] as const)if(input[key]!==undefined) {
+        sql+=` AND s.${key}=?`;
+        params.push(input[key]);
+    }
     sql += ' AND (s.expires_at IS NULL OR julianday(s.expires_at)>julianday(?))';
     params.push(new Date().toISOString());
     for (const [column, key] of [['branch', 'branch'], ['commit_ref', 'commit'], ['environment', 'environment']] as const) {
@@ -192,9 +200,11 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             progress = parse(found.row.progress);
             effectiveAt=progress.effectiveAt??input.as_of??effectiveAt;
             warnings = progress.warnings;
-            for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state', 'graph'] as const)
+            for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state', 'graph','subject_id','context_key'] as const)
                 if (request[key] !== undefined && request[key] !== input[key])
                     throw new MemoryError('CURSOR_QUERY_MISMATCH');
+            if(request.exclude_ids!==undefined && hash(request.exclude_ids)!==hash(input.exclude_ids??[]))
+                throw new MemoryError('CURSOR_QUERY_MISMATCH');
             if (Object.keys(request.context).length && hash(request.context) !== hash(input.context))
                 throw new MemoryError('CURSOR_QUERY_MISMATCH');
         }
@@ -592,10 +602,14 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     selected = selected.slice(0, 1);
             }
         }
-        const flags = new Map<string,number>();
+        const flags = new Map<string,number>(),prunedVersions=[];
         if (request.versions) {
-            const visible = db.prepare(`SELECT v.revision, s.revision current_revision, json_extract(v.body,'$.valid_for') valid_for,
-                json_extract(v.body,'$.decision_state') decision_state, json_extract(v.body,'$.valid_time') valid_time
+            const visible = db.prepare(`SELECT v.revision,v.body_state,s.revision current_revision,
+                json_extract(coalesce(v.body,v.pruned_context),'$.valid_for') valid_for,
+                json_extract(coalesce(v.body,v.pruned_context),'$.subject_id') subject_id,
+                json_extract(coalesce(v.body,v.pruned_context),'$.context_key') context_key,
+                json_extract(coalesce(v.body,v.pruned_context),'$.decision_state') decision_state,
+                json_extract(coalesce(v.body,v.pruned_context),'$.valid_time') valid_time
                 FROM memory_version_bodies v JOIN memory_search s ON s.memory_id=v.memory_id
                 WHERE v.memory_id=? AND v.revision=? AND ${eligible.sql}
                 AND NOT EXISTS(SELECT 1 FROM tombstones t WHERE t.id=v.memory_id OR t.content_hash=v.content_hash)
@@ -603,11 +617,17 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             for (const [key,ref] of versions) {
                 const row = visible.get(ref.memory_id,ref.revision,...eligible.params);
                 if (!row) continue;
+                if (input.subject_id!==undefined && row.subject_id!==input.subject_id ||
+                    input.context_key!==undefined && row.context_key!==input.context_key)continue;
                 const valid = parse(String(row.valid_for ?? '{}'),true);
                 if (input.decision_state && row.decision_state!==input.decision_state) continue;
                 if (input.as_of && !coversEffectiveTime(parse(String(row.valid_time ?? '{}'),true),effectiveAt)) continue;
                 const keys = ['branch','commit','environment'] as const;
                 if (keys.some(k=>valid[k] && input.context[k] && valid[k]!==input.context[k])) continue;
+                if(row.body_state==='pruned') {
+                    prunedVersions.push(ref);
+                    continue;
+                }
                 flags.set(key,Number(row.revision!==row.current_revision ||
                     valid.expires_at && Date.parse(valid.expires_at)<=Date.now() ||
                     keys.some(k=>valid[k] && !input.context[k])));
@@ -643,6 +663,10 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 :{state:['GRAPH_DISABLED','GRAPH_EXACT_ONLY'].includes(progress.graphReason)?'disabled':'degraded',reason:progress.graphReason};
         const pageWarnings = cachedWarnings?.initial ?? [...new Set(warnings)];
         const result: any = { items: [], generation: gen, retrieval_mode: retrievalMode, warnings: [...pageWarnings], empty_reason: null, evidence_status: 'none', has_more: false, next_cursor: null, retrieval: cachedWarnings ? {...draftPlan, graph:plan.graph} : plan };
+        if(prunedVersions.length) {
+            result.pruned_versions=prunedVersions;
+            result.warnings.push('VERSION_PRUNED');
+        }
         if(state && config.operations.includes('feedback'))
             result.feedback_receipt=savedPage?cachedFeedback?.token:randomUUID();
         // Explicit expansion has no query cursor. Account for continuation IDs in
@@ -706,6 +730,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 body.lifecycle==='historical'&&!input.as_of || !coversEffectiveTime(body.valid_time,effectiveAt);
             const strength = !unknownTime && !mismatchedDecision && (expansion || c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold)) ? 'supported' : 'weak';
             const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: requiresCheck ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? [ref?'version':'id'], ...extendedMetadata(body) };
+            if(ref&&(body.scope!==row.scope||body.project_id!==row.project_id))
+                item.recorded_ownership={scope:body.scope,project_id:body.project_id};
             if (input.as_of) item.effective_time=unknownTime?'unknown':'matched';
             if (unknownTime && !result.warnings.includes('EFFECTIVE_TIME_UNKNOWN')) result.warnings.push('EFFECTIVE_TIME_UNKNOWN');
             if (ref) Object.assign(item,{recorded_at:row.recorded_at,current_revision:row.current_revision,history_start_revision:row.history_start_revision,
@@ -800,7 +826,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         profileTrace?.add('state_persist',performance.now()-persistStarted);
         const serializationStarted=performance.now();
         result.evidence_status = result.items.some((i: any) => i.evidence_strength === 'supported') ? 'related_evidence' : 'insufficient';
-        result.empty_reason = result.items.length ? null : blocked ? 'item_exceeds_budget' : 'no_relevant_evidence';
+        result.empty_reason = result.items.length ? null : blocked ? 'item_exceeds_budget' :
+            prunedVersions.length?'version_pruned':'no_relevant_evidence';
         d.elapsed_ms = Number((performance.now() - start).toFixed(3));
         d.content_estimated_tokens = estimateTokens(Buffer.byteLength(JSON.stringify(result)));
         if (debug) {

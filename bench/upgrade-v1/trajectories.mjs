@@ -92,7 +92,8 @@ async function populate(service,modern) {
           saved[step.record]=await publish(service,body(material[step.record]),
             modern?{transition:'branch',expected_refs:[refs(saved[step.target])]}:{});
         } else if(step.type==='forget') {
-          const result=await service.forget({request_id:randomUUID(),memory_id:saved[step.target].memory_id,expected_revision:step.expected_revision});
+          const target={memory_id:saved[step.target].memory_id,expected_revision:step.expected_revision};
+          const result=await service.forget({request_id:randomUUID(),...target,...(service.forgetPreview&&{plan_hash:service.forgetPreview(target).plan_hash})});
           assert.equal(result.derived_erased,1);
         }
       }

@@ -2,7 +2,7 @@ import test from 'node:test';import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';import {writeFile,readFile} from 'node:fs/promises';import {DatabaseSync} from 'node:sqlite';
 import {randomUUID} from 'node:crypto';
 import {MemoryService} from '../dist/core/service.js';import {recallSchema} from '../dist/core/contracts.js';
-import {setup,record,publish} from './helpers.mjs';import {fake,seed,collect} from './adaptive-helpers.mjs';
+import { forget,setup,record,publish} from './helpers.mjs';import {fake,seed,collect} from './adaptive-helpers.mjs';
 const worker=(path,operation,arg)=>new Promise((resolve,reject)=>{const c=spawn(process.execPath,['tests/adaptive-worker.mjs',path,operation,JSON.stringify(arg??{})]);let out='',err='';c.stdout.on('data',b=>out+=b);c.stderr.on('data',b=>err+=b);c.on('error',reject);c.on('exit',(code,signal)=>resolve({code,signal,result:out.trim()?JSON.parse(out):null,err}));});
 
 test('focused returns a single relevant fact; normal responses omit diagnostics; legacy limit accepts large page requests',async()=>{
@@ -41,9 +41,10 @@ test('new, revised and forgotten records invalidate cursors; concurrent writers 
   try{
    if(mutation==='new'){const path=root+'/writer.json';await writeFile(path,JSON.stringify(config));const concurrent=await Promise.all([worker(path,'write'),worker(path,'page',{cursor:first.next_cursor})]);assert.equal(concurrent[0].code,0,JSON.stringify(concurrent));if(concurrent[1].code!==0)assert.equal(concurrent[1].result.error,'CURSOR_STALE');}
    else if(mutation==='update')await publish(s,record(project,{title:'设计偏好修订',content:'仅保留新版本内容'}),{target_id:target.id,expected_revision:target.revision});
-   else await s.forget({request_id:randomUUID(),memory_id:target.id,expected_revision:target.revision});
-   await assert.rejects(s.recall({cursor:first.next_cursor}),{code:'CURSOR_STALE'});
-   await assert.rejects(s.recall({cursor:first.next_cursor.replace(/:\d+$/,':0')}),{code:'CURSOR_STALE'});
+   else await forget(s,{request_id:randomUUID(),memory_id:target.id,expected_revision:target.revision});
+   const error={code:mutation==='forget'?'CURSOR_EXPIRED':'CURSOR_STALE'};
+   await assert.rejects(s.recall({cursor:first.next_cursor}),error);
+   await assert.rejects(s.recall({cursor:first.next_cursor.replace(/:\d+$/,':0')}),error);
    const current=await collect(s,{query:'设计偏好',mode:'broad'});assert.ok(current.pages.flatMap(p=>p.items).filter(i=>i.id===target.id).every(i=>mutation==='update'?i.revision===2:mutation!=='forget'));
   }finally{s.close();}
  }

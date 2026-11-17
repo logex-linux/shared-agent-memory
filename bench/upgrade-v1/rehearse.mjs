@@ -71,7 +71,7 @@ async function call(definition,expectedVersion,record,versions=false){
     await client.connect(transport);
     assert.equal(client.getServerVersion()?.version,expectedVersion);
     const names=(await client.listTools()).tools.map(tool=>tool.name).sort();
-    assert.deepEqual(names,['memory_commit','memory_propose','memory_recall']);
+    assert.deepEqual(names,['memory_commit','memory_propose','memory_recall','memory_renew_proposal','memory_resolve_project']);
     const result=await client.callTool({name:'memory_recall',arguments:versions?
       {versions:[{memory_id:record.memory_id,revision:record.revision}]}:{ids:[record.memory_id]}});
     assert.equal(result.isError,undefined);

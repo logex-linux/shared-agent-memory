@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile,mkdir,rm,writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { setup,record,publish } from './helpers.mjs';
+import { forget, setup,record,publish } from './helpers.mjs';
 import { MemoryService } from '../dist/core/service.js';
 test('weak lexical candidates remain visible as insufficient evidence, not certified facts',async()=>{
   const {service:s,project}=await setup();
@@ -26,7 +26,7 @@ test('export/import preserves ID/revision; repeat import is idempotent; revocati
     assert.equal((await b.importEntry(data.memories[0])).unchanged,true);
     assert.equal(b.db.prepare('SELECT count(*) n FROM memories').get().n,1);
     const importedExport=await b.export(first.project);
-    await a.forget({request_id:randomUUID(),memory_id:initial.memory_id,expected_revision:2});
+    await forget(a,{request_id:randomUUID(),memory_id:initial.memory_id,expected_revision:2});
     const revocations=(await readFile(first.root+'/revocations.jsonl','utf8')).trim().split('\n').map(JSON.parse);
     await b.applyRevocations(revocations);
     await b.maintenance();
@@ -54,7 +54,7 @@ test('maintenance reports export cleanup and revocation synchronization failures
   try{
     const m=await publish(s,record(project));const e=await s.export(project);
     await rm(e.path);await mkdir(e.path);await mkdir(root+'/revocations.jsonl.tmp');
-    const result=await s.forget({request_id:randomUUID(),memory_id:m.memory_id,expected_revision:1});
+    const result=await forget(s,{request_id:randomUUID(),memory_id:m.memory_id,expected_revision:1});
     assert.equal(result.maintenance.managed_exports_pending,1);assert.equal(result.maintenance.revocations_synced,false);
     assert.equal(s.db.prepare("SELECT value FROM meta WHERE key='revocations_pending'").get().value,1);
     await rm(e.path,{recursive:true});await rm(root+'/revocations.jsonl.tmp',{recursive:true});

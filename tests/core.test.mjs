@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile, access } from 'node:fs/promises';
 import { MemoryService } from '../dist/core/service.js';
-import { setup,record,publish } from './helpers.mjs';
+import { forget, setup,record,publish } from './helpers.mjs';
 
 test('real embedding publish, paraphrase, exact identifier, provenance, proposal invisibility',async()=>{
   const {service:s,project}=await setup();
@@ -106,9 +106,9 @@ test('forget removes bodies, derivatives, candidates, exports, indexes and retry
     const proposal=await s.propose({request_id:randomUUID(),record:record(project,{content:unique+'待提交',derived_from:[{memory_id:base.memory_id,revision:1}]})});
     const exported=await s.export(project);
     const req={request_id:randomUUID(),memory_id:base.memory_id,expected_revision:1};
-    const result=await s.forget(req);assert.equal(result.derived_erased,1);assert.equal(result.maintenance.managed_exports_pending,0);
+    const result=await forget(s,req);assert.equal(result.derived_erased,1);assert.equal(result.maintenance.managed_exports_pending,0);
     await assert.rejects(access(exported.path));
-    assert.deepEqual((await s.forget(req)).memory_id,result.memory_id);
+    assert.deepEqual((await forget(s,req)).memory_id,result.memory_id);
     assert.equal((await s.recall({project_id:project,ids:[base.memory_id,child.memory_id]})).items.length,0);
     const second=new MemoryService(config);try{assert.equal((await second.recall({project_id:project,query:unique})).items.length,0);}finally{second.close();}
     await assert.rejects(s.commit({request_id:randomUUID(),proposal_id:proposal.proposal_id,expected_revision:0}),{code:'PROPOSAL_NOT_PENDING'});
@@ -127,7 +127,7 @@ test('degraded read is explicit, failed embedding never publishes, rebuild recov
     const fail=new MemoryService(config,broken);
     try{
       const r=await fail.recall({project_id:project,query:'-67050'});assert.equal(r.retrieval_mode,'lexical_degraded');assert.equal(r.items[0].id,m.memory_id);
-      const p=await fail.propose({request_id:randomUUID(),record:record(project)});
+      const p=await fail.propose({request_id:randomUUID(),record:record(project,{content:'A distinct embedding failure fixture.'})});
       await assert.rejects(fail.commit({request_id:randomUUID(),proposal_id:p.proposal_id,expected_revision:0}),{code:'EMBEDDING_UNAVAILABLE'});
       assert.equal(fail.db.prepare('SELECT count(*) n FROM memories').get().n,1);
     }finally{fail.close();}

@@ -6,7 +6,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { backup, DatabaseSync } from 'node:sqlite';
 import * as vec from 'sqlite-vec';
-import { record, publish, dropTemporalProjection, restoreSchema11Storage } from './helpers.mjs';
+import { forget, record, publish, dropTemporalProjection, restoreSchema11Storage } from './helpers.mjs';
 import { fake, setupFake } from './adaptive-helpers.mjs';
 import { MemoryService } from '../dist/core/service.js';
 import { hash } from '../dist/core/contracts.js';
@@ -49,12 +49,12 @@ test('migration is atomic across interruption and racing opens, preserving Schem
   assert.equal(committed.signal,'SIGKILL',String(committed.stderr));
   const postCommit=new DatabaseSync(committedCopy,{readOnly:true,allowExtension:true});vec.load(postCommit);
   try {
-    assert.equal(postCommit.prepare('PRAGMA user_version').get().user_version,12);
+    assert.equal(postCommit.prepare('PRAGMA user_version').get().user_version,13);
     assert.equal(postCommit.prepare('SELECT count(*) n FROM memory_versions').get().n,1);
     assert.deepEqual(signature(postCommit),before);
   } finally {postCommit.close();}
   const runs=await Promise.all(Array.from({length:4},()=>inspectWorker(configPath)));
-  for(const run of runs){assert.equal(run.code,0,run.error);assert.equal(JSON.parse(run.output).schema,12);}
+  for(const run of runs){assert.equal(run.code,0,run.error);assert.equal(JSON.parse(run.output).schema,13);}
   const migrated=new MemoryService({...config,database:copy},fake);
   try {
     assert.deepEqual(signature(migrated.db),before);
@@ -85,17 +85,20 @@ test('Schema 11 compacts only current bodies and reuses chunk FTS for scoped dup
   s.close();
   const migrated=new MemoryService(config,fake);
   try {
-    assert.equal(migrated.storage.schema(),12);
+    assert.equal(migrated.storage.schema(),13);
     assert.equal(migrated.storage.generation(),gen);
-    assert.deepEqual(ordered(migrated.db,'memory_version_bodies'),before);
-    assert.deepEqual(ordered(migrated.db,'version_dependencies'),dependencies);
+    assert.deepEqual(ordered(migrated.db,'memory_version_bodies').map(({body_state,pruned_context,...row})=>row),before.map(row=>({...row})));
+    assert.deepEqual(ordered(migrated.db,'version_dependencies').map(({parent_revision,...row})=>{
+      assert.equal(parent_revision,1);
+      return row;
+    }),dependencies.map(row=>({...row})));
     const physical=ordered(migrated.db,'memory_versions');
     assert.equal(physical.filter(row=>row.body).length,1);
     assert.equal(JSON.parse(physical.find(row=>row.body).body).content,content);
     assert.equal(migrated.db.prepare("SELECT 1 FROM sqlite_master WHERE name='memories_fts'").get(),undefined);
     const hint=await migrated.propose({request_id:randomUUID(),record:fixture});
     assert.deepEqual(hint.similar_candidates.map(row=>[row.memory_id,row.revision]),[[child.memory_id,2]]);
-    await migrated.forget({request_id:randomUUID(),memory_id:parent.memory_id,expected_revision:1});
+    await forget(migrated,{request_id:randomUUID(),memory_id:parent.memory_id,expected_revision:1});
     assert.deepEqual((await migrated.recall({ids:[child.memory_id]})).items,[]);
     assert.equal(migrated.check().version_hash_errors.n,0);
   } finally {migrated.close();}
@@ -148,7 +151,7 @@ test('versioned restore validates history and revocation blocks old bytes even u
     await publish(s,record(project,{content:'New synthetic text',memory_form:'semantic'}),{target_id:initial.memory_id,expected_revision:1});
     const {path}=await s.export(project,false,'versioned');
     const archive=JSON.parse(await readFile(path,'utf8'));
-    assert.equal(archive.format,'shared-agent-memory/versions-v1');
+    assert.equal(archive.format,'shared-agent-memory/versions-v2');
     assert.equal(Object.hasOwn(archive,'memories'),false);
     assert.equal(archive.records[0].versions.length,2);
     assert.equal(dst.previewArchive(archive)[0].action,'create');
@@ -163,7 +166,7 @@ test('versioned restore validates history and revocation blocks old bytes even u
     assert.equal((await dst.recall({versions:[ref]})).items[0].content,'Old synthetic text');
     assert.equal(dst.check().version_mismatch.n,0);
     assert.equal(dst.check().version_hash_errors.n,0);
-    await s.forget({request_id:randomUUID(),memory_id:initial.memory_id,expected_revision:2});
+    await forget(s,{request_id:randomUUID(),memory_id:initial.memory_id,expected_revision:2});
     await assert.rejects(readFile(path),{code:'ENOENT'});
     assert.equal(s.db.prepare('SELECT count(*) n FROM memory_versions').get().n,0);
     const ledger=(await readFile(join(a.root,'revocations.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);

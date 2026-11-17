@@ -11,7 +11,7 @@ import { MemoryService } from '../dist/core/service.js';
 import { decayWeight } from '../dist/memory/feedback.js';
 import { QueryState } from '../dist/retrieval/state.js';
 import { setupFake, fake } from './adaptive-helpers.mjs';
-import { publish, record } from './helpers.mjs';
+import { forget, publish, record } from './helpers.mjs';
 
 const cli=promisify(execFile);
 const query={query:'SQLite rollback signing evidence',mode:'broad',view:'evidence',limit:2};
@@ -98,11 +98,11 @@ test('concurrent feedback and crash replay preserve one task contribution and it
     assert.equal(s.projectFeedback(100,true).watermark,result.watermark);
     assert.equal(s.db.prepare('SELECT weight FROM association_edges').get().weight,weight);
     assert.equal((await s.recall({ids:[request.used[0].memory_id]})).items[0].verification.status,'unverified');
-    await s.forget({request_id:randomUUID(),memory_id:request.used[0].memory_id,expected_revision:1});
+    await forget(s,{request_id:randomUUID(),memory_id:request.used[0].memory_id,expected_revision:1});
     assert.equal(count(s,'learning_events'),0);
     assert.equal(count(s,'association_edges'),0);
     assert.equal(s.db.prepare("SELECT count(*) n FROM events WHERE operation='feedback'").get().n,0);
-    await assert.rejects(s.feedback(request),{code:'FEEDBACK_EVIDENCE_STALE'});
+    await assert.rejects(s.feedback(request),{code:'FEEDBACK_RECEIPT_UNAVAILABLE'});
     assert.equal((await s.recall({ids:[request.used[1].memory_id]})).items.length,1);
   } finally {s.close();}
 });

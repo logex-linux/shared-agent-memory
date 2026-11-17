@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { MemoryService } from '../dist/core/service.js';
 import { setupFake, fake, vector } from './adaptive-helpers.mjs';
-import { record, publish } from './helpers.mjs';
+import { forget, record, publish } from './helpers.mjs';
 
 const request={query:'thermal pump outage restart procedure',mode:'focused',view:'evidence',limit:20,debug:true};
 const evidence=(project,title,content,overrides={})=>record(project,{
@@ -113,7 +113,7 @@ test('stale edges, deletion, corruption and pure graph changes have explicit saf
     const stale=await s.recall({...request,graph:true});
     assert.ok(stale.warnings.includes('GRAPH_STALE'));
     assert.ok(stale.items.every(i=>!i.graph_path));
-    await s.forget({request_id:randomUUID(),memory_id:relay.memory_id,expected_revision:updated.revision});
+    await forget(s,{request_id:randomUUID(),memory_id:relay.memory_id,expected_revision:updated.revision});
     assert.equal(s.db.prepare('SELECT count(*) n FROM memory_relations').get().n,0);
     const next=await s.recall({...request,graph:true});
     assert.ok(next.items.every(i=>i.id!==relay.memory_id&&!i.graph_path));

@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, realpathSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { hash, MemoryError, type Config } from '../core/contracts.js';
-export const RANKING_VERSION = 'adaptive-v1-state';
+export const RANKING_VERSION = 'adaptive-v1-lifecycle';
 const QUERY_TABLES = `
     CREATE TABLE IF NOT EXISTS queries(id TEXT PRIMARY KEY,authority TEXT NOT NULL,generation INTEGER NOT NULL,input TEXT NOT NULL,vector BLOB,profile TEXT,retrieval_mode TEXT NOT NULL,resolved TEXT NOT NULL,progress TEXT NOT NULL,expires INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS query_expiry ON queries(expires);
@@ -142,6 +142,8 @@ export class QueryState {
         };
     }
     saveInitialPage({query,candidates,seen,page}:ReturnType<QueryState['initialPage']>) {
+        if(Number(query.generation)<Number(this.db.prepare("SELECT value FROM cache_meta WHERE key='erased_before_generation'").get()?.value??0))
+            throw new MemoryError('CURSOR_STALE');
         this.db.prepare('INSERT INTO queries VALUES(?,?,?,?,?,?,?,?,?,?)').run(
             query.id,query.authority,query.generation,query.input,query.vector,query.profile,query.retrieval_mode,query.resolved,query.progress,query.expires);
         this.db.prepare(`INSERT INTO candidates SELECT ?,json_extract(value,'$.id'),json_extract(value,'$.data'),
@@ -150,6 +152,20 @@ export class QueryState {
             FROM json_each(?)`).run(query.id,candidates);
         this.db.prepare("INSERT INTO seen SELECT ?,json_extract(value,'$.channel'),json_extract(value,'$.id') FROM json_each(?)").run(query.id,seen);
         if(page)this.db.prepare('INSERT INTO pages VALUES(?,?,?,?,?)').run(page.q,page.n,page.ids,page.options,page.plan);
+    }
+    purgeBefore(generation:number) {
+        this.begin();
+        try {
+            for(const table of ['candidates','seen','pages'])this.db.prepare(`DELETE FROM ${table} WHERE q IN
+                (SELECT id FROM queries WHERE generation<?)`).run(generation);
+            this.db.prepare('DELETE FROM queries WHERE generation<?').run(generation);
+            this.db.exec('DELETE FROM cache_usage WHERE bytes=0');
+            this.db.prepare(`INSERT INTO cache_meta VALUES('erased_before_generation',?)
+                ON CONFLICT(key) DO UPDATE SET value=max(value,excluded.value)`).run(generation);
+            this.commit();
+        } catch(error) {this.rollback();throw error;}
+        const result=this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get()!;
+        return result.busy===0 && result.log===0;
     }
     lookup(cursor: string) {
         const match = /^am4:([0-9a-f-]{36}):(\d+)$/.exec(cursor);

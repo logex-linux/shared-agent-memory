@@ -1,4 +1,4 @@
-import test from'node:test';import assert from'node:assert/strict';import{spawn}from'node:child_process';import{writeFile,readFile,access}from'node:fs/promises';import{DatabaseSync}from'node:sqlite';import{randomUUID}from'node:crypto';import{MemoryService}from'../dist/core/service.js';import{QueryState}from'../dist/retrieval/state.js';import{setup,record,publish}from'./helpers.mjs';import{fake,seed,collect}from'./adaptive-helpers.mjs';
+import test from'node:test';import assert from'node:assert/strict';import{spawn}from'node:child_process';import{writeFile,readFile,access}from'node:fs/promises';import{DatabaseSync}from'node:sqlite';import{randomUUID}from'node:crypto';import{MemoryService}from'../dist/core/service.js';import{QueryState}from'../dist/retrieval/state.js';import{setup,record,publish,forget}from'./helpers.mjs';import{fake,seed,collect}from'./adaptive-helpers.mjs';
 const input={query:'设计偏好',mode:'broad',view:'evidence',limit:7,debug:true};
 async function exists(p){try{await access(p);return true;}catch{return false;}}
 async function until(p){const deadline=Date.now()+15000;while(!await exists(p)){if(Date.now()>deadline)throw Error('Missing barrier '+p);await new Promise(r=>setTimeout(r,5));}}
@@ -19,8 +19,15 @@ test('independent scoped cursor streams reach exhaustion without mixing state, c
 
 for(const mutation of ['create','update','forget','index'])test('a canonical '+mutation+' after the read snapshot preserves that snapshot and invalidates future cursor use',async()=>{
  const{service:s,root,path,project,gold}=await fixture();const target=(await s.recall(input)).items[0].id;const f=root+'/snapshot';await writeFile(f,JSON.stringify(input));const w=await start(path,f,'recall:read_snapshot','pause');
- try{await until(f+'.ready');const before=s.storage.generation();if(mutation==='create')await publish(s,record(project,{content:'新增设计偏好证据。'}));else if(mutation==='update')await publish(s,record(project,{content:'更新后的设计偏好证据。'}),{target_id:target,expected_revision:1});else if(mutation==='forget')await s.forget({request_id:randomUUID(),memory_id:target,expected_revision:1});else{s.storage.transaction(()=>{s.db.prepare('DELETE FROM memory_vec WHERE chunk_id=(SELECT id FROM memory_chunks WHERE memory_id=?)').run(target);s.storage.advance();});}
-  await writeFile(f+'.release','go');const result=await w.done;assert.equal(result.code,0,result.stderr);assert.equal(result.result.generation,before);assert.ok(result.result.items.every(i=>gold.includes(i.id)&&i.revision===1));assert.ok(result.result.items.some(i=>i.id===target));await assert.rejects(s.recall({cursor:result.result.next_cursor}),{code:'CURSOR_STALE'});assert.equal(s.check().integrity[0].integrity_check,'ok');
+ try{await until(f+'.ready');const before=s.storage.generation();if(mutation==='create')await publish(s,record(project,{content:'新增设计偏好证据。'}));else if(mutation==='update')await publish(s,record(project,{content:'更新后的设计偏好证据。'}),{target_id:target,expected_revision:1});else if(mutation==='forget')await forget(s,{request_id:randomUUID(),memory_id:target,expected_revision:1});else{s.storage.transaction(()=>{s.db.prepare('DELETE FROM memory_vec WHERE chunk_id=(SELECT id FROM memory_chunks WHERE memory_id=?)').run(target);s.storage.advance();});}
+  await writeFile(f+'.release','go');const result=await w.done;
+  if(mutation==='forget'){
+    assert.equal(result.code,1,result.stderr);
+    assert.equal(result.result.error,'CURSOR_STALE');
+    assert.deepEqual((await s.recall({ids:[target]})).items,[]);
+    return;
+  }
+  assert.equal(result.code,0,result.stderr);assert.equal(result.result.generation,before);assert.ok(result.result.items.every(i=>gold.includes(i.id)&&i.revision===1));assert.ok(result.result.items.some(i=>i.id===target));await assert.rejects(s.recall({cursor:result.result.next_cursor}),{code:'CURSOR_STALE'});assert.equal(s.check().integrity[0].integrity_check,'ok');
  }finally{w.child.kill('SIGKILL');s.close();}
 });
 

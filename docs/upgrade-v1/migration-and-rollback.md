@@ -33,11 +33,11 @@ Use an explicitly isolated config for the versioned logical archive.
 ```sh
 node dist/cli/main.js export --config "$ISOLATED_CONFIG" --project "$PROJECT_ID" --format versioned
 node dist/cli/main.js import --config "$RESTORE_CONFIG" --input "$ARCHIVE_FILE"
-node dist/cli/main.js import --config "$RESTORE_CONFIG" --input "$ARCHIVE_FILE" --mode restore --revocations "$LATEST_LEDGER" --commit
+node dist/cli/main.js import --config "$RESTORE_CONFIG" --input "$ARCHIVE_FILE" --mode restore --revocations "$LATEST_LEDGER" --maintenance "$LATEST_MAINTENANCE" --commit
 node dist/cli/main.js check --config "$RESTORE_CONFIG"
 ```
 
-The new format is `shared-agent-memory/versions-v1`. Its `records` contain
+Schema 6 introduced `shared-agent-memory/versions-v1`. Its `records` contain
 every retained revision for each selected record. Restore requires matching
 registered projects, checks body hashes and revision continuity, checks current
 scope and privileges, and indexes the active latest revision with the configured

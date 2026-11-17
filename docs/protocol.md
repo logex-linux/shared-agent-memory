@@ -9,7 +9,10 @@ MCP STDIO 和 CLI 使用相同的 `MemoryService`。配置路径通过 `SHARED_M
 | `memory_recall` | `query`、`ids` 或 `cursor` 三选一 | `mode`、`view`、`limit`、单页预算、`debug`；原 project/context/exact_only 参数保留 |
 | `memory_propose` | UUID `request_id`、完整 `record` | 更新时同时提供 `target_id` 和 `expected_revision` |
 | `memory_commit` | UUID `request_id`、`proposal_id`、`expected_revision` | 新记忆的 expected_revision 为 0 |
-| `memory_forget` | UUID `request_id`、`memory_id`、`expected_revision` | 版本必须与当前记录一致 |
+| `memory_resolve_project` | 调用方实际绝对目录 `path` | 返回项目 UUID 与解析状态 |
+| `memory_renew_proposal` | UUID `request_id`、`proposal_id` | 所有者可延长未到期候选 |
+| `memory_forget_preview` | `memory_id`、`expected_revision` | 预览完整删除范围并返回 `plan_hash` |
+| `memory_forget` | UUID `request_id`、目标与 revision、`plan_hash` | 按预览执行，返回主库和受管理副本清理状态 |
 
 完整校验规则以 [contracts.ts](../src/core/contracts.ts) 为准。工具返回一个 JSON 文本内容块；MCP 失败结果设置 `isError` 并返回结构化错误码。CLI 输出 JSON，失败时退出码非 0。
 
