@@ -189,9 +189,13 @@ async function task(c,spec,arm,order) {
   const exact_spans=shown.every(item=>item.verified);
   const action=calls.some(call=>call.name?.endsWith('write_fixture_result')&&call.ok);
   const passed=run.code===0&&artifact===gold.expected&&action&&!unauthorized&&exact_spans;
+  const used=run.usage.map(row=>row.input_tokens);
+  const inputTokens=used.length&&used.every(value=>value!==null)&&total(used)>0?total(used):null;
+  const unavailable=run.code!==0&&inputTokens===null&&!calls.length;
   let failure=null;
   if(!passed){
-    if(run.code!==0)failure='client';
+    if(unavailable)failure='client_unavailable';
+    else if(run.code!==0)failure='client';
     else if(unauthorized)failure='scope';
     else if(!exact_spans)failure='evidence_offsets';
     else if(!action||run.last?.includes(gold.expected)&&artifact!==gold.expected)failure='action';
@@ -200,11 +204,12 @@ async function task(c,spec,arm,order) {
       failure=diagnosis.classification;
     }else failure='decision';
   }
-  const used=run.usage.map(row=>row.input_tokens),bytes=calls.filter(call=>call.name?.startsWith('memory_')).map(call=>call.reply_bytes);
+  const bytes=calls.filter(call=>call.name?.startsWith('memory_')).map(call=>call.reply_bytes);
   const observedModels=[...new Set(run.usage.map(row=>row.model).filter(Boolean))];
   const model_matched=!observedModels.length||observedModels.every(id=>id===spec.model);
   return {family:c.family,split:c.split,kind:c.kind,client:spec.client,model:spec.model,observed_models:observedModels,model_matched,
-    arm:arm.name,order,snapshot:snapshot.sha256,passed:passed&&model_matched,failure:model_matched?failure:'model_mismatch',
+    arm:arm.name,order,snapshot:snapshot.sha256,passed:passed&&model_matched,scorable:!unavailable&&model_matched,
+    failure:model_matched?failure:'model_mismatch',
     expected:gold.expected,artifact,tool_state:{artifact_exists:artifact!==null,write_succeeded:action},exit_code:run.code,
     target_at_5:gold.expected!==review&&c.kind!=='override'?top.some(item=>wanted.has(key(item))):null,
     current_at_5:gold.expected!==review&&!['override','history'].includes(c.kind)?top.some(item=>wanted.has(key(item))):null,
@@ -213,18 +218,20 @@ async function task(c,spec,arm,order) {
     missing_source_definite:c.kind==='missing'?artifact!==null&&artifact!==review:null,
     exact_spans,unauthorized,continuations:primary.filter(call=>(pack?call.args.read:call.args)?.cursor).length,calls,
     tool_reply_bytes:bytes.every(value=>value!==null)?total(bytes):null,
-    input_tokens:used.length&&used.every(value=>value!==null)&&total(used)>0?total(used):null,usage:run.usage,elapsed_ms:run.elapsed_ms,
+    input_tokens:inputTokens,usage:run.usage,elapsed_ms:run.elapsed_ms,
     ...(run.errors.length>0&&{errors:run.errors.slice(-2)}),...(run.tool_errors.length>0&&{tool_errors:run.tool_errors}),
     ...(run.stderr.length>0&&{stderr:run.stderr})};
 }
 
 function summarize(rows) {
-  const holdout=rows.filter(row=>row.split==='holdout'),scored=holdout.length?holdout:rows;
+  const holdout=rows.filter(row=>row.split==='holdout'),scheduled=holdout.length?holdout:rows;
+  const scored=scheduled.filter(row=>row.scorable);
   const metrics=Object.fromEntries(arms.map(({name})=>{
     const runs=scored.filter(row=>row.arm===name);
     const measured=runs.filter(row=>row.input_tokens!==null);
     const proportion=field=>ratio(runs.filter(row=>row[field]===true).length,runs.filter(row=>row[field]!==null).length);
-    return [name,{runs:runs.length,successes:runs.filter(row=>row.passed).length,input_token_runs:measured.length,
+    return [name,{attempts:scheduled.filter(row=>row.arm===name).length,runs:runs.length,
+      successes:runs.filter(row=>row.passed).length,input_token_runs:measured.length,
       input_tokens_p50:quantile(measured.map(row=>row.input_tokens),.5),
       tool_reply_bytes_p50:quantile(runs.flatMap(row=>row.tool_reply_bytes===null?[]:[row.tool_reply_bytes]),.5),
       elapsed_ms_p95:quantile(runs.map(row=>row.elapsed_ms),.95),current_at_5:proportion('current_at_5'),
@@ -255,7 +262,8 @@ function summarize(rows) {
     zero_discordance_family_upper_95:bound,cost_pairs:cost.length,median_input_tokens:median,reduction,
     no_memory_success_memory_failure:ratio(withNone.filter(p=>p.none.passed&&!p.sample.passed).length,withNone.length),
     no_memory_failure_memory_success:ratio(withNone.filter(p=>!p.none.passed&&p.sample.passed).length,withNone.length)},
-    critical_failures,criteria:{holdout_available:holdout.length>0,noninferiority:interval[0]!==null&&interval[0]>-.02&&
+    unscored_runs:scheduled.length-scored.length,critical_failures,
+    criteria:{holdout_available:holdout.length>0,noninferiority:interval[0]!==null&&interval[0]>-.02&&
       (bound===null||bound<.02),input_token_reduction:cost.length===pairs.length&&reduction!==null&&reduction>=.2,
       fixed_budget_success_gain:delta!==null&&delta>=.05&&interval[0]>0}};
 }
