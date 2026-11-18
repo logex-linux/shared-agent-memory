@@ -32,6 +32,9 @@ Defaults are 7 days for proposals, 90 days for history and recovery, and 5 retai
 
 `node scripts/upgrade-local.mjs --manifest FILE --output NEW_DIRECTORY` prepares a consistent database backup and a versioned runtime. Preserve the latest `maintenance.json` and `revocations.jsonl` independently of database backups. Existing deployments can set the absolute `maintenance_state` directory on every role. A runtime configured with that directory rejects a database that lacks required maintenance or revocations.
 
+Render the local usage guide from the active installation manifest with
+`node scripts/local-usage.mjs INSTALLATION.json [UPGRADE_REPORT.json]`.
+
 Versioned exports use `shared-agent-memory/versions-v2`, including explicit pruned revisions. The new importer also reads v1. For a committed logical import, pass `--revocations FILE --maintenance FILE` from the active deployment's current managed state. A logical archive carries history, while a SQLite backup carries the full transaction state.
 
 `restore-backup --source FILE --output NEW_DIRECTORY --config ADMIN_CONFIG --revocations FILE --maintenance FILE` restores into a new isolated directory. It applies maintenance and revocations before admitting reads. The ledger carries hashes and the metadata needed for replay. A backup lacking bytes for a later authorized write requires reconciliation with a newer compatible backup or archive. Compare IDs, revisions, scopes, hashes and published changes before activating the staged copy. Run a compatible runtime for Schema 13 and retain writes made after an upgrade.

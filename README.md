@@ -2,7 +2,7 @@
 
 [English](README.en.md) · [协议](docs/protocol.md) · [维护](docs/operations.md) · [自适应检索](docs/adaptive-retrieval.md) · [实测报告](docs/adaptive-results.md) · [MIT](LICENSE)
 
-`1.0.0-beta.4`（Schema 14）提供写入准入预览、事项目录、精确来源和临时任务覆盖。确定性证据包由连接配置启用。升级前先在隔离副本演练。见 [事项目录与证据包](docs/upgrade-v1/frontier-contract.md)、[生命周期维护](docs/upgrade-v1/lifecycle.md)及[迁移和恢复](docs/upgrade-v1/migration-and-rollback.md)。
+`1.0.0-beta.5`（Schema 14）在证据包只选中矛盾的一端时提示复核，并提供本地来源迁移预览与客户端配对评测。确定性证据包由连接配置启用。见 [事项目录与证据包](docs/upgrade-v1/frontier-contract.md)、[生命周期维护](docs/upgrade-v1/lifecycle.md)及[迁移和恢复](docs/upgrade-v1/migration-and-rollback.md)。
 
 供同一台机器上的多个 AI Agent 共用的本地记忆服务。提供标准 **MCP STDIO** 和 **CLI**，用本地 embedding、关键词和代码标识符检索，按当前任务返回相关片段。
 

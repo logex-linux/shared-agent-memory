@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {mkdir,readFile,writeFile} from 'node:fs/promises';
-import {homedir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {MemoryService} from '../../dist/core/service.js';
+import {runAgent} from './agent-runner.mjs';
 import {isolatedWorkspace,reportDirectory,writeRunReport} from '../../scripts/artifacts.mjs';
 
 const root=await isolatedWorkspace('lifecycle-agents');
@@ -13,7 +12,6 @@ assert.ok(['codex','stepcode'].includes(client),'Usage: lifecycle-agents.mjs cod
 const rounds=Number(roundsText);
 assert.ok(Number.isInteger(rounds)&&rounds>=1&&rounds<=3);
 const server=resolve('dist/mcp/server.js');
-const evaluator=resolve('bench/upgrade-v1/fixture-result.mjs');
 const model=resolve('.local/models/bge-small-zh-v1.5');
 const directory=await reportDirectory(output,'agents-'+client);
 const results=[];
@@ -30,74 +28,6 @@ if(resume) {
     result.recalled && result.preserved && result.excluded)previous.set(result.round+'/'+result.name,result);
 }
 
-function run(work,config,prompt,tools,afterRecall) {
-  const env={...process.env,SHARED_MEMORY_CONFIG:config,SHARED_MEMORY_NODE:process.execPath};
-  const cli=client==='codex'?
-    process.env.SAM_CODEX_BIN??'codex':process.env.SAM_STEP_BIN??join(homedir(),'.stepcode/bin/step');
-  const args=client==='codex'?[
-    'exec','--ignore-user-config','--ignore-rules','--skip-git-repo-check','--ephemeral','--sandbox','read-only','--json',
-    '-c','mcp_servers.shared_memory.command='+JSON.stringify(process.execPath),
-    '-c','mcp_servers.shared_memory.args='+JSON.stringify([server]),
-    '-c','mcp_servers.shared_memory.env.SHARED_MEMORY_CONFIG='+JSON.stringify(config),
-    '-c','mcp_servers.shared_memory.enabled_tools='+JSON.stringify(tools),
-    '-c','mcp_servers.fixture.command='+JSON.stringify(process.execPath),
-    '-c','mcp_servers.fixture.args='+JSON.stringify([evaluator]),
-    prompt
-  ]:[
-    '--provider',process.env.SAM_STEP_PROVIDER??'magpie','--model',process.env.SAM_STEP_MODEL??'agy-cli/gemini-4-hydrogen',
-    '--mode','json','--print','--no-session','--no-builtin-tools','--no-context-files','--no-extensions','--no-skills','--no-update-check',
-    '--tools',[...tools.map(t=>'mcp__shared_memory__'+t),'write_fixture_result'].join(','),'-e',resolve('bench/upgrade-v1/fixture-result-step.mjs'),
-    '--tool-override','mcp__shared_memory__memory_recall=allow',
-    '--tool-override','mcp__shared_memory__memory_resolve_project=allow','--',prompt
-  ];
-  return new Promise((done,reject)=>{
-    const child=spawn(cli,args,{cwd:work,env,stdio:['ignore','pipe','pipe']});
-    child.stdout.setEncoding('utf8');
-    let stdout='',stderr='',pending='',race;
-    child.stdout.on('data',part=>{
-      stdout+=part;
-      if(!afterRecall||race)return;
-      pending+=part;
-      const lines=pending.split('\n');
-      pending=lines.pop()??'';
-      for(const line of lines) {
-        let event;
-        try {event=JSON.parse(line);}catch {continue;}
-        if(event.type==='item.completed'&&event.item?.type==='mcp_tool_call'&&event.item.tool==='memory_recall' ||
-          event.type==='tool_execution_end'&&event.toolName?.endsWith('memory_recall')) {
-          race=afterRecall();
-          race.catch(()=>{});
-          break;
-        }
-      }
-    });
-    child.stderr.on('data',part=>stderr+=part);
-    const timer=setTimeout(()=>child.kill('SIGTERM'),150_000);
-    child.on('error',error=>{clearTimeout(timer);reject(error);});
-    child.on('close',async(code,signal)=>{
-      clearTimeout(timer);
-      try {await race;}catch(error){reject(error);return;}
-      const events=stdout.split('\n').flatMap(line=>{try{return [JSON.parse(line)];}catch{return [];}});
-      const codex=events.filter(e=>e.type==='item.completed').map(e=>e.item);
-      const step=events.filter(e=>e.type==='message_end').map(e=>e.message);
-      const finals=client==='codex'?codex.filter(i=>i.type==='agent_message').map(i=>i.text):
-        step.filter(i=>i.role==='assistant').flatMap(i=>i.content.filter(c=>c.type==='text').map(c=>c.text));
-      const recalls=events.filter(e=>e.type==='tool_execution_start'&&e.toolName?.endsWith('memory_recall'))
-        .map(e=>e.args??{}).concat(codex.filter(i=>i.type==='mcp_tool_call'&&i.tool==='memory_recall').map(i=>i.arguments??{}));
-      const calls=codex.filter(i=>i.type==='mcp_tool_call'&&i.status==='completed')
-        .map(i=>({name:i.tool,args:i.arguments??{},result:JSON.stringify(i.result??i)}))
-        .concat(events.filter(e=>e.type==='tool_execution_end'&&e.toolName?.includes('shared_memory'))
-          .filter(e=>!e.isError).map(e=>({name:e.toolName.replace('mcp__shared_memory__',''),
-            args:events.find(start=>start.type==='tool_execution_start'&&start.toolCallId===e.toolCallId)?.args??{},result:JSON.stringify(e.result??e)})));
-      const errors=events.filter(e=>e.type==='turn.failed'||e.type==='error'||e.message?.errorMessage)
-        .map(e=>e.error?.message??e.message?.errorMessage??e.message).filter(Boolean);
-      const tool_errors=events.filter(e=>e.type==='tool_execution_end'&&e.isError)
-        .slice(0,2).map(e=>({tool:e.toolName,message:JSON.stringify(e.result??e.error??'').slice(0,650)}));
-      done({code,signal,last:finals.at(-1)?.trim(),stdout,recalls,calls,errors,tool_errors,
-        stderr:code?stderr.split('\n').filter(s=>/error|failed|unauth|forbid|limit|unavailable/i.test(s)).slice(-3).map(s=>s.slice(0,360)):[]});
-    });
-  });
-}
 async function scenario(name,round) {
   const group=join(root,name+'-'+round),work=join(group,'project'),other=join(group,'other');
   await mkdir(work,{recursive:true});await mkdir(other);
@@ -193,7 +123,7 @@ async function scenario(name,round) {
     const prompt='合成任务。先用 shared_memory 的 memory_recall 严格按此参数读取 '+JSON.stringify(read)+'。'+request+
       ' 此任务的实际交付是调用 write_fixture_result 写出标记。value 只含实际标记及已明确要求的状态后缀，' +
       '没有后缀要求时只写标记。不要把证据引用或解释放进 value。写完再告知结果。';
-    const runResult=await run(work,harnessConfig,prompt,tools,afterRecall);
+    const runResult=await runAgent({client,work,config:harnessConfig,server,prompt,tools,afterRecall});
     const artifact=await readFile(join(work,'fixture-result.txt'),'utf8').catch(error=>{
       if(error.code==='ENOENT')return null;
       throw error;

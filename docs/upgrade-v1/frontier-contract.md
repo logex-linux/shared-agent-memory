@@ -43,6 +43,17 @@ content is evidence, including content formatted as a command.
 The deterministic evidence pack stays opt-in until the task quality and cost
 gates are met. It reuses recall budgets and never generates new claims.
 
+A recorded contradiction raises `RECORDED_CONFLICT` and sets the affected
+items to `use: "conflict"`. The pack status becomes `requires_check`. When both
+endpoints are included, `conflicts` identifies their exact revisions. When
+only one endpoint is included, its flag carries the review requirement and
+the other endpoint stays outside the response. Endpoints must satisfy the
+effective time, current revision, connection scope and task exclusions.
+The pack resolves these conditions inside the recall snapshot, including on
+cursor continuation. A budget fallback marks the affected raw items
+`applicability: "requires_check"`. A concurrent canonical change can return
+`VIEW_STALE`, in which case start the read again.
+
 ## CLI and MCP
 
 Pass JSON through `--input` to a CLI command. Select an existing role
@@ -106,3 +117,45 @@ clients, p95 was about 85 ms for recall, 92 ms for the catalog and 80 ms
 for the opt-in pack. Reproduce the measurements with the
 `frontier-baseline.mjs`, `frontier-evaluate.mjs` and `frontier-scale.mjs`
 scripts under `bench/upgrade-v1`.
+
+## Beta.5 source review and evaluation
+
+```sh
+node scripts/source-preview.mjs DATABASE SOURCE_REVIEW.json
+node bench/upgrade-v1/paired-agents.mjs FROZEN_BETA4_RUNTIME REPORT_DIRECTORY
+```
+
+The source preview opens the database read-only and inspects the exact
+`memory_id`, `revision` and zero-based `source_index` listed in `targets`.
+Register absolute directories in `roots`. The preview checks the original
+path and searches those directories for files with the same basename. Supply
+the exact heading or line as `anchor`. Numbered headings must agree with the
+recorded section number. A `sha256:` or `sha256-file:` revision refers to the
+whole file. A `sha256-fragment:` revision uses the specified `fragment` byte
+range `[start,end)`. A full Git commit uses the requested `git_path` and compares
+the working file to the committed blob. A directory source can list
+`directory_files` using exact relative paths already named by its locator.
+The report distinguishes availability, changed bytes, missing locators and
+ambiguous candidates.
+
+For a confirmed replacement, update the current head through the normal
+proposal and revision checks. Keep the original revision, source fingerprint,
+scope, adoption and verification status. Check any catalog projection
+against the new revision. Reopen the exact source and review the heading
+before accepting the change.
+
+The paired runner compares no memory, beta.4 ordinary recall, beta.4 packs
+and the current pack in fresh workspaces. The four arms share a snapshot
+and page budget within each source family. The runner rotates their order.
+Clients receive natural task prompts and write an artifact through a fixture
+tool. The scorer checks the file after the tool runs and verifies each
+returned span against the exact revision in SQLite.
+
+The built-in set has 12 synthetic families for piloting the protocol.
+`SAM_PAIRED_CASES` can point to a JSON array of authorized, de-identified
+cases using the same scenario fields. Use `split: "holdout"` for pre-frozen
+holdout families, with one row per independent family. The report groups
+the two clients by family and records their model IDs, cursor calls, span
+checks, result bytes, latency and available usage. Codex reports aggregate
+turn usage. StepCode reports usage per assistant response. A missing token
+counter stays empty. Pilot scores cannot authorize default enablement.

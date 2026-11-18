@@ -7,6 +7,7 @@ import { prepared } from '../storage/statements.js';
 import { RetrievalProfile } from './profile.js';
 import { QueryState, authority } from './state.js';
 import { taskExclusions } from './task-override.js';
+import type { packEvidence } from './context-pack.js';
 import { extendedMetadata } from '../memory/versions.js';
 import { coversEffectiveTime, declaredFactState, decisionIntent, temporalPredicate } from '../memory/temporal.js';
 import { destination, graphBonus, graphEpoch, graphVersion, GraphReader, GRAPH_PAGE_WORK, GRAPH_SEEDS, readGraph, startGraph,
@@ -17,6 +18,7 @@ type Context = {
     encoder: Encoder;
     generation: () => number;
     checkpoint?: (point: string) => void;
+    packPage?: typeof packEvidence;
 };
 type Candidate = {
     specificTopic?: boolean;
@@ -93,7 +95,7 @@ export function readScopePredicate(input: Pick<RecallInput,'project_id'|'include
     }
     return {sql,params};
 }
-export function eligibility(db:DatabaseSync,input: RecallInput, config: Config, effectiveAt:string,taskIds?:string[]) {
+export function eligibility(db:DatabaseSync,input: RecallInput, config: Config, effectiveAt:string,taskIds?:string[],readAt=new Date().toISOString()) {
     let {sql,params}=readScopePredicate(input,config,taskIds);
     if (input.versions) return {sql,params};
     for(const key of ['subject_id','context_key'] as const)if(input[key]!==undefined) {
@@ -101,7 +103,7 @@ export function eligibility(db:DatabaseSync,input: RecallInput, config: Config, 
         params.push(input[key]);
     }
     sql += ' AND (s.expires_at IS NULL OR julianday(s.expires_at)>julianday(?))';
-    params.push(new Date().toISOString());
+    params.push(readAt);
     for (const [column, key] of [['branch', 'branch'], ['commit_ref', 'commit'], ['environment', 'environment']] as const) {
         sql += ` AND (s.${column} IS NULL OR ? IS NULL OR s.${column}=?)`;
         params.push(input.context[key] ?? null, input.context[key] ?? null);
@@ -222,7 +224,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         const gen = ctx.generation(), auth = authority(config, db);
         const overlay=input.task_id?taskExclusions(ctx.db,config,gen,input.task_id):undefined;
         if(request.cursor && overlay?.binding!==progress.task_binding)throw new MemoryError('CURSOR_TASK_CHANGED');
-        const eligible = eligibility(db,input,config,effectiveAt,overlay?.ids);
+        const readAt=new Date().toISOString();
+        const eligible = eligibility(db,input,config,effectiveAt,overlay?.ids,readAt);
         const snapshot=expansion?undefined:indexSnapshot(ctx.db,db,gen);
         if(!expansion && !request.cursor) {
             ctx.checkpoint?.('recall:read_snapshot');
@@ -854,6 +857,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         if (Buffer.byteLength(JSON.stringify(result)) > options.max_bytes)
             throw new MemoryError('PAGE_BUDGET_TOO_SMALL');
         profileTrace?.add('serialization',performance.now()-serializationStarted);
+        const packed=ctx.packPage?.(db,config,input,result,{...options,effectiveAt,readAt,taskIds:overlay?.ids});
         if (state && !request.cursor && (result.has_more || result.feedback_receipt)) {
             // Stage and serialize the entire page before reserving the shared writer.
             const saving=performance.now(), initial=state.initialPage(q);
@@ -875,7 +879,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             if(Buffer.byteLength(JSON.stringify(result))>options.max_bytes){delete (d as any).stages_ms;delete (d as any).state_lock;delete (d as any).memory;}
             for(let i=0;i<4;i++){d.response_bytes=Buffer.byteLength(JSON.stringify(result));d.estimated_tokens=estimateTokens(d.response_bytes);}
         }
-        traceResponse=result;return result;
+        traceResponse=result;return packed??result;
     }
     catch (e) {
         if (db.isTransaction)

@@ -4,7 +4,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { fileURLToPath } from 'node:url';
 
-export default function sharedMemory(pi) {
+export default function sharedMemory(pi,server=fileURLToPath(new URL('../dist/mcp/server.js',import.meta.url))) {
   let client;
   pi.on('session_start',async()=>{
     const config=process.env.SHARED_MEMORY_CONFIG;
@@ -12,7 +12,7 @@ export default function sharedMemory(pi) {
     client=new Client({name:'pi-shared-memory-bridge',version:'0.1.0'});
     await client.connect(new StdioClientTransport({
       command:process.env.SHARED_MEMORY_NODE??process.execPath,
-      args:[fileURLToPath(new URL('../dist/mcp/server.js',import.meta.url))],
+      args:[server],
       env:{SHARED_MEMORY_CONFIG:config},stderr:'pipe'
     }));
     const {tools}=await client.listTools();

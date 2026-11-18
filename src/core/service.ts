@@ -487,13 +487,10 @@ export class MemoryService {
     if(!this.config.context_pack_enabled)throw new MemoryError('CONTEXT_PACK_DISABLED');
     const {read,needed}=contextPackSchema.parse(raw);
     if(!needed)return {pack:'deterministic-v1',evidence_status:'not_needed',items:[]};
-    const input={...read!,view:read!.view??'evidence' as const};
-    const page=await this.recall(input);
-    return this.snapshot(()=>{
-      if(page.generation!==this.storage.generation())throw new MemoryError('VIEW_STALE');
-      if(input.task_id)taskExclusions(this.db,this.config,page.generation,input.task_id);
-      return packEvidence(this.db,this.config,input,page);
-    });
+    const input=read!.cursor?read!:{...read!,view:read!.view??'evidence' as const};
+    const page=await this.recallPage(input,'hybrid',packEvidence);
+    if(page.generation!==this.storage.generation())throw new MemoryError('VIEW_STALE');
+    return page;
   }
   explainMemory(raw:unknown) {
     this.permission('recall');
@@ -786,11 +783,14 @@ export class MemoryService {
     }
   }
   async recall(raw:unknown,mode:'hybrid'|'lexical'|'vector'='hybrid') {
+    return this.recallPage(raw,mode);
+  }
+  private recallPage(raw:unknown,mode:'hybrid'|'lexical'|'vector',packPage?:typeof packEvidence) {
     this.permission('recall');const input=recallSchema.parse(raw);
     if(input.exclude_ids)input.exclude_ids=[...new Set(input.exclude_ids.map(id=>id.toLowerCase()))].sort();
     if(input.exact_only && (!input.query || identifiers(input.query).length===0))throw new MemoryError('EXACT_IDENTIFIER_REQUIRED');
     this.validateViewScope(input);
-    return retrieve({db:this.db,config:this.config,encoder:this.encoder,generation:()=>this.storage.generation(),checkpoint:this.checkpoint},input,mode);
+    return retrieve({db:this.db,config:this.config,encoder:this.encoder,generation:()=>this.storage.generation(),checkpoint:this.checkpoint,packPage},input,mode);
   }
   async feedback(raw:unknown) {
     this.permission('feedback');this.permission('recall');

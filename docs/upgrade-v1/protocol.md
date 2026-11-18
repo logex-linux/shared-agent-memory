@@ -1,7 +1,7 @@
 # Shared Agent Memory v1 · Protocol
 
 The v0.4.8 protocol remains documented in [protocol.md](../protocol.md).
-The v1 preview advertises version `1.0.0-beta.4` during MCP initialization. See [the subject catalog and evidence contract](frontier-contract.md) and [Schema 13 lifecycle maintenance](lifecycle.md).
+The v1 preview advertises version `1.0.0-beta.5` during MCP initialization. See [the subject catalog and evidence contract](frontier-contract.md) and [lifecycle maintenance](lifecycle.md).
 Existing tools retain their names. Discover optional arguments and permissioned
 tools through the tool list.
 

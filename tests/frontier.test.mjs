@@ -194,6 +194,123 @@ test('evidence packets retain exact spans and mark incomplete source coverage an
   }finally{s.close();reader.close();}
 });
 
+const contradiction=(target,sources)=>({expected_refs:[ref(target)],
+  relations:[{type:'contradicts',target_id:target.memory_id,sources}]});
+
+test('evidence packets flag either end of a contradiction without disclosing an off-page end',async()=>{
+  const {service:s,project}=await setupFake({context_pack_enabled:true});
+  try {
+    const claim=record(project,{kind:'fact',title:'Oriole release marker',content:'The Oriole release marker is amber.',
+      subject_id:'release.marker',context_key:'stable'});
+    const a=await publish(s,claim);
+    const b=await publish(s,{...claim,content:'The Oriole release marker is indigo.'},contradiction(a,claim.sources));
+    const both=await s.contextPack({read:{versions:[ref(a),ref(b)]}});
+    assert.equal(both.conflicts.length,1);
+    assert.deepEqual(both.items.map(item=>item.use),['conflict','conflict']);
+    assert.equal(s.browse(directory(project,claim.subject_id,'conflicts')).count,1);
+    for(const [shown,other] of [[a,b],[b,a]]) {
+      const one=await s.contextPack({read:{versions:[ref(shown)]}});
+      assert.equal(one.evidence_status,'requires_check');
+      assert.equal(one.items[0].use,'conflict');
+      assert.deepEqual(one.conflicts,[]);
+      assert.ok(!JSON.stringify(one).includes(other.memory_id));
+    }
+    const first=await s.contextPack({read:{query:'Oriole release marker',project_id:project,limit:1}});
+    const next=await s.contextPack({read:{cursor:first.next_cursor}});
+    assert.deepEqual(new Set([first.items[0].memory_id,next.items[0].memory_id]),new Set([a.memory_id,b.memory_id]));
+    assert.deepEqual([first,next].map(page=>[page.evidence_status,page.items[0].use,page.conflicts.length]),
+      [['requires_check','conflict',0],['requires_check','conflict',0]]);
+  }finally{s.close();}
+});
+
+test('evidence packet conflicts honor the inherited task, scope, effective time and current revision',async()=>{
+  const {service:s,config,project,other}=await setupFake({context_pack_enabled:true});
+  const scoped=new MemoryService({...config,allowed_projects:[project],allow_global:false},fake);
+  try {
+    const claim=record(project,{kind:'fact',title:'Kestrel release marker',content:'The Kestrel release marker is amber.'});
+    const a=await publish(s,claim);
+    const b=await publish(s,{...claim,content:'The Kestrel release marker is blue.',valid_for:{environment:'staging'}},
+      contradiction(a,claim.sources));
+    const expired=await publish(s,{...claim,content:'The Kestrel release marker is gray.',
+      valid_for:{expires_at:'2023-01-01T00:00:00.000Z'}},contradiction(a,claim.sources));
+    const foreign=await publish(s,record(other,{kind:'fact',title:claim.title,content:'The Kestrel release marker is private.'}));
+    // Exercise a legacy edge across owners that the current write API rejects.
+    s.db.prepare(`INSERT INTO memory_relations(id,revision,from_id,from_revision,to_id,to_revision,type,project_id,scope,sources,recorded_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(),1,a.memory_id,1,foreign.memory_id,1,'contradicts',project,'project',JSON.stringify(claim.sources),new Date().toISOString());
+    const visible={ids:[a.memory_id],project_id:project,context:{environment:'staging'}};
+    const clean=page=>{
+      assert.equal(page.evidence_status,'related_evidence');
+      assert.ok(!page.warnings.includes('RECORDED_CONFLICT'));
+      assert.deepEqual(page.conflicts,[]);
+      assert.ok(page.items.every(item=>item.use!=='conflict'));
+    };
+    assert.equal((await scoped.contextPack({read:visible})).items[0].use,'conflict');
+    clean(await scoped.contextPack({read:{...visible,context:{environment:'production'}}}));
+    const task_id=randomUUID();
+    scoped.taskOverride({task_id,exclude_ids:[b.memory_id]});
+    clean(await scoped.contextPack({read:{...visible,task_id}}));
+    await publish(s,{...claim,content:'The Kestrel release manual describes the fixture.'});
+    const first=await scoped.contextPack({read:{query:'Kestrel release marker',project_id:project,
+      context:{environment:'staging'},task_id,exclude_ids:[expired.memory_id],limit:1}});
+    clean(first);
+    assert.ok(first.next_cursor);
+    clean(await scoped.contextPack({read:{cursor:first.next_cursor}}));
+    await publish(s,{...claim,content:'The Kestrel release marker is corrected to amber.'},
+      {target_id:b.memory_id,expected_revision:b.revision});
+    await assert.rejects(scoped.contextPack({read:{cursor:first.next_cursor}}),{code:'CURSOR_STALE'});
+    clean(await scoped.contextPack({read:visible}));
+    const replacement=await publish(s,{...claim,content:'The Kestrel release marker is copper.'},contradiction(a,claim.sources));
+    await forget(s,{memory_id:replacement.memory_id,expected_revision:replacement.revision,request_id:randomUUID()});
+    clean(await scoped.contextPack({read:visible}));
+  }finally{scoped.close();s.close();}
+});
+
+test('tight evidence pack budgets preserve conflict annotations in the raw page',async()=>{
+  const {service:s,project}=await setupFake({context_pack_enabled:true});
+  try {
+    const claims=[];
+    for(let n=0;n<10;n++){
+      const base=record(project,{kind:'fact',title:'Finch verification marker '+n,content:'Finch marker fixture '+n});
+      const sources=[{...base.sources[0],uri:'test://marker/'+n}];
+      const links=claims.length?{expected_refs:claims.map(ref),
+        relations:claims.map(target=>contradiction(target,sources).relations[0])}:{};
+      claims.push(await publish(s,{...base,sources},links));
+    }
+    const read={query:'Finch verification marker fixture',view:'evidence',limit:10};
+    const ordinary=await s.recall(read);
+    assert.equal(ordinary.items.length,claims.length);
+    const max_bytes=Buffer.byteLength(JSON.stringify(ordinary))+300;
+    const result=await s.contextPack({read:{...read,max_bytes,token_budget:Math.floor(max_bytes/3)}});
+    assert.equal(result.pack,'raw_fallback');
+    assert.equal(result.evidence_status,'requires_check');
+    assert.ok(result.warnings.includes('RECORDED_CONFLICT'));
+    assert.ok(result.items.every(item=>item.applicability==='requires_check'));
+    assert.deepEqual(result.items.map(({id,revision,content,excerpts})=>({id,revision,content,excerpts})),
+      ordinary.items.map(({id,revision,content,excerpts})=>({id,revision,content,excerpts})));
+    assert.ok(Buffer.byteLength(JSON.stringify(result))<=max_bytes);
+  }finally{s.close();}
+});
+
+test('a pack assembled across a concurrent erasure requests a fresh read',async()=>{
+  const {service:s,config,project}=await setupFake({context_pack_enabled:true});
+  const claim=record(project,{kind:'fact',title:'Dipper release marker',content:'Dipper marker is silver.'});
+  const a=await publish(s,claim);
+  const b=await publish(s,{...claim,content:'Dipper marker is copper.'},contradiction(a,claim.sources));
+  let erasure;
+  const reader=new MemoryService(config,fake,point=>{
+    if(point==='recall:canonical_released'&&!erasure)
+      erasure=forget(s,{memory_id:b.memory_id,expected_revision:b.revision,request_id:randomUUID()});
+  });
+  try {
+    await assert.rejects(reader.contextPack({read:{ids:[a.memory_id]}}),{code:'VIEW_STALE'});
+    await erasure;
+    const page=await reader.contextPack({read:{ids:[a.memory_id]}});
+    assert.equal(page.evidence_status,'related_evidence');
+    assert.deepEqual(page.conflicts,[]);
+  }finally{reader.close();s.close();}
+});
+
 test('an old schema backup reconciles erasure before rebuilding a catalog',async()=>{
   const {service:s,config,project,root}=await setupFake();
   const base=pref(project,'A formerly used serialized setting.');
