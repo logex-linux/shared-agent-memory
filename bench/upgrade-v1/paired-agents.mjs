@@ -224,7 +224,9 @@ async function task(c,spec,arm,order) {
 }
 
 function summarize(rows) {
-  const holdout=rows.filter(row=>row.split==='holdout'),scheduled=holdout.length?holdout:rows;
+  const holdout=rows.filter(row=>row.split==='holdout'),pilot=rows.filter(row=>row.split==='pilot');
+  const development=rows.filter(row=>row.split==='development');
+  const scheduled=holdout.length?holdout:pilot;
   const scored=scheduled.filter(row=>row.scorable);
   const metrics=Object.fromEntries(arms.map(({name})=>{
     const runs=scored.filter(row=>row.arm===name);
@@ -257,7 +259,8 @@ function summarize(rows) {
   const critical_failures=candidate.filter(row=>!row.exact_spans||row.unauthorized||
     ['override','scope','forgotten'].includes(row.kind)&&!row.passed).length;
   const interval=[quantile(draws,.025),quantile(draws,.975)],delta=ratio(total(deltas),deltas.length);
-  return {scored_split:holdout.length?'holdout':'pilot',metrics,paired:{tasks:pairs.length,families:groups.length,
+  return {scored_split:holdout.length?'holdout':'pilot',development_runs:development.length,pilot_runs:pilot.length,
+    holdout_runs:holdout.length,metrics,paired:{tasks:pairs.length,families:groups.length,
     delta,family_bootstrap_95:interval,
     zero_discordance_family_upper_95:bound,cost_pairs:cost.length,median_input_tokens:median,reduction,
     no_memory_success_memory_failure:ratio(withNone.filter(p=>p.none.passed&&!p.sample.passed).length,withNone.length),
@@ -270,6 +273,7 @@ function summarize(rows) {
 
 const rows=[];
 const settings={builds,clients,budget,timeout_ms:timeoutMs,fixture_sha256:hash(frozen),fixture_kind:caseFile?'operator_supplied':'synthetic',
+  case_splits:Object.fromEntries([...new Set(cases.map(c=>c.split))].map(split=>[split,cases.filter(c=>c.split===split).length])),
   input_token_methods:{codex:'turn.completed usage totals',stepcode:'assistant message usage, including cache reads and writes'}};
 const planned=cases.length*clients.length*arms.length;
 async function save(){

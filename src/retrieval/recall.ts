@@ -2,7 +2,8 @@ import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { MemoryError, verificationSchema, hash, type Config, type Encoder, type RecallInput } from '../core/contracts.js';
 import { identifiers, ftsQuery, terms } from './lexical.js';
-import { answerIntent, factState, focusTerms, evidenceWindow, referenceEvidence, type FactState } from './evidence.js';
+import { answerIntent, factState, focusTerms, evidenceWindow, referenceEvidence, supportAssessment, supportRequirements,
+    type FactState, type SupportAssessment, type SupportRequirement } from './evidence.js';
 import { prepared } from '../storage/statements.js';
 import { RetrievalProfile } from './profile.js';
 import { QueryState, authority } from './state.js';
@@ -45,7 +46,7 @@ type Candidate = {
     base: number;
     admitted: boolean;
     graphPath?: GraphPath;
-    answer?: { state: FactState; coverage: number; alignment: number; checked: string; salient?: boolean; subjectMatches?: number; referenceBackground?: boolean };
+    answer?: { state: FactState; coverage: number; alignment: number; checked: string; salient?: boolean; subjectMatches?: number; referenceBackground?: boolean; support?: SupportAssessment };
 };
 const blob = (v: Float32Array) => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
 const INCOMPLETE_INDEX = `(NOT EXISTS(SELECT 1 FROM memory_chunks c WHERE c.memory_id=s.memory_id)
@@ -117,8 +118,9 @@ const broadIntent = (q: string) => /(长期|稳定.*偏好|归纳|总结|跨项�
 // Direct reference or specific, salient semantic evidence can precede weak
 // background. Missing applicability context is still returned as requires_check.
 const directEvidence = (c: Candidate | undefined, threshold: number) => Boolean(c && !c.answer?.referenceBackground &&
-    (c.exact>0&&Math.max(c.coverage,c.answer?.coverage??0)>=.6
-    || c.specificTopic&&c.answer?.salient&&(c.answer.coverage>=.6)&&(c.cosine??0)>=threshold));
+    (c.answer?.support ? c.answer.support.level==='direct' :
+        c.exact>0&&Math.max(c.coverage,c.answer?.coverage??0)>=.6
+        || c.specificTopic&&c.answer?.salient&&(c.answer.coverage>=.6)&&(c.cosine??0)>=threshold));
 // Agreement between indexed and local subject terms can override a legacy
 // anchor. A lone identifier, generic vocabulary or semantic score cannot.
 const subjectCoverage = (c: Candidate) => Math.min(c.coverage, c.answer?.coverage ?? 0);
@@ -323,7 +325,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
             return {rows:ids.map(id=>chunkCache.get(id)).filter(Boolean).sort((a,b)=>a.start-b.start),read};
         };
-        const queryTerms=input.query?focusTerms(input.query):[], termWeights=new Map<string,number>(),references=resolved==='focused'?referenceEvidence(input.query??''):undefined;
+        const queryTerms=input.query?focusTerms(input.query):[], termWeights=new Map<string,number>(),references=resolved==='focused'?referenceEvidence(input.query??''):undefined,
+            supportReq:SupportRequirement|undefined=resolved==='focused'&&input.query?supportRequirements(input.query):undefined;
         const queryIdentifiers=identifiers(input.query??'').filter(id=>input.exact_only||!/^20\d{2}$/.test(id)||queryTerms.length===1);
         if(resolved==='focused'&&input.query) {
             const total=snapshot!.chunks??=Number(db.prepare('SELECT count(*) n FROM memory_chunks').get()!.n);
@@ -355,7 +358,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 // A ubiquitous provenance path cannot answer the rest of a question.
                 // Retain the neighbor, but require local subject evidence for support.
                 || !c.specificTopic&&refs.subjectCount>=3&&refs.subjectCoverage<.3&&salientMatches===0);
-            c.answer={state,coverage,alignment,checked:signature,salient:salientMatches>0,subjectMatches:salient.filter(t=>words.has(t)).length,referenceBackground};
+            const support=supportReq?supportAssessment(supportReq,text,words,{exact:c.exact,coverage,cosine:c.cosine??0,
+                threshold:config.evidence_threshold,referenceBackground,subjectCoverage:refs.subjectCoverage}):undefined;
+            c.answer={state,coverage,alignment,checked:signature,salient:salientMatches>0,subjectMatches:salient.filter(t=>words.has(t)).length,referenceBackground,support};
             if(profileTrace){profileTrace.current=previousStage!;profileTrace.add('ranking',performance.now()-rankingStarted);}
         };
         const persisted=new Map<string,string>();
@@ -744,7 +749,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             const mismatchedDecision=!expansion && declared!==undefined && intent!=='unknown' && declared!==intent;
             const requiresCheck=flags.get(key) || unknownTime || body.lifecycle==='quarantined' ||
                 body.lifecycle==='historical'&&!input.as_of || !coversEffectiveTime(body.valid_time,effectiveAt);
-            const strength = !unknownTime && !mismatchedDecision && (expansion || c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold)) ? 'supported' : 'weak';
+            const support=c?.answer?.support;
+            const legacySupport=Boolean(c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold));
+            const strength = !unknownTime && !mismatchedDecision && (expansion || (support ? support.level==='direct' : legacySupport)) ? 'supported' : 'weak';
             const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: requiresCheck ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? [ref?'version':'id'], ...extendedMetadata(body) };
             if(ref&&(body.scope!==row.scope||body.project_id!==row.project_id))
                 item.recorded_ownership={scope:body.scope,project_id:body.project_id};
@@ -752,7 +759,15 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             if (unknownTime && !result.warnings.includes('EFFECTIVE_TIME_UNKNOWN')) result.warnings.push('EFFECTIVE_TIME_UNKNOWN');
             if (ref) Object.assign(item,{recorded_at:row.recorded_at,current_revision:row.current_revision,history_start_revision:row.history_start_revision,
                 history_complete:row.history_start_revision===1&&row.history_version_count===row.current_revision,does_not_imply_current:true});
-            if (c?.answer) item.answer_relevance={state:c.answer.state,assessment:declared===undefined?'local_claim_heuristic':'declared_state',intent};
+            if (c?.answer) {
+                item.answer_relevance={state:c.answer.state,assessment:declared===undefined?'local_claim_heuristic':'declared_state',intent};
+                if(support) {
+                    const adjusted=support.level==='direct'&&(unknownTime||mismatchedDecision)
+                        ?{...support,level:'partial' as const,basis:[...support.basis,unknownTime?'unknown_time':'decision_mismatch']}:support;
+                    item.support={level:adjusted.level,basis:adjusted.basis,subject_coverage:Number(adjusted.subject_coverage.toFixed(3)),
+                        entities_covered:adjusted.entities_covered,entities_required:adjusted.entities_required,relation_covered:adjusted.relation_covered};
+                }
+            }
             if(c?.graphPath)item.graph_path=readGraph(()=>graphReader!.explain(c.graphPath!));
             if(referenceBackground){item.recall_reason=[...item.recall_reason,'background_only'];if(!result.warnings.includes('REFERENCE_EVIDENCE_MISSING'))result.warnings.push('REFERENCE_EVIDENCE_MISSING');}
             if (options.view==='evidence'&&!expansion) item.snippet_selection=snippetSelection;
@@ -841,6 +856,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         profileTrace?.add('state_persist',performance.now()-persistStarted);
         const serializationStarted=performance.now();
+        const supportLevels=result.items.map((item:any)=>item.support?.level).filter(Boolean);
+        if(supportLevels.length) plan.support={direct:supportLevels.filter((level:string)=>level==='direct').length,
+            partial:supportLevels.filter((level:string)=>level==='partial').length,
+            missing:supportLevels.filter((level:string)=>level==='missing').length};
+        if(supportLevels.length&&!supportLevels.includes('direct')&&result.has_more&&!result.warnings.includes('DIRECT_EVIDENCE_MISSING'))
+            result.warnings.push('DIRECT_EVIDENCE_MISSING');
         result.evidence_status = result.items.some((i: any) => i.evidence_strength === 'supported') ? 'related_evidence' : 'insufficient';
         result.empty_reason = result.items.length ? null : blocked ? 'item_exceeds_budget' :
             prunedVersions.length?'version_pruned':'no_relevant_evidence';

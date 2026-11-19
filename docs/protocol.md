@@ -38,6 +38,8 @@ MCP STDIO 和 CLI 使用相同的 `MemoryService`。配置路径通过 `SHARED_M
 
 `evidence_strength` 表示与本次问题的相关性，同一版本在不同查询下可以不同；不等于事实可信度。`evidence_status=insufficient` 表示候选不足以支持答案。空结果不证明某件事从未发生。
 
+普通 Focused 查询还返回 `support`：`level` 为 `direct`、`partial` 或 `missing`，`basis` 给出判定依据，`subject_coverage`、`entities_covered`/`entities_required` 和 `relation_covered` 说明主体、实体与关系的覆盖情况。只有 `direct` 会得到 `evidence_strength=supported`；`partial` 与 `missing` 均为 `weak`，但条目仍会作为可定位背景返回。人名编号、公共路径或单一精确标识符只作召回线索；问句要求的产品名、供应商、关系两端和关系措辞需要同时得到支持。`retrieval.support` 汇总本页三类数量。若本页没有任何 `direct`、仍有候选且 `has_more=true`，warnings 会包含 `DIRECT_EVIDENCE_MISSING`；客户端可续一页或按已知 ID 展开后再决定是否回答。
+
 ## 新增记录
 
 下面是合成参数示例，项目 UUID 必须替换成已注册项目；来源、时间、会话和内容应反映实际获授权的记录。

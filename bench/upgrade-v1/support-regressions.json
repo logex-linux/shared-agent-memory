@@ -1,0 +1,181 @@
+{
+  "format": "shared-agent-memory/support-regressions-v1",
+  "frozen_at": "2026-11-19",
+  "notes": "Sanitized replay pairs from the 2026-11-19 recall-log review. Each case keeps the query-visible subject, relation and expected evidence level. Families are disjoint so the same person, course, session or source family is never shared between development and holdout.",
+  "cases": [
+    {
+      "id": "S03-S04",
+      "family": "book-ocr-location",
+      "split": "development",
+      "query": "书籍 OCR 页码标记 输出位置",
+      "stages": [
+        {
+          "name": "before-write",
+          "publish": ["roster"],
+          "expect": {
+            "status": "insufficient",
+            "levels": { "roster": "partial" }
+          }
+        },
+        {
+          "name": "after-write",
+          "publish": ["book"],
+          "expect": {
+            "top": "book",
+            "status": "related_evidence",
+            "levels": { "book": "direct", "roster": "partial" }
+          }
+        }
+      ],
+      "records": {
+        "roster": {
+          "title": "课堂点名记录",
+          "content": "本周课堂点名与座位表，记录出勤和分组。",
+          "tags": ["course", "attendance"]
+        },
+        "book": {
+          "title": "书籍 OCR 成品位置",
+          "content": "《数字时代》的 OCR 成品保存在 /notes/book-ocr，页码标记按原书页码输出。",
+          "tags": ["book", "ocr"]
+        }
+      }
+    },
+    {
+      "id": "S11",
+      "family": "course-reading-assignment",
+      "split": "development",
+      "query": "3391 课程 读书作业 指定书目 2000字 读书笔记",
+      "stages": [
+        {
+          "name": "single-page",
+          "publish": ["course", "other"],
+          "expect": {
+            "top": "course",
+            "status": "related_evidence",
+            "levels": { "course": "direct", "other": "partial" }
+          }
+        }
+      ],
+      "records": {
+        "course": {
+          "title": "课程 3391 读书作业要求",
+          "content": "3391 课程读书作业：阅读指定书目，提交 2000 字读书笔记，并引用原文页码。",
+          "tags": ["course", "assignment"]
+        },
+        "other": {
+          "title": "3391 课程读书作业旧版封面",
+          "content": "3391 课程读书作业旧版封面格式，只保留封面和目录要求。",
+          "tags": ["course", "legacy"]
+        }
+      }
+    },
+    {
+      "id": "S13",
+      "family": "person-id-wrong-course",
+      "split": "development",
+      "query": "2023110042 课程 3391 数字文化 读书笔记 主题 阅读材料",
+      "stages": [
+        {
+          "name": "single-page",
+          "publish": ["otherCourse", "course"],
+          "expect": {
+            "top": "course",
+            "status": "related_evidence",
+            "levels": { "course": "direct", "otherCourse": "partial" }
+          }
+        }
+      ],
+      "records": {
+        "otherCourse": {
+          "title": "2023110042 课程 5521 读书笔记手册",
+          "content": "2023110042 的 5521 课程读书笔记格式：封面、目录和页码。",
+          "tags": ["course", "manual"]
+        },
+        "course": {
+          "title": "2023110042 课程 3391 读书笔记主题",
+          "content": "3391 课程读书笔记主题围绕数字文化，要求结合阅读材料。",
+          "tags": ["course", "notes"]
+        }
+      }
+    },
+    {
+      "id": "S15",
+      "family": "client-shared-skills-directory",
+      "split": "development",
+      "query": "Antigravity 与 StepCode 是否共享技能目录 /Users/linnx/.agents/skills",
+      "stages": [
+        {
+          "name": "before-relation",
+          "publish": ["horizon", "codex"],
+          "expect": {
+            "status": "insufficient",
+            "levels": { "horizon": "partial", "codex": "partial" }
+          }
+        },
+        {
+          "name": "after-relation",
+          "publish": ["link"],
+          "expect": {
+            "top": "link",
+            "status": "related_evidence",
+            "levels": { "link": "direct", "horizon": "partial", "codex": "partial" }
+          }
+        }
+      ],
+      "records": {
+        "horizon": {
+          "title": "Horizon 安装记录",
+          "content": "Horizon 客户端安装到 /Users/linnx/.agents/skills，使用默认配置。",
+          "tags": ["client", "install"]
+        },
+        "codex": {
+          "title": "Codex 默认安装目录",
+          "content": "Codex 的默认安装目录是 /Users/linnx/.agents/skills。",
+          "tags": ["client", "install"]
+        },
+        "link": {
+          "title": "Antigravity 与 StepCode 共享技能目录",
+          "content": "Antigravity 与 StepCode 通过符号链接共享 /Users/linnx/.agents/skills，两端 inode 相同。",
+          "tags": ["client", "symlink"]
+        }
+      }
+    },
+    {
+      "id": "S18",
+      "family": "vendor-transcription-model-cli",
+      "split": "development",
+      "query": "百炼/Qwen 转写模型与 CLI 的约定",
+      "stages": [
+        {
+          "name": "wrong-vendor",
+          "publish": ["stepaudio"],
+          "expect": {
+            "status": "insufficient",
+            "levels": { "stepaudio": "partial" }
+          }
+        },
+        {
+          "name": "right-vendor",
+          "publish": ["bailian"],
+          "expect": {
+            "top": "bailian",
+            "status": "related_evidence",
+            "levels": { "bailian": "direct", "stepaudio": "partial" }
+          }
+        }
+      ],
+      "records": {
+        "stepaudio": {
+          "title": "StepAudio 转写流程",
+          "content": "StepAudio 转写模型通过 CLI 批量处理音频，输出字幕文件。",
+          "tags": ["transcription", "cli"]
+        },
+        "bailian": {
+          "title": "百炼 Qwen 转写约定",
+          "content": "百炼 Qwen 转写模型使用 DashScope CLI，输出 SRT 字幕。",
+          "tags": ["transcription", "qwen"]
+        }
+      }
+    }
+  ]
+}

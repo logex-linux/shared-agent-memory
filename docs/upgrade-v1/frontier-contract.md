@@ -159,3 +159,24 @@ the two clients by family and records their model IDs, cursor calls, span
 checks, result bytes, latency and available usage. Codex reports aggregate
 turn usage. StepCode reports usage per assistant response. A missing token
 counter stays empty. Pilot scores cannot authorize default enablement.
+
+## Beta.6 support calibration
+
+Beta.6 keeps Schema 14 and ordinary recall budgets. Focused pages add
+`support.level` (`direct`, `partial`, `missing`) and `support.basis`, plus
+subject, entity and relation coverage counts. Only `direct` yields
+`evidence_strength=supported`; applicability or decision-state downgrades are
+recorded as `unknown_time` or `decision_mismatch`. Person numbers, shared public
+paths and a lone exact identifier are recall clues. Questions about a
+cross-client link require both endpoints and relation wording; vendor or model
+questions require the named product and required object. A page with no `direct` item and more candidates emits `DIRECT_EVIDENCE_MISSING`, so the client can try one continuation or expand a known ID before answering.
+
+The sanitized frozen pairs are `bench/upgrade-v1/support-regressions.json`.
+Each case keeps its family, split, query-visible subject/relation and expected
+level. The paired runner now excludes development rows from pilot aggregates,
+reports `development_runs`, `pilot_runs`, `holdout_runs` and `case_splits`, and
+still requires a pre-frozen holdout for any default-enablement claim. A page
+with only `partial`/`missing` support and more candidates emits
+`DIRECT_EVIDENCE_MISSING`; the client may try one continuation or expand a
+known ID. Roll back the runtime to beta.5 if a shadow or small-scope run
+regresses; canonical SQLite facts and revisions need no rollback.

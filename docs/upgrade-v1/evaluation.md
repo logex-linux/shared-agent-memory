@@ -211,3 +211,21 @@ frozen suite matched 607 pages across 186 queries, and the 53 available
 private replay pages matched. Ordinary recall transferred zero full bodies
 in these runs. Results are under `.local/upgrade-v1/p5/` in
 `beta-tests.log`, `compatibility.json` and `private-replay/report.json`.
+
+## Beta.6 support calibration
+
+Beta.6 replays five sanitized error pairs from the 2026-11-19 log review.
+S03/S04 covers a missing book record before and after write; S11 a course
+assignment; S13 the same person's other-course manual; S15 a shared skills
+directory; S18 a different transcription vendor. The before pages return
+`insufficient` with `partial` background. The after pages return the direct
+record as `supported` while the near miss stays `weak`.
+
+`tests/support-calibration.test.mjs` runs the frozen fixture with a constant
+vector encoder, so semantic similarity alone cannot earn a support label.
+Every page must report zero ordinary full-body reads and a `support` summary
+that matches its items. The beta.6 build and all 159 tests passed. The live
+copy replay downgraded the S13 other-course manual, S15 install record and S18
+different-vendor record, while keeping the S04, S11 and S15 true hits at the
+top. A partial page with remaining candidates emits `DIRECT_EVIDENCE_MISSING`.
+No frozen corpus or private replay is overwritten by this label-only change.

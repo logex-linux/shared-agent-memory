@@ -46,6 +46,97 @@ export function referenceEvidence(query:string) {
     const patterns=refs.map(id=>referencePattern(id,true));
     return (text:string,words=new Set(terms(text)))=>({count:refs.length,coverage:refs.length?patterns.filter(re=>re.test(text)).length/refs.length:1,subjectCount:subject.length,subjectCoverage:subject.length?subject.filter(t=>words.has(t)).length/subject.length:0});
 }
+export type SupportLevel = 'direct'|'partial'|'missing';
+export type SupportEntity = { anyOf: string[]; kind: 'path'|'code'|'name'|'term'|'number' };
+export type SupportRequirement = { entities: SupportEntity[]; relations: { test: RegExp; label: string }[]; subject: string[] };
+export type SupportAssessment = { level: SupportLevel; basis: string[]; subject_coverage: number; entities_covered: number; entities_required: number; relation_covered: boolean };
+export type SupportSignal = { exact: number; coverage: number; cosine: number; threshold: number; referenceBackground?: boolean; subjectCoverage: number };
+const englishScaffolding=new Set('the a an and or but of to for from in on at by with as is are was were be been being have has had do does did this that these those it its i we you they their our my your which what how why when where who should would could can must may will not no if then than also into about through during before after including exactly explicitly said made current previous user use using check find fix'.split(' '));
+const relationRules=[
+    {test:/共享|共用|同一(?:个)?|相同|一致|符号链接|软链接|硬链接|互指|链接到|指向|symlink|shared?|same(?: folder| directory)?|identical|link(?:ed)? to/i,label:'share_or_link'},
+    {test:/区别|差异|不同|对比|比较|versus|\bvs\b|differ/i,label:'compare'},
+    {test:/冲突|矛盾|不一致|contradict|conflict/i,label:'conflict'},
+    {test:/依赖|取决于|depends? on/i,label:'depend'},
+    {test:/替换|取代|迁移|改为|supersed|replac|migrat/i,label:'supersede'}
+];
+const normalizeEntity=(value:string)=>value.trim().replace(/^[`'"「『]+|[`'"」』]+$/g,'').toLowerCase();
+// Entity and relation requirements are answerability checks, not recall filters.
+// A person number or a shared public path remains a useful clue but cannot alone
+// establish that the returned record answers the requested subject or relation.
+export function supportRequirements(query:string):SupportRequirement {
+    const entities=new Map<string,SupportEntity>(),add=(values:string[],kind:SupportEntity['kind'])=>{
+        const anyOf=[...new Set(values.map(normalizeEntity).filter(value=>value.length>=2&&!englishScaffolding.has(value)))];
+        const key=anyOf.join('|');
+        if(anyOf.length&&!entities.has(key)) entities.set(key,{anyOf,kind});
+    };
+    const slashGroups=[...query.matchAll(/(?<![\p{L}\p{N}_/.-])([\p{L}\p{N}_+-]{2,})\s*[/／]\s*([\p{L}\p{N}_+-]{2,})(?![\p{L}\p{N}_/.-])/gu)]
+        .map(match=>[match[1],match[2]]);
+    const isPath=(id:string)=>id.startsWith('/')||id.startsWith('./')||id.startsWith('../')||id.includes('\\')||
+        (id.match(/\//g)??[]).length>1||/\/[^/]*\.[a-z0-9]+$/i.test(id);
+    const found=identifiers(query);
+    const paths=found.filter(isPath);
+    for(const path of paths) add([path],'path');
+    const numbers=found.filter(id=>/^\d{4,}$/.test(id)&&!/^20\d{2}(?:\d{4}|[-_]\d{1,2}[-_]\d{1,2})?$/.test(id));
+    const slashText=new Set(slashGroups.map(group=>group.join('/').toLowerCase()));
+    const codes=found.filter(id=>!paths.includes(id)&&!numbers.includes(id)&&!slashText.has(id)&&
+        !/^20\d{2}(?:\d{4}|[-_]\d{1,2}[-_]\d{1,2})?$/.test(id));
+    for(const code of codes) add([code],'code');
+    const quoted=[...query.matchAll(/[`'"「『]([^`'"」』]{2,80})[`'"」』]/g)].map(match=>match[1]);
+    for(const value of quoted) add([value],'code');
+    const names=[...query.matchAll(/\b[A-Z][A-Za-z0-9.+#_-]{2,}\b/g)].map(match=>match[0])
+        .filter(value=>!englishScaffolding.has(value.toLowerCase())&&!/[_.-]$/.test(value)&&
+            !paths.some(path=>path.includes(value.toLowerCase()))&&!codes.some(code=>code.includes(value.toLowerCase())));
+    for(const name of names) add([name],'name');
+    for(const group of slashGroups) add(group,'term');
+    const groups=[...entities.values()];
+    const same=(a:SupportEntity,b:SupportEntity)=>a.anyOf.length===b.anyOf.length&&a.anyOf.every(value=>b.anyOf.includes(value));
+    const required=groups.filter((entity,index)=>!groups.some((other,otherIndex)=>otherIndex!==index&&
+        (same(entity,other)&&otherIndex<index||
+        other.anyOf.length>entity.anyOf.length&&entity.anyOf.every(value=>other.anyOf.includes(value)))));
+    const referenceTerms=new Set(required.flatMap(entity=>entity.anyOf.flatMap(terms)));
+    const subject=focusTerms(query).filter(term=>!referenceTerms.has(term));
+    return {entities:required.slice(0,8),relations:relationRules.filter(rule=>rule.test.test(query)),subject};
+}
+const mentions=(text:string,value:string)=>{
+    try {return referencePattern(value,/[\\/]/.test(value)).test(text);}
+    catch {return text.toLowerCase().includes(value);}
+};
+export function supportAssessment(requirements:SupportRequirement,text:string,words:Set<string>,signal:SupportSignal):SupportAssessment {
+    const entitiesRequired=requirements.entities.length;
+    const covered=requirements.entities.filter(entity=>entity.anyOf.some(value=>mentions(text,value)));
+    const entitiesCovered=covered.length;
+    const relationCovered=!requirements.relations.length||requirements.relations.some(rule=>rule.test.test(text));
+    const basis:string[]=[];
+    const lexical=signal.coverage>=.6, semantic=signal.cosine>=signal.threshold, identifier=signal.exact>0;
+    const strongSubject=signal.subjectCoverage>=.6;
+    const missingKinds=requirements.entities.filter(entity=>!covered.includes(entity)).map(entity=>entity.kind);
+    // A missing code symbol does not erase a locally supported subject. Missing
+    // product names, vendors or paths do, unless the subject itself is fully covered.
+    const entitiesOk=entitiesCovered===entitiesRequired
+        || strongSubject&&missingKinds.every(kind=>kind==='code'||kind==='number');
+    if(signal.referenceBackground) {
+        basis.push('background_only');
+        return {level:identifier||lexical||semantic?'partial':'missing',basis,subject_coverage:signal.subjectCoverage,entities_covered:entitiesCovered,entities_required:entitiesRequired,relation_covered:relationCovered};
+    }
+    if(!identifier&&!lexical&&!semantic) {
+        basis.push('no_support_signal');
+        return {level:'missing',basis,subject_coverage:signal.subjectCoverage,entities_covered:entitiesCovered,entities_required:entitiesRequired,relation_covered:relationCovered};
+    }
+    if(!entitiesOk) basis.push('missing_entity');
+    else if(entitiesRequired&&entitiesCovered<entitiesRequired) basis.push('code_symbol_optional');
+    if(!relationCovered) basis.push('missing_relation');
+    const identifierSupport=identifier&&(strongSubject||!requirements.subject.length);
+    const semanticSupport=semantic&&(strongSubject||entitiesRequired>0&&entitiesCovered===entitiesRequired||
+        missingKinds.every(kind=>kind==='code'||kind==='number')&&signal.subjectCoverage>=.4);
+    if(entitiesOk&&relationCovered&&(identifierSupport||lexical||semanticSupport)) {
+        if(identifierSupport) basis.push('identifier_subject');
+        if(lexical) basis.push('lexical_subject');
+        if(semanticSupport) basis.push('semantic_subject');
+        return {level:'direct',basis,subject_coverage:signal.subjectCoverage,entities_covered:entitiesCovered,entities_required:entitiesRequired,relation_covered:relationCovered};
+    }
+    if(!strongSubject) basis.push('weak_subject');
+    return {level:'partial',basis,subject_coverage:signal.subjectCoverage,entities_covered:entitiesCovered,entities_required:entitiesRequired,relation_covered:relationCovered};
+}
 // Whole original sentence/line when possible. Long code lines use contiguous windows.
 // Offsets are JS UTF-16 offsets, the same units used by the chunker.
 export function evidenceWindow(text: string, query: string, budget = 200) {

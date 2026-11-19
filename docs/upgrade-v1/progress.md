@@ -88,3 +88,26 @@ records, an external ledger with six entries, fault injection and six isolated
 client launch templates. See [migration and recovery](migration-and-rollback.md).
 The checked-out preview is `1.0.0-beta.1`. The installed runtime remains
 v0.4.8 on Schema 5. This branch has no live rollout or remote push.
+
+## Beta.6 support calibration
+
+Beta.6 keeps Schema 14 and changes ordinary focused labels only. `support.level`
+is now `direct`, `partial` or `missing`, with `support.basis` and subject,
+entity and relation coverage. Only `direct` yields `evidence_strength=supported`.
+Person numbers, shared public paths and a lone exact identifier remain recall
+clues. Cross-end link questions require both endpoints and relation wording;
+vendor or model questions require the named product and required object.
+
+The frozen sanitized regressions are in
+`bench/upgrade-v1/support-regressions.json`: S03/S04, S11, S13, S15 and S18.
+Each case records the query-visible subject, relation, expected level and a
+disjoint family. `tests/support-calibration.test.mjs` replays the before/after
+pages. The paired runner now excludes development rows from pilot aggregates
+and reports each split separately.
+
+The beta.6 build and all 159 tests pass with Node 24.18.0. The installed runtime
+was activated as `1.0.0-beta.6` on Schema 14 from the working tree on
+2026-11-19. Because the source checkout was not committed, the installation
+manifest records `commit: null`; the activation report keeps the source HEAD,
+dirty status and the pre-swap artifact hash. The canonical database was backed
+up before the swap and was not modified by activation.
