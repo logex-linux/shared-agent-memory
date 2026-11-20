@@ -254,5 +254,7 @@ rejects the `am5` cursor as `CURSOR_INVALID`. See `cursor-cross-evidence.json`.
 Two warm pairs over 12 frozen queries measured beta.6/beta.7 median p95 of
 23.736/23.753 ms (ratio 1.0007) with zero ordinary full-body reads. See
 `stable-warm-evidence.json`. The CI CPU job sets
-`ONNXRUNTIME_NODE_INSTALL_CUDA=skip`; the Ubuntu runner result is still needed
-before rc.1.
+`ONNXRUNTIME_NODE_INSTALL_CUDA=skip`; Ubuntu run
+[44747471987](https://github.com/logex-linux/shared-agent-memory/actions/runs/44747471987)
+passed `npm ci`, model download, 165 tests, the adaptive benchmark and the
+installer/CLI check on commit `b69e3a6`.

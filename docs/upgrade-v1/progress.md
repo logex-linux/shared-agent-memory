@@ -140,6 +140,13 @@ full-body reads. See `bench/upgrade-v1/stable-warm-evidence.json`.
 
 The CI CPU job now sets `ONNXRUNTIME_NODE_INSTALL_CUDA=skip` for `npm ci`, so
 `onnxruntime-node` does not try the unpublished Linux GPU archive. The local
-suite has 165 tests; a clean Ubuntu runner still has to confirm the install
-path and model/test/benchmark steps. The installed runtime remains beta.6 until
-the candidate is staged and the release owner approves the switch.
+suite has 165 tests. The clean Ubuntu run
+[44747471987](https://github.com/logex-linux/shared-agent-memory/actions/runs/44747471987)
+passed `npm ci`, model download, all 165 tests, the adaptive benchmark and the
+installer/CLI check on commit `b69e3a6`.
+
+Beta.7 was activated as `1.0.0-beta.7` on Schema 14 with commit
+`b69e3a65ca4abe8f7663025db0799b20801e1eaa`. The canonical database was backed
+up before the swap and remained at generation 583 with 460 records. The
+beta.7 candidate, beta.6 rollback runtime, evidence and CI report are under
+`~/.agents/backups/shared-agent-memory/beta7-stable-20261120/`.

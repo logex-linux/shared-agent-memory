@@ -196,4 +196,7 @@ semantics. The canonical database and revision checks are unchanged.
 The six frozen families and the real-BGE before/after results are in
 `bench/upgrade-v1/stable-regressions.json` and
 `stable-regressions-evidence.json`. The CI CPU job sets
-`ONNXRUNTIME_NODE_INSTALL_CUDA=skip`; a clean Ubuntu run still gates rc.1.
+`ONNXRUNTIME_NODE_INSTALL_CUDA=skip`; Ubuntu run
+[44747471987](https://github.com/logex-linux/shared-agent-memory/actions/runs/44747471987)
+passed `npm ci`, model download, 165 tests, the adaptive benchmark and the
+installer/CLI check on commit `b69e3a6`.
