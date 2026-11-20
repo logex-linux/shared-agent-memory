@@ -1,0 +1,87 @@
+{
+  "format": "shared-agent-memory/stable-regressions-v1",
+  "frozen_at": "2026-11-20",
+  "source": "shared-agent-memory-stable-release-evidence-2026-11-20.json",
+  "source_fixture_sha256": "a19b6dc354e0ca005175d1a5eab206eece2122beae043de77033a743b2f09618",
+  "notes": "Six synthetic counterexamples frozen before the beta.7 scoring change. Each family first stores only the adjacent object, then adds the asked object. These are regressions, not natural-traffic holdouts.",
+  "cases": [
+    {
+      "key": "cold-storage",
+      "family": "warehouse-retention",
+      "query": "青禾冷链北仓的温度记录要保留多少天？",
+      "distractor": {
+        "title": "青禾冷链南仓温度记录留存规则",
+        "content": "青禾冷链南仓的温度记录保留 90 天。该规则的适用范围是南仓。"
+      },
+      "direct": {
+        "title": "青禾冷链北仓温度记录留存规则",
+        "content": "青禾冷链北仓的温度记录保留 30 天。该规则的适用范围是北仓。"
+      }
+    },
+    {
+      "key": "library-loans",
+      "family": "library-branch-loans",
+      "query": "白石图书馆东馆外借的摄影画册可以续借几次？",
+      "distractor": {
+        "title": "白石图书馆西馆摄影画册外借",
+        "content": "西馆借出的摄影画册可续借两次。这是白石图书馆西馆的借阅办法。"
+      },
+      "direct": {
+        "title": "白石图书馆东馆摄影画册外借",
+        "content": "东馆借出的摄影画册只可续借一次。这是白石图书馆东馆的借阅办法。"
+      }
+    },
+    {
+      "key": "subtitle-exports",
+      "family": "subtitle-platform-export",
+      "query": "云帆字幕网页版默认导出什么字幕格式？",
+      "distractor": {
+        "title": "云帆字幕桌面版导出设置",
+        "content": "云帆字幕桌面版默认导出 WebVTT 字幕，桌面版设置在导出对话框中。"
+      },
+      "direct": {
+        "title": "云帆字幕网页版导出设置",
+        "content": "云帆字幕网页版默认导出 SRT 字幕，网页版设置在浏览器内的导出面板中。"
+      }
+    },
+    {
+      "key": "edition-paper",
+      "family": "book-edition-paper",
+      "query": "梧桐出版社的《夜间植物志》重印版选用了哪种纸？",
+      "distractor": {
+        "title": "梧桐出版社《夜间植物志》初版印制单",
+        "content": "《夜间植物志》初版的内页采用 90 克米白胶版纸。梧桐出版社的这份印制单只覆盖初版。"
+      },
+      "direct": {
+        "title": "梧桐出版社《夜间植物志》重印版印制单",
+        "content": "《夜间植物志》重印版的内页采用 120 克再生纸。梧桐出版社的这份印制单只覆盖重印版。"
+      }
+    },
+    {
+      "key": "choir-schedule",
+      "family": "choir-room-schedule",
+      "query": "南湾合唱团周二排练用哪间教室？",
+      "distractor": {
+        "title": "南湾合唱团周四排练安排",
+        "content": "南湾合唱团在每周四排练，订的是榕树教室。此场地安排仅用于周四。"
+      },
+      "direct": {
+        "title": "南湾合唱团周二排练安排",
+        "content": "南湾合唱团在每周二排练，订的是松柏教室。此场地安排仅用于周二。"
+      }
+    },
+    {
+      "key": "software-tier",
+      "family": "software-plan-limit",
+      "query": "What is the export size limit for the AsterDocs team plan?",
+      "distractor": {
+        "title": "AsterDocs personal plan export limit",
+        "content": "Exports on the AsterDocs personal plan are limited to 20 MB per file. This limit applies to the personal plan."
+      },
+      "direct": {
+        "title": "AsterDocs team plan export limit",
+        "content": "Exports on the AsterDocs team plan are limited to 100 MB per file. This limit applies to the team plan."
+      }
+    }
+  ]
+}

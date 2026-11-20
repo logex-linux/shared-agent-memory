@@ -2,7 +2,7 @@
 
 [English](README.en.md) · [协议](docs/protocol.md) · [维护](docs/operations.md) · [自适应检索](docs/adaptive-retrieval.md) · [实测报告](docs/adaptive-results.md) · [MIT](LICENSE)
 
-`1.0.0-beta.6`（Schema 14）按主体、关系和适用对象校准普通召回的 `supported` 判定，并输出 `support.level` 与依据；人名编号和公共路径只作召回线索。确定性证据包仍由连接配置启用。见 [事项目录与证据包](docs/upgrade-v1/frontier-contract.md)、[生命周期维护](docs/upgrade-v1/lifecycle.md)及[迁移和恢复](docs/upgrade-v1/migration-and-rollback.md)。
+`1.0.0-beta.7`（Schema 14）把对象限定、平台/版本/时间/套餐限定和答案类型纳入普通召回判定，并在最终交付片段上复核 `direct`；`am4` 旧游标返回 `CURSOR_STALE`，新游标为 `am5`。确定性证据包仍由连接配置启用。见 [事项目录与证据包](docs/upgrade-v1/frontier-contract.md)、[生命周期维护](docs/upgrade-v1/lifecycle.md)及[迁移和恢复](docs/upgrade-v1/migration-and-rollback.md)。
 
 供同一台机器上的多个 AI Agent 共用的本地记忆服务。提供标准 **MCP STDIO** 和 **CLI**，用本地 embedding、关键词和代码标识符检索，按当前任务返回相关片段。
 

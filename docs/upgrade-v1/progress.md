@@ -111,3 +111,35 @@ was activated as `1.0.0-beta.6` on Schema 14 from the working tree on
 manifest records `commit: null`; the activation report keeps the source HEAD,
 dirty status and the pre-swap artifact hash. The canonical database was backed
 up before the swap and was not modified by activation.
+
+## Beta.7 stable-release blockers
+
+Beta.7 keeps Schema 14 and addresses the three blockers in the 2026-11-20
+review. Ordinary focused support now extracts object qualifiers (north/south
+warehouse, east/west library, web/desktop edition, first/reprint edition,
+weekday, team/personal plan) and answer types (location, quantity, time,
+boolean). The `direct` label is re-issued on the delivered excerpt, so a
+qualifier or answer sentence cut by the window or budget cannot remain direct.
+
+The six frozen counterexamples are in
+`bench/upgrade-v1/stable-regressions.json`. With real local BGE, beta.6 marked
+all 6 adjacent objects as supported before and after the correct record was
+added. Beta.7 marked 0/6 before, kept 6/6 correct records in the top five, and
+kept 0/6 wrong objects supported after. Results are in
+`bench/upgrade-v1/stable-regressions-evidence.json`.
+
+Cursors now use `am5`; `am4` returns `CURSOR_STALE` with a restart hint. On the
+same generation-583 copy, beta.6's S15 first page produced an `am4` cursor;
+beta.7 rejected it as stale, a fresh beta.7 page continued to the same
+`019f08d1` revision with `weak / partial`, and beta.6 rejected the `am5`
+cursor as `CURSOR_INVALID`. See `bench/upgrade-v1/cursor-cross-evidence.json`.
+
+Two independent warm pairs (120 calls per runtime, 12 frozen queries) measured
+beta.6/beta.7 median p95 of 23.736/23.753 ms, ratio 1.0007, with zero ordinary
+full-body reads. See `bench/upgrade-v1/stable-warm-evidence.json`.
+
+The CI CPU job now sets `ONNXRUNTIME_NODE_INSTALL_CUDA=skip` for `npm ci`, so
+`onnxruntime-node` does not try the unpublished Linux GPU archive. The local
+suite has 165 tests; a clean Ubuntu runner still has to confirm the install
+path and model/test/benchmark steps. The installed runtime remains beta.6 until
+the candidate is staged and the release owner approves the switch.

@@ -1,0 +1,276 @@
+{
+  "format": "shared-agent-memory/stable-regressions-evidence-v1",
+  "generated_at": "2026-11-20T13:02:00Z",
+  "fixture": "bench/upgrade-v1/stable-regressions.json",
+  "fixture_sha256": "2db31343c8a9eaa0780a04fa2cb79440c2fd5ffa8295bb07a1d3a5e3ab0147e2",
+  "runtime": {
+    "beta6": "/Users/linnx/.agents/backups/shared-agent-memory/beta6-support-20261119/candidate/dist",
+    "beta7": "dist"
+  },
+  "model": "local CPU bge-small-zh-v1.5 FP32, 2 threads",
+  "query": {
+    "mode": "focused",
+    "view": "evidence",
+    "limit": 5,
+    "max_bytes": 8000,
+    "scope": "family project"
+  },
+  "metrics": {
+    "beta6": {
+      "families": 6,
+      "before_wrong_supported": 6,
+      "after_gold_top5": 6,
+      "after_wrong_supported": 6
+    },
+    "beta7": {
+      "families": 6,
+      "before_wrong_supported": 0,
+      "after_gold_top5": 6,
+      "after_wrong_supported": 0
+    }
+  },
+  "cases": [
+    {
+      "key": "cold-storage",
+      "family": "warehouse-retention",
+      "query": "青禾冷链北仓的温度记录要保留多少天？",
+      "before": {
+        "status": "insufficient",
+        "items": [
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier"
+            ]
+          }
+        ]
+      },
+      "after": {
+        "status": "related_evidence",
+        "items": [
+          {
+            "role": "gold",
+            "level": "direct",
+            "strength": "supported",
+            "basis": [
+              "lexical_subject",
+              "semantic_subject"
+            ]
+          },
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "library-loans",
+      "family": "library-branch-loans",
+      "query": "白石图书馆东馆外借的摄影画册可以续借几次？",
+      "before": {
+        "status": "insufficient",
+        "items": [
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier"
+            ]
+          }
+        ]
+      },
+      "after": {
+        "status": "related_evidence",
+        "items": [
+          {
+            "role": "gold",
+            "level": "direct",
+            "strength": "supported",
+            "basis": [
+              "lexical_subject",
+              "semantic_subject"
+            ]
+          },
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "subtitle-exports",
+      "family": "subtitle-platform-export",
+      "query": "云帆字幕网页版默认导出什么字幕格式？",
+      "before": {
+        "status": "insufficient",
+        "items": [
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier"
+            ]
+          }
+        ]
+      },
+      "after": {
+        "status": "related_evidence",
+        "items": [
+          {
+            "role": "gold",
+            "level": "direct",
+            "strength": "supported",
+            "basis": [
+              "lexical_subject",
+              "semantic_subject"
+            ]
+          },
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "edition-paper",
+      "family": "book-edition-paper",
+      "query": "梧桐出版社的《夜间植物志》重印版选用了哪种纸？",
+      "before": {
+        "status": "insufficient",
+        "items": [
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier",
+              "weak_subject"
+            ]
+          }
+        ]
+      },
+      "after": {
+        "status": "related_evidence",
+        "items": [
+          {
+            "role": "gold",
+            "level": "direct",
+            "strength": "supported",
+            "basis": [
+              "lexical_subject",
+              "semantic_subject"
+            ]
+          },
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier",
+              "weak_subject"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "choir-schedule",
+      "family": "choir-room-schedule",
+      "query": "南湾合唱团周二排练用哪间教室？",
+      "before": {
+        "status": "insufficient",
+        "items": [
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier"
+            ]
+          }
+        ]
+      },
+      "after": {
+        "status": "related_evidence",
+        "items": [
+          {
+            "role": "gold",
+            "level": "direct",
+            "strength": "supported",
+            "basis": [
+              "lexical_subject",
+              "semantic_subject"
+            ]
+          },
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "software-tier",
+      "family": "software-plan-limit",
+      "query": "What is the export size limit for the AsterDocs team plan?",
+      "before": {
+        "status": "insufficient",
+        "items": [
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier"
+            ]
+          }
+        ]
+      },
+      "after": {
+        "status": "related_evidence",
+        "items": [
+          {
+            "role": "gold",
+            "level": "direct",
+            "strength": "supported",
+            "basis": [
+              "lexical_subject",
+              "semantic_subject"
+            ]
+          },
+          {
+            "role": "wrong_entity",
+            "level": "partial",
+            "strength": "weak",
+            "basis": [
+              "missing_qualifier"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

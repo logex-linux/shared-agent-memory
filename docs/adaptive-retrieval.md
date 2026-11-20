@@ -49,7 +49,7 @@ SQLite 内部可扫描符合条件的索引项；这仍是精确 cosine KNN，�
 ```
 
 ```json
-{"cursor":"am4:返回的查询UUID:1"}
+{"cursor":"am5:返回的查询UUID:1"}
 ```
 
 cursor 为服务返回的不透明值，调用者不得自行拼接。后续请求继承原查询、范围、context、mode、view、limit 和单页预算；对于尚未生成的新页，可显式覆盖单页 limit / view / token_budget / max_bytes。不能改变 query、scope、mode 或 context。
@@ -92,7 +92,7 @@ Token 估算是 `ceil(紧凑JSON UTF-8 bytes / 3)`，不是任意 LLM 的真实 
 
 canonical Schema5 不变。辅助文件 `<真实database路径>.retrieval.db` 使用 WAL、0600 权限、secure_delete，保存查询参数/向量、候选 ID/分数/Chunk偏移、散列 facet、通道进度与不可变页面选择；不缓存记忆正文或来源原文。游标是随机128位查询 ID 和页序号，服务器查表验证，不是可以绕过 ACL 的令牌。
 
-绑定内容：真实数据库路径、connection_id、允许的项目/操作、all_projects/global、注册项目集合、检索阈值、模型配置、排序策略版本、原查询和 canonical generation。每页重查权限及适用性。任何正式发布、修订、遗忘或索引重建导致 generation 变化后，旧游标拒绝；时间经过导致旧页条目过期也拒绝重放。新页跳过已过期候选；显式项目过滤和 global 规则从候选 SQL 开始执行。
+绑定内容：真实数据库路径、connection_id、允许的项目/操作、all_projects/global、注册项目集合、检索阈值、模型配置、排序策略版本、证据判定版本、原查询和 canonical generation。beta.7 起游标前缀为 `am5`；beta.6 及更早的 `am4` 游标返回 `CURSOR_STALE`，客户端用原问句重新查询，不沿用旧页的逐条证据等级。每页重查权限及适用性。任何正式发布、修订、遗忘或索引重建导致 generation 变化后，旧游标拒绝；时间经过导致旧页条目过期也拒绝重放。新页跳过已过期候选；显式项目过滤和 global 规则从候选 SQL 开始执行。
 
 | 错误 | 处理 |
 |---|---|

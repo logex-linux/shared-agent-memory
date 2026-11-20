@@ -48,8 +48,10 @@ export function referenceEvidence(query:string) {
 }
 export type SupportLevel = 'direct'|'partial'|'missing';
 export type SupportEntity = { anyOf: string[]; kind: 'path'|'code'|'name'|'term'|'number' };
-export type SupportRequirement = { entities: SupportEntity[]; relations: { test: RegExp; label: string }[]; subject: string[] };
-export type SupportAssessment = { level: SupportLevel; basis: string[]; subject_coverage: number; entities_covered: number; entities_required: number; relation_covered: boolean };
+export type SupportQualifier = { anyOf: string[]; kind: 'location'|'platform'|'edition'|'time'|'tier' };
+export type SupportAnswerKind = 'location'|'quantity'|'time'|'boolean'|'choice'|'unknown';
+export type SupportRequirement = { entities: SupportEntity[]; relations: { test: RegExp; label: string }[]; qualifiers: SupportQualifier[]; answer: SupportAnswerKind; subject: string[] };
+export type SupportAssessment = { level: SupportLevel; basis: string[]; subject_coverage: number; entities_covered: number; entities_required: number; relation_covered: boolean; qualifiers_covered: number; qualifiers_required: number; answer_covered: boolean };
 export type SupportSignal = { exact: number; coverage: number; cosine: number; threshold: number; referenceBackground?: boolean; subjectCoverage: number };
 const englishScaffolding=new Set('the a an and or but of to for from in on at by with as is are was were be been being have has had do does did this that these those it its i we you they their our my your which what how why when where who should would could can must may will not no if then than also into about through during before after including exactly explicitly said made current previous user use using check find fix'.split(' '));
 const relationRules=[
@@ -60,6 +62,53 @@ const relationRules=[
     {test:/替换|取代|迁移|改为|supersed|replac|migrat/i,label:'supersede'}
 ];
 const normalizeEntity=(value:string)=>value.trim().replace(/^[`'"「『]+|[`'"」』]+$/g,'').toLowerCase();
+// Confirmed aliases only. Unknown wording stays literal so a near miss cannot
+// inherit a direct label from a synonym guess.
+const qualifierSynonyms:Record<string,string[]>={
+    '网页版':['网页版','web','browser','网页'],
+    '桌面版':['桌面版','desktop','客户端'],
+    '手机版':['手机版','mobile','手机'],
+    '移动版':['移动版','mobile','移动端'],
+    '团队版':['团队版','team','团队计划','团队套餐'],
+    '个人版':['个人版','personal','个人计划','个人套餐'],
+    '企业版':['企业版','enterprise','企业计划','企业套餐'],
+    '专业版':['专业版','pro','professional'],
+    '免费版':['免费版','free'],
+    '付费版':['付费版','paid','premium'],
+    '旗舰版':['旗舰版','flagship','ultimate'],
+    '标准版':['标准版','standard'],
+    '基础版':['基础版','basic','starter'],
+    '高级版':['高级版','advanced','premium'],
+    '初版':['初版','第一版','first edition','1st edition'],
+    '重印版':['重印版','再版','reprint','reprint edition'],
+    '修订版':['修订版','revised edition','revision'],
+    '团队订阅':['团队订阅','team','团队计划','团队套餐'],
+    '个人订阅':['个人订阅','personal','个人计划','个人套餐'],
+    '企业订阅':['企业订阅','enterprise','企业计划','企业套餐'],
+    '家庭订阅':['家庭订阅','family','家庭计划','家庭套餐'],
+    '周二':['周二','星期二','tuesday','tue'],
+    '周四':['周四','星期四','thursday','thu'],
+    '周一':['周一','星期一','monday','mon'],
+    '周三':['周三','星期三','wednesday','wed'],
+    '周五':['周五','星期五','friday','fri'],
+    '周六':['周六','星期六','saturday','sat'],
+    '周日':['周日','周天','星期日','星期天','sunday','sun']
+};
+const answerKind=(query:string):SupportAnswerKind=>{
+    if(/哪里|哪儿|何处|位置|路径|目录|文件夹|保存在|存放在|位于|存放于|产物|输出到|\bwhere\b|\bpath\b|\bdirectory\b|\bfolder\b|\blocation\b|\bsaved\b|\bstored\b/i.test(query))return 'location';
+    if(/多少|几次|多久|多大|几天|几小时|几个月|几年|限制|上限|尺寸|\bhow many\b|\bhow much\b|\blimit\b|\bsize\b/i.test(query))return 'quantity';
+    if(/什么时候|哪天|周几|几号|日期|时间|\bwhen\b|\bwhat time\b|\bdate\b/i.test(query))return 'time';
+    if(/是否|是不是|有没有|能否|可以吗|\bwhether\b|\bis there\b|\bdoes\b/i.test(query))return 'boolean';
+    if(/哪种|哪个|哪一|什么格式|什么纸|哪间|哪版|哪仓|哪个平台|\bwhich\b|\bwhat format\b/i.test(query))return 'choice';
+    return 'unknown';
+};
+const answerSatisfied=(kind:SupportAnswerKind,text:string)=>{
+    if(kind==='unknown'||kind==='choice')return true;
+    if(kind==='location')return /(?:^|[\s(（])(?:~|\.{0,2}\/|\/)[^\s，。；、）)]+|[\w.-]+\/[\w./-]+|\b[\w-]+\.(?:md|txt|json|srt|vtt|ass|pdf|docx?|xlsx?|pptx?|png|jpe?g|webp|zip|html?|csv|mp4|mov|wav|mp3)\b|位置|路径|目录|文件夹|保存在|存放在|位于|存放于|\bpath\b|\bdirectory\b|\bfolder\b|\blocation\b|\bsaved\b|\bstored\b/i.test(text);
+    if(kind==='quantity')return /\d+(?:\.\d+)?\s*(?:天|次|小时|分钟|秒|个月|年|页|克|公斤|千克|厘米|毫米|米|元|块|份|个|间|台|人|本|张|条|字|%|MB|GB|KB|TB)|\d+(?:\.\d+)?\s*(?:days?|times?|hours?|minutes?|months?|years?|pages?|grams?|kg|cm|mm|meters?|MB|GB|KB|TB)|[一二三四五六七八九十百千万两]+(?:次|天|小时|分钟|秒|个月|年|页|克|公斤|厘米|毫米|米|元|块|份|个|间|台|人|本|张|条|字)/i.test(text);
+    if(kind==='time')return /\d{1,2}月\d{1,2}日|\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:周|星期)[一二三四五六日天]|今天|昨天|明天|上午|下午|晚上|\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\b(?:today|yesterday|tomorrow)\b/i.test(text);
+    return /是|否|可以|不能|支持|不支持|有|没有|需要|不需要|共享|相同|一致|符号链接|指向|属于|\byes\b|\bno\b|\bcan\b|\bcannot\b|\bsupported?\b|\bunsupported?\b|\bsame\b|\bshared?\b/i.test(text);
+};
 // Entity and relation requirements are answerability checks, not recall filters.
 // A person number or a shared public path remains a useful clue but cannot alone
 // establish that the returned record answers the requested subject or relation.
@@ -93,11 +142,32 @@ export function supportRequirements(query:string):SupportRequirement {
     const required=groups.filter((entity,index)=>!groups.some((other,otherIndex)=>otherIndex!==index&&
         (same(entity,other)&&otherIndex<index||
         other.anyOf.length>entity.anyOf.length&&entity.anyOf.every(value=>other.anyOf.includes(value)))));
+    const qualifiers=new Map<string,SupportQualifier>();
+    const addQualifier=(values:string[],kind:SupportQualifier['kind'])=>{
+        const anyOf=[...new Set(values.map(normalizeEntity).filter(value=>value.length>=2))];
+        const key=anyOf.join('|');
+        if(anyOf.length&&!qualifiers.has(key)) qualifiers.set(key,{anyOf,kind});
+    };
+    for(const match of query.matchAll(/[东南西北中上下前后新老初重第](?:仓|馆|区|店|楼|院|库|房)/gu))
+        addQualifier([match[0]],'location');
+    for(const match of query.matchAll(/网页版|桌面版|手机版|移动版|团队版|个人版|企业版|专业版|免费版|付费版|旗舰版|标准版|基础版|高级版|初版|重印版|再版|修订版|第[一二三四五六七八九十\d]+版/gu))
+        addQualifier(qualifierSynonyms[match[0]]??[match[0]],'platform');
+    for(const match of query.matchAll(/(?:周|星期)[一二三四五六日天]/gu))
+        addQualifier(qualifierSynonyms[match[0]]??[match[0]],'time');
+    for(const match of query.matchAll(/\b(team|personal|enterprise|business|free|paid|pro|premium|basic|standard)\s+(plan|tier|edition|version)\b/gi))
+        addQualifier([match[1],match[0]],'tier');
+    for(const match of query.matchAll(/(?:团队|个人|企业|家庭)(?:订阅|套餐|计划)/gu))
+        addQualifier(qualifierSynonyms[match[0]]??[match[0]],'tier');
     const referenceTerms=new Set(required.flatMap(entity=>entity.anyOf.flatMap(terms)));
     const subject=focusTerms(query).filter(term=>!referenceTerms.has(term));
-    return {entities:required.slice(0,8),relations:relationRules.filter(rule=>rule.test.test(query)),subject};
+    return {entities:required.slice(0,8),relations:relationRules.filter(rule=>rule.test.test(query)),
+        qualifiers:[...qualifiers.values()],answer:answerKind(query),subject};
 }
 const mentions=(text:string,value:string)=>{
+    // Han phrases are commonly embedded without spaces. Identifier-style
+    // boundaries would reject "北仓" inside "青禾冷链北仓"; a literal phrase
+    // check is the intended qualifier test.
+    if(/\p{Script=Han}/u.test(value))return text.toLowerCase().includes(value);
     try {return referencePattern(value,/[\\/]/.test(value)).test(text);}
     catch {return text.toLowerCase().includes(value);}
 };
@@ -106,6 +176,10 @@ export function supportAssessment(requirements:SupportRequirement,text:string,wo
     const covered=requirements.entities.filter(entity=>entity.anyOf.some(value=>mentions(text,value)));
     const entitiesCovered=covered.length;
     const relationCovered=!requirements.relations.length||requirements.relations.some(rule=>rule.test.test(text));
+    const qualifiersRequired=requirements.qualifiers.length;
+    const qualifiersCovered=requirements.qualifiers.filter(qualifier=>qualifier.anyOf.some(value=>mentions(text,value))).length;
+    const qualifiersOk=qualifiersCovered===qualifiersRequired;
+    const answerCovered=answerSatisfied(requirements.answer,text);
     const basis:string[]=[];
     const lexical=signal.coverage>=.6, semantic=signal.cosine>=signal.threshold, identifier=signal.exact>0;
     const strongSubject=signal.subjectCoverage>=.6;
@@ -114,28 +188,33 @@ export function supportAssessment(requirements:SupportRequirement,text:string,wo
     // product names, vendors or paths do, unless the subject itself is fully covered.
     const entitiesOk=entitiesCovered===entitiesRequired
         || strongSubject&&missingKinds.every(kind=>kind==='code'||kind==='number');
+    const result=(level:SupportLevel,extra:string[]=[]):SupportAssessment=>({level,basis:[...basis,...extra],subject_coverage:signal.subjectCoverage,
+        entities_covered:entitiesCovered,entities_required:entitiesRequired,relation_covered:relationCovered,
+        qualifiers_covered:qualifiersCovered,qualifiers_required:qualifiersRequired,answer_covered:answerCovered});
     if(signal.referenceBackground) {
         basis.push('background_only');
-        return {level:identifier||lexical||semantic?'partial':'missing',basis,subject_coverage:signal.subjectCoverage,entities_covered:entitiesCovered,entities_required:entitiesRequired,relation_covered:relationCovered};
+        return result(identifier||lexical||semantic?'partial':'missing');
     }
     if(!identifier&&!lexical&&!semantic) {
         basis.push('no_support_signal');
-        return {level:'missing',basis,subject_coverage:signal.subjectCoverage,entities_covered:entitiesCovered,entities_required:entitiesRequired,relation_covered:relationCovered};
+        return result('missing');
     }
     if(!entitiesOk) basis.push('missing_entity');
     else if(entitiesRequired&&entitiesCovered<entitiesRequired) basis.push('code_symbol_optional');
     if(!relationCovered) basis.push('missing_relation');
+    if(!qualifiersOk) basis.push('missing_qualifier');
+    if(!answerCovered) basis.push('missing_answer');
     const identifierSupport=identifier&&(strongSubject||!requirements.subject.length);
     const semanticSupport=semantic&&(strongSubject||entitiesRequired>0&&entitiesCovered===entitiesRequired||
         missingKinds.every(kind=>kind==='code'||kind==='number')&&signal.subjectCoverage>=.4);
-    if(entitiesOk&&relationCovered&&(identifierSupport||lexical||semanticSupport)) {
+    if(entitiesOk&&relationCovered&&qualifiersOk&&answerCovered&&(identifierSupport||lexical||semanticSupport)) {
         if(identifierSupport) basis.push('identifier_subject');
         if(lexical) basis.push('lexical_subject');
         if(semanticSupport) basis.push('semantic_subject');
-        return {level:'direct',basis,subject_coverage:signal.subjectCoverage,entities_covered:entitiesCovered,entities_required:entitiesRequired,relation_covered:relationCovered};
+        return result('direct');
     }
     if(!strongSubject) basis.push('weak_subject');
-    return {level:'partial',basis,subject_coverage:signal.subjectCoverage,entities_covered:entitiesCovered,entities_required:entitiesRequired,relation_covered:relationCovered};
+    return result('partial');
 }
 // Whole original sentence/line when possible. Long code lines use contiguous windows.
 // Offsets are JS UTF-16 offsets, the same units used by the chunker.

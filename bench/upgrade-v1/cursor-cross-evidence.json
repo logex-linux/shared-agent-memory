@@ -1,0 +1,45 @@
+{
+  "format": "shared-agent-memory/cursor-cross-evidence-v1",
+  "generated_at": "2026-11-20T13:12:00Z",
+  "method": "Same disposable copy of the generation 583 canonical database, same StepCode connection and model. beta.6 requests S15 with limit 1; beta.7 resumes the am4 cursor, starts a fresh am5 query, continues page 2; beta.6 receives the am5 cursor.",
+  "result": {
+    "beta6_first": {
+      "cursor": "am4:bf50e69a-233d-4cac-872e-fbdcd5bed551:1",
+      "items": [
+        {
+          "id": "d2b1dac7-212d-46e1-b450-5202fa517b22",
+          "revision": 1,
+          "strength": "supported",
+          "level": "direct"
+        }
+      ]
+    },
+    "beta7_on_beta6_cursor": {
+      "code": "CURSOR_STALE",
+      "hint": "Restart the original query; am4 cursors do not carry beta.7 support semantics."
+    },
+    "beta7_first": {
+      "cursor": "am5:4dfb7350-5f41-4f2d-9add-1f22ba3ec8be:1",
+      "items": [
+        {
+          "id": "d2b1dac7-212d-46e1-b450-5202fa517b22",
+          "revision": 1,
+          "strength": "supported",
+          "level": "direct"
+        }
+      ]
+    },
+    "beta7_second": {
+      "status": "insufficient",
+      "items": [
+        {
+          "id": "019f08d1-98b1-4c22-b691-36a080369450",
+          "revision": 1,
+          "strength": "weak",
+          "level": "partial"
+        }
+      ]
+    },
+    "beta6_on_beta7_cursor": "CURSOR_INVALID"
+  }
+}

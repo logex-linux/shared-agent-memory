@@ -229,3 +229,30 @@ copy replay downgraded the S13 other-course manual, S15 install record and S18
 different-vendor record, while keeping the S04, S11 and S15 true hits at the
 top. A partial page with remaining candidates emits `DIRECT_EVIDENCE_MISSING`.
 No frozen corpus or private replay is overwritten by this label-only change.
+
+## Beta.7 stable-release blockers
+
+Beta.7 adds object-qualifier and answer-type requirements and re-issues
+`direct` on the delivered excerpt. The six frozen counterexamples are in
+`bench/upgrade-v1/stable-regressions.json`; the runner is
+`stable-regressions-run.mjs`. With real CPU BGE:
+
+| Runtime | Adjacent object supported before | Correct record top five | Wrong object supported after |
+| --- | ---: | ---: | ---: |
+| beta.6 | 6/6 | 6/6 | 6/6 |
+| beta.7 | 0/6 | 6/6 | 0/6 |
+
+The before pages return `insufficient`; the after pages return the correct
+record as `direct` while the adjacent object remains `partial / weak`. Raw
+per-case levels and basis are in `stable-regressions-evidence.json`.
+
+Cursor compatibility uses the same generation-583 copy. Beta.6's `am4` S15
+cursor is rejected by beta.7 as `CURSOR_STALE`; a fresh beta.7 page uses `am5`
+and continues to the same `019f08d1` revision with `weak / partial`; beta.6
+rejects the `am5` cursor as `CURSOR_INVALID`. See `cursor-cross-evidence.json`.
+
+Two warm pairs over 12 frozen queries measured beta.6/beta.7 median p95 of
+23.736/23.753 ms (ratio 1.0007) with zero ordinary full-body reads. See
+`stable-warm-evidence.json`. The CI CPU job sets
+`ONNXRUNTIME_NODE_INSTALL_CUDA=skip`; the Ubuntu runner result is still needed
+before rc.1.

@@ -180,3 +180,20 @@ with only `partial`/`missing` support and more candidates emits
 `DIRECT_EVIDENCE_MISSING`; the client may try one continuation or expand a
 known ID. Roll back the runtime to beta.5 if a shadow or small-scope run
 regresses; canonical SQLite facts and revisions need no rollback.
+
+## Beta.7 stable-release blockers
+
+Beta.7 keeps Schema 14. Focused support adds object qualifiers and answer
+types, and re-issues `direct` on the delivered excerpt rather than the whole
+chunk. A qualifier or answer sentence cut by the window or budget therefore
+cannot remain direct. Person numbers and shared public paths remain clues.
+
+Cursors use `am5`; `am4` returns `CURSOR_STALE` with a restart hint. The
+support version is part of query authority, so old query state cannot silently
+reuse beta.6 labels. Same-version continuation keeps the existing page
+semantics. The canonical database and revision checks are unchanged.
+
+The six frozen families and the real-BGE before/after results are in
+`bench/upgrade-v1/stable-regressions.json` and
+`stable-regressions-evidence.json`. The CI CPU job sets
+`ONNXRUNTIME_NODE_INSTALL_CUDA=skip`; a clean Ubuntu run still gates rc.1.

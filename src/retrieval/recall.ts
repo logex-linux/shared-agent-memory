@@ -749,7 +749,16 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             const mismatchedDecision=!expansion && declared!==undefined && intent!=='unknown' && declared!==intent;
             const requiresCheck=flags.get(key) || unknownTime || body.lifecycle==='quarantined' ||
                 body.lifecycle==='historical'&&!input.as_of || !coversEffectiveTime(body.valid_time,effectiveAt);
-            const support=c?.answer?.support;
+            // The label is issued on the excerpt that is actually delivered, not
+            // on the whole chunk. A qualifier or answer sentence cut by the window
+            // or budget cannot remain direct.
+            const delivered=excerpts.map(e=>e.text).join('\n');
+            const finalSupport=supportReq&&!expansion&&c?.answer
+                ?supportAssessment(supportReq,delivered,new Set(terms(delivered)),{exact:c.exact,coverage:c.coverage,
+                    cosine:c.cosine??0,threshold:config.evidence_threshold,referenceBackground,
+                    subjectCoverage:c.answer.support?.subject_coverage??c.answer.coverage})
+                :c?.answer?.support;
+            const support=finalSupport;
             const legacySupport=Boolean(c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold));
             const strength = !unknownTime && !mismatchedDecision && (expansion || (support ? support.level==='direct' : legacySupport)) ? 'supported' : 'weak';
             const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: requiresCheck ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? [ref?'version':'id'], ...extendedMetadata(body) };
@@ -764,8 +773,14 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 if(support) {
                     const adjusted=support.level==='direct'&&(unknownTime||mismatchedDecision)
                         ?{...support,level:'partial' as const,basis:[...support.basis,unknownTime?'unknown_time':'decision_mismatch']}:support;
-                    item.support={level:adjusted.level,basis:adjusted.basis,subject_coverage:Number(adjusted.subject_coverage.toFixed(3)),
+                    const supportView:any={level:adjusted.level,basis:adjusted.basis,subject_coverage:Number(adjusted.subject_coverage.toFixed(3)),
                         entities_covered:adjusted.entities_covered,entities_required:adjusted.entities_required,relation_covered:adjusted.relation_covered};
+                    if(adjusted.qualifiers_required){
+                        supportView.qualifiers_covered=adjusted.qualifiers_covered;
+                        supportView.qualifiers_required=adjusted.qualifiers_required;
+                    }
+                    if(!adjusted.answer_covered)supportView.answer_covered=false;
+                    item.support=supportView;
                 }
             }
             if(c?.graphPath)item.graph_path=readGraph(()=>graphReader!.explain(c.graphPath!));

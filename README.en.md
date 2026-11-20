@@ -4,7 +4,7 @@
 
 A local shared-memory service for AI agents on the same machine. It exposes a standard MCP STDIO server and CLI backed by one SQLite database, with local embeddings, keyword retrieval, versioned records and traceable sources.
 
-`1.0.0-beta.6` (Schema 14) calibrates ordinary-recall `supported` labels against the question's subject, relation and required object, and returns `support.level` with its basis. Person numbers and shared public paths remain recall clues, not proof. The deterministic evidence pack stays opt-in. See [the subject catalog and evidence contract](docs/upgrade-v1/frontier-contract.md).
+`1.0.0-beta.7` (Schema 14) adds object qualifiers, platform/edition/time/tier limits and answer-type checks to ordinary recall, and re-issues `direct` only on the delivered excerpt. `am4` cursors now return `CURSOR_STALE`; new cursors use `am5`. The deterministic evidence pack stays opt-in. See [the subject catalog and evidence contract](docs/upgrade-v1/frontier-contract.md).
 
 Agents search the whole library with task-specific queries, receive relevant excerpts, then expand selected records by ID. Project IDs are optional search filters, not a required preselection of task memories. Integrate the server into your own agent harness.
 

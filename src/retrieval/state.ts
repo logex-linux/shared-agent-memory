@@ -3,7 +3,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, realpathSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { hash, MemoryError, type Config } from '../core/contracts.js';
-export const RANKING_VERSION = 'adaptive-v1-lifecycle';
+export const RANKING_VERSION = 'adaptive-v2-support';
+export const SUPPORT_VERSION = 'support-v2-qualifiers';
 const QUERY_TABLES = `
     CREATE TABLE IF NOT EXISTS queries(id TEXT PRIMARY KEY,authority TEXT NOT NULL,generation INTEGER NOT NULL,input TEXT NOT NULL,vector BLOB,profile TEXT,retrieval_mode TEXT NOT NULL,resolved TEXT NOT NULL,progress TEXT NOT NULL,expires INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS query_expiry ON queries(expires);
@@ -20,7 +21,7 @@ const LEASE_TABLES = `
     CREATE INDEX IF NOT EXISTS frontier_lease_expiry ON frontier_leases(expires);`;
 type LeaseKind='admission'|'task';
 export function authority(config: Config, db: DatabaseSync) {
-    return hash({ ranking: RANKING_VERSION, database: realpathSync(config.database), connection: config.connection_id, projects: [...config.allowed_projects].sort(), all: config.all_projects, global: config.allow_global, operations: [...config.operations].sort(), semantic: config.semantic_threshold, evidence: config.evidence_threshold, model: config.model_dir, dtype: config.dtype,
+    return hash({ ranking: RANKING_VERSION, support: SUPPORT_VERSION, database: realpathSync(config.database), connection: config.connection_id, projects: [...config.allowed_projects].sort(), all: config.all_projects, global: config.allow_global, operations: [...config.operations].sort(), semantic: config.semantic_threshold, evidence: config.evidence_threshold, model: config.model_dir, dtype: config.dtype,
         ...(config.operations.includes('feedback')&&{feedback_policy:config.feedback_policy}),registry: db.prepare('SELECT id FROM projects ORDER BY id').all() });
 }
 // Disposable query state: IDs, scores, offsets and facet keys only; never memory bodies.
@@ -203,7 +204,10 @@ export class QueryState {
         return result.busy===0 && result.log===0;
     }
     lookup(cursor: string) {
-        const match = /^am4:([0-9a-f-]{36}):(\d+)$/.exec(cursor);
+        if (/^am4:/.test(cursor))
+            throw new MemoryError('CURSOR_STALE','Cursor predates the current support calibration',
+                {required_operation:'recall',hint:'Restart the original query; am4 cursors do not carry beta.7 support semantics.'});
+        const match = /^am5:([0-9a-f-]{36}):(\d+)$/.exec(cursor);
         if (!match || !Number.isSafeInteger(Number(match[2])))
             throw new MemoryError('CURSOR_INVALID');
         const row = this.db.prepare('SELECT * FROM queries WHERE id=?').get(match[1]) as any;
@@ -215,7 +219,7 @@ export class QueryState {
         return this.db.prepare(`SELECT q.authority,q.expires,q.input,json_extract(p.plan,'$.feedback.used') used
             FROM pages p JOIN queries q ON q.id=p.q WHERE json_extract(p.plan,'$.feedback.token')=?`).get(token);
     }
-    cursor(q: string, page: number) { return `am4:${q}:${page}`; }
+    cursor(q: string, page: number) { return `am5:${q}:${page}`; }
     commit() { this.db.exec('COMMIT');this.timing.held_ms+=performance.now()-this.heldAt; }
     rollback() { if (this.db.isTransaction)
         this.db.exec('ROLLBACK'); }

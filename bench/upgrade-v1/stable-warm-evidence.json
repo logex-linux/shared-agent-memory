@@ -1,0 +1,52 @@
+{
+  "format": "shared-agent-memory/stable-warm-evidence-v1",
+  "generated_at": "2026-11-20T13:10:00Z",
+  "method": "12 warmup queries; 120 timed calls per runtime per pair (10 passes over 12 frozen queries); one process/client; real CPU BGE FP32, 2 threads; disposable copy of the generation 583 canonical database; two independent pairs",
+  "runtimes": {
+    "beta6": "/Users/linnx/.agents/backups/shared-agent-memory/beta6-support-20261119/candidate/dist",
+    "beta7": "dist"
+  },
+  "pairs": [
+    {
+      "pair": "a",
+      "beta6": {
+        "count": 120,
+        "p50": 15.522042000000056,
+        "p95": 23.357332999999926,
+        "max": 26.27891599999998,
+        "full_body_reads": 0
+      },
+      "beta7": {
+        "count": 120,
+        "p50": 16.31600000000003,
+        "p95": 23.539540999999645,
+        "max": 24.588166999999885,
+        "full_body_reads": 0
+      },
+      "p95_ratio": 1.0078008906239304
+    },
+    {
+      "pair": "b",
+      "beta6": {
+        "count": 120,
+        "p50": 16.20291700000007,
+        "p95": 24.11437500000011,
+        "max": 27.784374999999727,
+        "full_body_reads": 0
+      },
+      "beta7": {
+        "count": 120,
+        "p50": 16.19133399999987,
+        "p95": 23.967167000000245,
+        "max": 33.822000000000116,
+        "full_body_reads": 0
+      },
+      "p95_ratio": 0.9938954254464458
+    }
+  ],
+  "median_p95": {
+    "beta6": 23.735854000000018,
+    "beta7": 23.753353999999945
+  },
+  "median_p95_ratio": 1.0007372812454916
+}

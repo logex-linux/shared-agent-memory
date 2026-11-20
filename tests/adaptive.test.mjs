@@ -53,7 +53,7 @@ test('new, revised and forgotten records invalidate cursors; concurrent writers 
 test('TTL, expired records, unknown cursor, index damage, and incomplete page creation fail explicitly',async()=>{
  const {service:s,project,config,root}=await setup({query_ttl_seconds:1});s.encoder=fake;seed(s,[project],60);let first=await s.recall({query:'设计偏好',mode:'broad',limit:3});
  try{
-  await assert.rejects(s.recall({cursor:'am4:'+randomUUID()+':1'}),{code:'CURSOR_EXPIRED'});await assert.rejects(s.recall({cursor:'bad'}),{code:'CURSOR_INVALID'});
+  assert.ok(first.next_cursor.startsWith('am5:'));await assert.rejects(s.recall({cursor:'am4:'+randomUUID()+':1'}),error=>error.code==='CURSOR_STALE'&&error.details?.hint.includes('beta.7'));await assert.rejects(s.recall({cursor:'am5:'+randomUUID()+':1'}),{code:'CURSOR_EXPIRED'});await assert.rejects(s.recall({cursor:'bad'}),{code:'CURSOR_INVALID'});
   const cache=new DatabaseSync(config.database+'.retrieval.db');cache.prepare('UPDATE queries SET expires=0').run();cache.close();await assert.rejects(s.recall({cursor:first.next_cursor}),{code:'CURSOR_EXPIRED'});
   first=await s.recall({query:'设计偏好',mode:'broad',limit:3});s.db.prepare('DELETE FROM memory_vec WHERE chunk_id=(SELECT min(chunk_id) FROM memory_vec)').run();await assert.rejects(s.recall({cursor:first.next_cursor}),{code:'CURSOR_INDEX_CHANGED'});
   const degraded=await s.recall({query:'设计偏好',mode:'broad'});assert.equal(degraded.retrieval_mode,'lexical_degraded');assert.ok(degraded.warnings.includes('INDEX_INCOMPLETE'));
