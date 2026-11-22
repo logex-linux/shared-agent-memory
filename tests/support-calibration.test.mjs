@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import {setup, record, publish} from './helpers.mjs';
 import {supportRequirements} from '../dist/retrieval/evidence.js';
@@ -64,5 +65,96 @@ for(const scenario of fixture.cases) test(`support calibration ${scenario.id}: $
         assert.equal(item.evidence_strength,level==='direct'?'supported':'weak');
       }
     }
+  } finally { s.close(); }
+});
+
+test('rc1 compact detail reduces envelope bytes without altering content or offsets and rejects cursor detail mismatch', async () => {
+  const {service:s,project} = await setup(); s.encoder = encoder;
+  try {
+    await publish(s, record(project, {title:'紧凑证据测试条目一', content:'紧凑证据第一段：测试详情开关保持正文和偏移一致。', tags:['rc1-compact']}));
+    await publish(s, record(project, {title:'紧凑证据测试条目二', content:'紧凑证据第二段：测试分页续传禁止中途切换 detail。', tags:['rc1-compact']}));
+    const full = await s.recall({query:'紧凑证据', mode:'broad', view:'evidence', detail:'full', limit:1});
+    const compact = await s.recall({query:'紧凑证据', mode:'broad', view:'evidence', detail:'compact', limit:1});
+    assert.equal(compact.items.length, 1);
+    assert.equal(compact.items[0].id, full.items[0].id);
+    assert.equal(compact.items[0].content, full.items[0].content);
+    assert.deepEqual(compact.items[0].excerpts, full.items[0].excerpts.map(({start,end}) => ({start,end})));
+    assert.equal(compact.items[0].verification.status, full.items[0].verification.status);
+    assert.equal(compact.items[0].verification.basis, full.items[0].verification.basis);
+    assert.equal(compact.items[0].verification.method, undefined);
+    assert.equal(compact.items[0].excerpt, undefined);
+    assert.equal(compact.items[0].snippet_selection, undefined);
+    assert.equal(compact.items[0].written_by, undefined);
+    assert.ok(Buffer.byteLength(JSON.stringify(compact)) < Buffer.byteLength(JSON.stringify(full)));
+    await assert.rejects(s.recall({cursor:compact.next_cursor, detail:'full'}), {code:'CURSOR_PAGE_OPTIONS_MISMATCH'});
+  } finally { s.close(); }
+});
+
+test('rc1 multi-record joint coverage elevates page_support without inflating weak items', async () => {
+  const {service:s,project} = await setup(); s.encoder = encoder;
+  try {
+    const a = await publish(s, record(project, {title:'GatewayA 故障分析', content:'GatewayA 在 Linux 服务器启动异常，记录服务启动故障原因。'}));
+    const b = await publish(s, record(project, {title:'GatewayB 一键修复', content:'GatewayB 的修复脚本完成发布并用于线上启动修复。'}));
+    const page = await s.recall({query:'GatewayA GatewayB 服务启动故障与线上修复', mode:'focused', view:'evidence', limit:5, debug:true});
+    assert.equal(page.evidence_status, 'related_evidence');
+    assert.equal(page.retrieval.page_support?.composition, 'multi_record');
+    assert.equal(page.retrieval.page_support?.level, 'direct');
+    const contributors = page.retrieval.page_support.contributors.map(c => c.id);
+    assert.ok(contributors.includes(a.memory_id) && contributors.includes(b.memory_id));
+    for (const item of page.items) {
+      assert.equal(item.evidence_strength, 'weak');
+      assert.equal(item.support?.level, 'partial');
+    }
+    const compactPage = await s.recall({query:'GatewayA GatewayB 服务启动故障与线上修复', mode:'focused', view:'evidence', detail:'compact', limit:5, debug:true});
+    assert.equal(compactPage.evidence_status, 'related_evidence');
+    assert.equal(compactPage.retrieval.page_support?.composition, 'multi_record');
+  } finally { s.close(); }
+});
+
+test('rc1 version-line matching keeps minor line visible without fake direct and preserves multi-record visibility', async () => {
+  const {service:s,project} = await setup(); s.encoder = encoder;
+  try {
+    const bg = await publish(s, record(project, {title:'chrome-use MCP 旧版桥接教训', content:'chrome-use 早期 bridge 端口占用排错记录。'}));
+    const v02 = await publish(s, record(project, {title:'chrome-use v0.2：click target+expect 核验', content:'chrome-use v0.2 实现单次点击可见状态核验。'}));
+    const page = await s.recall({query:'chrome-use 0.2.0 是否支持原生 dialog 超时与单次点击耗时？', mode:'focused', view:'evidence'});
+    const hit = page.items.find(item => item.id === v02.memory_id);
+    assert.ok(hit, 'v0.2 record should be returned');
+    assert.ok(!hit.recall_reason.includes('background_only'), 'version line v0.2 should not be background_only');
+    assert.equal(hit.support?.level, 'partial');
+    assert.equal(hit.evidence_strength, 'weak');
+    assert.ok(page.items.some(item => item.id === bg.memory_id));
+  } finally { s.close(); }
+});
+
+test('rc1 exact_only zero-hit preflight skips query embedding and vector search', async () => {
+  const {service:s,project} = await setup();
+  let queryEmbeds = 0;
+  s.encoder = {...encoder, query: async () => { queryEmbeds++; return vector(); }};
+  try {
+    await publish(s, record(project, {title:'已有路径记录', content:'配置文件位于 /etc/existing/app.conf。'}));
+    const empty = await s.recall({query:'/Users/missing/nonexistent/settings.json', mode:'focused', view:'evidence', exact_only:true, debug:true});
+    assert.equal(empty.items.length, 0);
+    assert.equal(empty.evidence_status, 'insufficient');
+    assert.equal(queryEmbeds, 0);
+    assert.equal(empty.diagnostics.query_embeddings, 0);
+    assert.equal(empty.diagnostics.vector_queries, 0);
+    assert.equal(empty.diagnostics.ranking_chunk_rows_read, 0);
+    const present = await s.recall({query:'/etc/existing/app.conf', mode:'focused', view:'evidence', exact_only:true, debug:true});
+    assert.equal(present.items.length, 1);
+    assert.equal(queryEmbeds, 1);
+  } finally { s.close(); }
+});
+
+test('rc1 propose marks supersede/correct suggestion for matching title or explicit update wording', async () => {
+  const {service:s,project} = await setup(); s.encoder = encoder;
+  try {
+    const prev = await publish(s, record(project, {title:'作业材料打包位置约定', content:'2026-11-10 打包汇总，原文件保留原位未删除。'}));
+    const proposal = await s.propose({
+      request_id: randomUUID(),
+      record: record(project, {title:'作业材料打包位置约定', content:'2026-11-10 按用户要求删除原文件，本条更新此前同主题记录：原文件已不再保留。'})
+    });
+    const match = proposal.similar_candidates.find(c => c.memory_id === prev.memory_id);
+    assert.ok(match, 'should find previous record in similar_candidates');
+    assert.equal(match.suggested_transition, 'supersede');
   } finally { s.close(); }
 });

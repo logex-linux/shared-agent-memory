@@ -2,7 +2,7 @@ import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { MemoryError, verificationSchema, hash, type Config, type Encoder, type RecallInput } from '../core/contracts.js';
 import { identifiers, ftsQuery, terms } from './lexical.js';
-import { answerIntent, factState, focusTerms, evidenceWindow, referenceEvidence, supportAssessment, supportRequirements,
+import { answerIntent, factState, focusTerms, evidenceWindow, pageSupportAssessment, referenceEvidence, supportAssessment, supportRequirements,
     type FactState, type SupportAssessment, type SupportRequirement } from './evidence.js';
 import { prepared } from '../storage/statements.js';
 import { RetrievalProfile } from './profile.js';
@@ -172,6 +172,66 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         const lockStarted=performance.now();cache.begin();profileTrace?.add('state_wait',performance.now()-lockStarted);
         ctx.checkpoint?.('recall:state_locked');
     };
+    if (!request.cursor && request.query && request.exact_only) {
+        const preflightStarted=performance.now();
+        db.exec('BEGIN');
+        let preHit:unknown;
+        let preGen=0, preAuth='', preResolved='focused', preOverlay:ReturnType<typeof taskExclusions>|undefined;
+        try {
+            preGen=ctx.generation();
+            preAuth=authority(config,db);
+            preOverlay=request.task_id?taskExclusions(ctx.db,config,preGen,request.task_id):undefined;
+            const preReadAt=new Date().toISOString();
+            const preEligible=eligibility(db,request,config,effectiveAt,preOverlay?.ids,preReadAt);
+            ctx.checkpoint?.('recall:read_snapshot');
+            if(authority(config,db)!==preAuth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
+            const preIds=identifiers(request.query);
+            preHit=preIds.length?db.prepare(`WITH matches AS MATERIALIZED (SELECT 1 FROM chunk_identifiers i JOIN memory_chunks c ON c.id=i.chunk_id JOIN memory_search s ON s.memory_id=i.memory_id WHERE i.identifier IN (SELECT value FROM json_each(?)) AND ${preEligible.sql} AND c.revision=s.revision AND c.profile_id=s.profile_id LIMIT 1) SELECT 1 FROM matches LIMIT 1`).get(JSON.stringify(preIds),...preEligible.params):undefined;
+            if(preHit) {
+                db.exec('COMMIT');
+                profileTrace?.add('candidate_sql',performance.now()-preflightStarted);
+            }
+        } catch(error) {
+            if(db.isTransaction)db.exec('ROLLBACK');
+            throw error;
+        }
+        if(!preHit) {
+            try {
+                profileTrace?.add('fts_identifiers',performance.now()-preflightStarted);
+                preResolved=request.mode==='broad'||(!request.mode||request.mode==='auto')&&broadIntent(request.query)?'broad':'focused';
+                const preOptions={limit:request.limit??(preResolved==='focused'?8:config.page_item_limit),token_budget:Math.min(request.token_budget??config.response_token_budget,config.response_token_budget),max_bytes:Math.min(request.max_bytes??config.page_response_bytes,config.page_response_bytes),view:request.view??'chunks',detail:request.detail??'full'};
+                const preWarnings=request.graph?['GRAPH_EXACT_ONLY']:[];
+                const prePlan:any={mode:preResolved,assessment:'heuristic',view:preOptions.view,stop_reason:'insufficient',more_unexamined:false,coverage:{projects:0,periods:0,topics:0},...(preOptions.detail==='compact'&&{detail:'compact'}),...(request.graph&&{graph:{state:'disabled',reason:'GRAPH_EXACT_ONLY'}})};
+                const preResult:any={items:[],generation:preGen,retrieval_mode:retrievalMode,warnings:preWarnings,empty_reason:'no_relevant_evidence',evidence_status:'insufficient',has_more:false,next_cursor:null,retrieval:prePlan};
+                if(Buffer.byteLength(JSON.stringify(preResult))>preOptions.max_bytes)throw new MemoryError('PAGE_BUDGET_TOO_SMALL');
+                d.elapsed_ms=Number((performance.now()-start).toFixed(3));
+                d.content_estimated_tokens=estimateTokens(Buffer.byteLength(JSON.stringify(preResult)));
+                if(debug){
+                    preResult.diagnostics=d;
+                    for(let i=0;i<4;i++){d.response_bytes=Buffer.byteLength(JSON.stringify(preResult));d.estimated_tokens=estimateTokens(d.response_bytes);}
+                }
+                if(Buffer.byteLength(JSON.stringify(preResult))>preOptions.max_bytes)throw new MemoryError('PAGE_BUDGET_TOO_SMALL');
+                const packed=ctx.packPage?.(db,config,request,preResult,{...preOptions,effectiveAt,readAt:new Date().toISOString(),taskIds:preOverlay?.ids});
+                ctx.checkpoint?.('recall:state_updated');
+                if(authority(config,db)!==preAuth)throw new MemoryError('CURSOR_SCOPE_CHANGED');
+                ctx.checkpoint?.('recall:before_commit');
+                db.exec('COMMIT');
+                ctx.checkpoint?.('recall:canonical_released');
+                ctx.checkpoint?.('recall:committed');
+                if(profileTrace&&debug){
+                    profileTrace.add('total',performance.now()-start);
+                    Object.assign(d,{stages_ms:profileTrace.times,state_lock:{wait_ms:0,held_ms:0,transactions:0},memory:process.memoryUsage()});
+                    if(Buffer.byteLength(JSON.stringify(preResult))>preOptions.max_bytes){delete (d as any).stages_ms;delete (d as any).state_lock;delete (d as any).memory;}
+                    for(let i=0;i<4;i++){d.response_bytes=Buffer.byteLength(JSON.stringify(preResult));d.estimated_tokens=estimateTokens(d.response_bytes);}
+                }
+                traceResponse=preResult;
+                return packed??preResult;
+            } catch(error) {
+                if(db.isTransaction)db.exec('ROLLBACK');
+                throw error;
+            }
+        }
+    }
     const embeddingStarted=performance.now();
     if (!request.cursor && request.query && channel !== 'lexical')
         try {
@@ -544,17 +604,22 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             if(graphState?.stale)warnings.push('GRAPH_STALE');
             progress.warnings = [...new Set(warnings)];
         }
-        let options = { limit: request.limit ?? input.limit ?? (resolved === 'focused' ? 8 : config.page_item_limit), token_budget: Math.min(request.token_budget ?? input.token_budget ?? config.response_token_budget, config.response_token_budget), max_bytes: Math.min(request.max_bytes ?? input.max_bytes ?? config.page_response_bytes, config.page_response_bytes), view: request.view ?? input.view ?? 'chunks' };
+        let options = { limit: request.limit ?? input.limit ?? (resolved === 'focused' ? 8 : config.page_item_limit), token_budget: Math.min(request.token_budget ?? input.token_budget ?? config.response_token_budget, config.response_token_budget), max_bytes: Math.min(request.max_bytes ?? input.max_bytes ?? config.page_response_bytes, config.page_response_bytes), view: request.view ?? input.view ?? 'chunks', detail: request.detail ?? input.detail ?? 'full' };
         if (savedPage) {
             const prior = parse(savedPage.options);
+            const priorDetail = prior.detail ?? 'full';
             for (const key of ['limit', 'token_budget', 'max_bytes', 'view'] as const)
                 if (request[key] !== undefined && options[key] !== prior[key])
                     throw new MemoryError('CURSOR_PAGE_OPTIONS_MISMATCH');
+            if (request.detail !== undefined && options.detail !== priorDetail)
+                throw new MemoryError('CURSOR_PAGE_OPTIONS_MISMATCH');
             if (prior.max_bytes > config.page_response_bytes || prior.token_budget > config.response_token_budget || parse(savedPage.ids).length > config.page_item_limit)
                 throw new MemoryError('CURSOR_PAGE_BUDGET_CHANGED');
-            options = prior;
+            options = { ...prior, detail: priorDetail };
             d.cache_replay = true;
         }
+        else if (request.cursor && request.detail !== undefined && options.detail !== (input.detail ?? 'full'))
+            throw new MemoryError('CURSOR_PAGE_OPTIONS_MISMATCH');
         traceBudget=options.max_bytes;
         let pool: Candidate[] = [], selected: string[] = [], contextPriority=false;
         let subjectLeader: string | undefined;
@@ -604,6 +669,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             else if (anchors.length)
                 pool = [...anchors, ...pool.filter(c => !anchors.some(a => a.id === c.id))];
             // Do not override fact-state ranking or reorder ordinary current evidence.
+            const leaderBeforeSort=pool[0];
             contextPriority=resolved==='focused'&&answerIntent(input.query??'')==='unknown'&&pool.some(c=>c.requiresCheck&&directEvidence(c,config.evidence_threshold));
             if(resolved==='focused')pool.sort((a,b)=>(contextPriority?Number(directEvidence(b,config.evidence_threshold))-Number(directEvidence(a,config.evidence_threshold)):0)||Number(Boolean(a.answer?.referenceBackground))-Number(Boolean(b.answer?.referenceBackground)));
             if (resolved === 'focused' && page === 0 && !input.exact_only && answerIntent(input.query!) === 'unknown' && pool.length > 1) {
@@ -616,10 +682,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     pool.unshift(stronger);
                 }
             }
+            if (!subjectLeader && resolved === 'focused' && page === 0 && !input.exact_only && leaderBeforeSort?.answer?.referenceBackground && !pool[0]?.answer?.referenceBackground && pool[0]?.answer?.salient)
+                subjectLeader = pool[0].id;
             selected = pool.map(c => c.id);
             if (resolved === 'focused' && !(request.limit ?? input.limit) && pool.length > 1) {
                 const a = pool[0], b = pool[1], gap = a.base > 0 ? (a.base - b.base) / a.base : 0;
-                if (a.admitted && (a.exact > 0 || a.reasons.length >= 2) && (gap > .25 || ((a.cosine ?? 0) - (b.cosine ?? 0) >= .18 && (a.cosine ?? 0) >= config.evidence_threshold + .1 && a.coverage >= .6)) && (b.cosine ?? 0) < config.evidence_threshold && b.coverage < .6)
+                if (a.admitted && directEvidence(a, config.evidence_threshold) && (a.exact > 0 || a.reasons.length >= 2) && (gap > .25 || ((a.cosine ?? 0) - (b.cosine ?? 0) >= .18 && (a.cosine ?? 0) >= config.evidence_threshold + .1 && a.coverage >= .6)) && (b.cosine ?? 0) < config.evidence_threshold && b.coverage < .6)
                     selected = selected.slice(0, 1);
             }
         }
@@ -671,7 +739,8 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         d.candidate_ids = state ? Number((state.db.prepare('SELECT count(*) n FROM candidates WHERE q=?').get(q) as any).n) : selected.length;
         d.candidates_ranked = selected.length;
-        const draftPlan = { mode: expansion ?? resolved, assessment: 'heuristic', view: options.view, stop_reason: 'page_budget' };
+        const isCompact = options.detail === 'compact' && options.view === 'evidence' && !expansion;
+        const draftPlan = { mode: expansion ?? resolved, assessment: 'heuristic', view: options.view, ...(isCompact && { detail: 'compact' }), stop_reason: 'page_budget' };
         const plan: any = savedPage ? parse(savedPage.plan) : draftPlan;
         const cachedWarnings = plan.graph_page_warnings;
         const cachedFeedback = plan.feedback;
@@ -697,7 +766,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         if(expansion&&selected.length)result[remainingKey]=expansionRefs(selected);
         if(profileTrace)profileTrace.add('candidates',Math.max(0,performance.now()-candidateStarted-['index_validation','knn','fts_identifiers','ranking','candidate_sql'].reduce((n,k)=>n+(profileTrace.times[k]??0),0)));
         const materializeStarted=performance.now();if(profileTrace)profileTrace.current='materialization';
-        const fitted: string[] = [], candidateMap = new Map(pool.map(c => [c.id, c]));
+        const fitted: string[] = [], candidateMap = new Map(pool.map(c => [c.id, c])), itemTagsMap = new Map<string, string[]>(), itemSubjectCoverage = new Map<string, number>(), itemAnswerState = new Map<string, FactState>();
         let blocked = false;
         const fits = (reserve = 256) => {const bytes=Buffer.byteLength(JSON.stringify(result))+reserve;return bytes<=options.max_bytes-(debug?Math.min(2048,Math.floor(options.max_bytes/2)):0)&&estimateTokens(bytes)<=options.token_budget;};
         for (const key of selected.slice(0, Math.min(options.limit, config.page_item_limit))) {
@@ -761,7 +830,22 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             const support=finalSupport;
             const legacySupport=Boolean(c && !referenceBackground && (c.exact > 0 || c.coverage >= .6 || (c.cosine ?? 0) >= config.evidence_threshold));
             const strength = !unknownTime && !mismatchedDecision && (expansion || (support ? support.level==='direct' : legacySupport)) ? 'supported' : 'weak';
-            const item: any = { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: verificationSchema.parse(body.verification), valid_for: body.valid_for ?? {}, applicability: requiresCheck ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? [ref?'version':'id'], ...extendedMetadata(body) };
+            const parsedVerification = verificationSchema.parse(body.verification);
+            if (Array.isArray(body.tags)) itemTagsMap.set(id, body.tags);
+            const item: any = isCompact
+                ? {
+                    id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title,
+                    content: excerpts.map(e => e.text).join('\n…\n'),
+                    sources: body.sources.map((src: any) => ({ source_type: src.source_type, uri: src.uri, locator: src.locator, revision_ref: src.revision_ref })),
+                    verification: { status: parsedVerification.status, basis: parsedVerification.basis, ...(parsedVerification.reviewer && { reviewer: parsedVerification.reviewer }), ...(parsedVerification.reviewed_at && { reviewed_at: parsedVerification.reviewed_at }) },
+                    ...(Object.keys(body.valid_for ?? {}).length && { valid_for: body.valid_for }),
+                    applicability: requiresCheck ? 'requires_check' : 'current',
+                    evidence_strength: strength,
+                    excerpts: excerpts.map(({ start, end }) => ({ start, end })),
+                    recall_reason: c?.reasons ?? [ref ? 'version' : 'id'],
+                    ...extendedMetadata(body)
+                }
+                : { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: parsedVerification, valid_for: body.valid_for ?? {}, applicability: requiresCheck ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? [ref?'version':'id'], ...extendedMetadata(body) };
             if(ref&&(body.scope!==row.scope||body.project_id!==row.project_id))
                 item.recorded_ownership={scope:body.scope,project_id:body.project_id};
             if (input.as_of) item.effective_time=unknownTime?'unknown':'matched';
@@ -769,23 +853,29 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             if (ref) Object.assign(item,{recorded_at:row.recorded_at,current_revision:row.current_revision,history_start_revision:row.history_start_revision,
                 history_complete:row.history_start_revision===1&&row.history_version_count===row.current_revision,does_not_imply_current:true});
             if (c?.answer) {
-                item.answer_relevance={state:c.answer.state,assessment:declared===undefined?'local_claim_heuristic':'declared_state',intent};
+                itemAnswerState.set(id, c.answer.state);
+                if (!isCompact) item.answer_relevance={state:c.answer.state,assessment:declared===undefined?'local_claim_heuristic':'declared_state',intent};
                 if(support) {
                     const adjusted=support.level==='direct'&&(unknownTime||mismatchedDecision)
                         ?{...support,level:'partial' as const,basis:[...support.basis,unknownTime?'unknown_time':'decision_mismatch']}:support;
-                    const supportView:any={level:adjusted.level,basis:adjusted.basis,subject_coverage:Number(adjusted.subject_coverage.toFixed(3)),
-                        entities_covered:adjusted.entities_covered,entities_required:adjusted.entities_required,relation_covered:adjusted.relation_covered};
-                    if(adjusted.qualifiers_required){
-                        supportView.qualifiers_covered=adjusted.qualifiers_covered;
-                        supportView.qualifiers_required=adjusted.qualifiers_required;
+                    itemSubjectCoverage.set(id, Number(adjusted.subject_coverage.toFixed(3)));
+                    if (isCompact) {
+                        item.support={level:adjusted.level};
+                    } else {
+                        const supportView:any={level:adjusted.level,basis:adjusted.basis,subject_coverage:Number(adjusted.subject_coverage.toFixed(3)),
+                            entities_covered:adjusted.entities_covered,entities_required:adjusted.entities_required,relation_covered:adjusted.relation_covered};
+                        if(adjusted.qualifiers_required){
+                            supportView.qualifiers_covered=adjusted.qualifiers_covered;
+                            supportView.qualifiers_required=adjusted.qualifiers_required;
+                        }
+                        if(!adjusted.answer_covered)supportView.answer_covered=false;
+                        item.support=supportView;
                     }
-                    if(!adjusted.answer_covered)supportView.answer_covered=false;
-                    item.support=supportView;
                 }
             }
             if(c?.graphPath)item.graph_path=readGraph(()=>graphReader!.explain(c.graphPath!));
             if(referenceBackground){item.recall_reason=[...item.recall_reason,'background_only'];if(!result.warnings.includes('REFERENCE_EVIDENCE_MISSING'))result.warnings.push('REFERENCE_EVIDENCE_MISSING');}
-            if (options.view==='evidence'&&!expansion) item.snippet_selection=snippetSelection;
+            if (options.view==='evidence'&&!expansion&&!isCompact) item.snippet_selection=snippetSelection;
             if (expansion)
                 Object.assign(item, { written_by: row.written_by, content_hash: row.content_hash, embedding_profile_id: row.profile_id, derived_from: body.derived_from, author_client: body.author_client, author_session: body.author_session, import_key: body.import_key, relevance: c ? { rrf: c.rrf, cosine: c.cosine, identifier_matches: c.exact } : undefined });
             result.items.push(item);
@@ -805,7 +895,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                     if (text)
                         parts.push({ ...e, text, end: e.start + text.length });
                     remaining -= text.length;
-                } item.content = parts.map(e => e.text).join('\n…\n'); item.truncated = true; item.excerpts = parts.map(({ text, ...e }) => e); item.excerpt = { start: parts[0]?.start ?? 0, end: parts.at(-1)?.end ?? 0 }; };
+                } item.content = parts.map(e => e.text).join('\n…\n'); item.truncated = true; if (isCompact) { item.excerpts = parts.map(({ start, end }) => ({ start, end })); delete item.excerpt; } else { item.excerpts = parts.map(({ text, ...e }) => e); item.excerpt = { start: parts[0]?.start ?? 0, end: parts.at(-1)?.end ?? 0 }; } };
                 let lo = 1, hi = excerpts.reduce((n, e) => n + e.text.length, 0), best = 0;
                 while (lo <= hi) {
                     const mid = Math.floor((lo + hi) / 2);
@@ -839,6 +929,22 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
         }
         if (!result.items.length || blocked) delete result.feedback_receipt;
         profileTrace?.add('materialization',performance.now()-materializeStarted);
+        // Page-level joint support is computed on the materialized items before
+        // persisting first-page metadata so cursor page 0 replay stays identical.
+        const serializationStarted=performance.now();
+        const supportLevels=result.items.map((item:any)=>item.support?.level).filter(Boolean);
+        if(supportLevels.length) plan.support={direct:supportLevels.filter((level:string)=>level==='direct').length,
+            partial:supportLevels.filter((level:string)=>level==='partial').length,
+            missing:supportLevels.filter((level:string)=>level==='missing').length};
+        let hasSupported = result.items.some((i: any) => i.evidence_strength === 'supported');
+        if (!hasSupported && supportReq && !expansion && resolved === 'focused') {
+            const pageSupport = pageSupportAssessment(supportReq, result.items, decisionIntent(input), itemTagsMap, itemSubjectCoverage, itemAnswerState);
+            if (pageSupport?.level === 'direct') {
+                result.retrieval.page_support = pageSupport;
+                if (result.retrieval !== plan) plan.page_support = pageSupport;
+                hasSupported = true;
+            }
+        }
         const persistStarted=performance.now();
         if (state) {
             if(savedPage)state.db.prepare('UPDATE queries SET expires=? WHERE id=?').run(Date.now() + config.query_ttl_seconds * 1000, q);
@@ -870,14 +976,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             }
         }
         profileTrace?.add('state_persist',performance.now()-persistStarted);
-        const serializationStarted=performance.now();
-        const supportLevels=result.items.map((item:any)=>item.support?.level).filter(Boolean);
-        if(supportLevels.length) plan.support={direct:supportLevels.filter((level:string)=>level==='direct').length,
-            partial:supportLevels.filter((level:string)=>level==='partial').length,
-            missing:supportLevels.filter((level:string)=>level==='missing').length};
-        if(supportLevels.length&&!supportLevels.includes('direct')&&result.has_more&&!result.warnings.includes('DIRECT_EVIDENCE_MISSING'))
+        if(supportLevels.length&&!supportLevels.includes('direct')&&result.retrieval.page_support?.level!=='direct'&&result.has_more&&!result.warnings.includes('DIRECT_EVIDENCE_MISSING'))
             result.warnings.push('DIRECT_EVIDENCE_MISSING');
-        result.evidence_status = result.items.some((i: any) => i.evidence_strength === 'supported') ? 'related_evidence' : 'insufficient';
+        result.evidence_status = hasSupported ? 'related_evidence' : 'insufficient';
         result.empty_reason = result.items.length ? null : blocked ? 'item_exceeds_budget' :
             prunedVersions.length?'version_pruned':'no_relevant_evidence';
         d.elapsed_ms = Number((performance.now() - start).toFixed(3));

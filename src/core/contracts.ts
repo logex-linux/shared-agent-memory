@@ -153,6 +153,7 @@ export const recallSchema = z.object({
   context: validSchema.omit({expires_at:true}).default({}), limit: z.number().int().positive().safe().optional(),
   exact_only:z.boolean().default(false),token_budget:z.number().int().min(512).max(1000000).optional(),
   mode:z.enum(['auto','focused','broad']).optional(),view:z.enum(['chunks','evidence']).optional(),
+  detail:z.enum(['compact','full']).optional(),
   cursor:text(160).optional(),debug:z.boolean().default(false),max_bytes:z.number().int().min(2048).max(1048576).optional()
 }).strict().superRefine((r,ctx) => {
   if (Number(Boolean(r.query))+Number(Boolean(r.ids))+Number(Boolean(r.cursor))+Number(Boolean(r.versions))!==1)

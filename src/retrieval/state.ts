@@ -3,8 +3,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, realpathSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { hash, MemoryError, type Config } from '../core/contracts.js';
-export const RANKING_VERSION = 'adaptive-v2-support';
-export const SUPPORT_VERSION = 'support-v2-qualifiers';
+export const RANKING_VERSION = 'adaptive-v3-rc1';
+export const SUPPORT_VERSION = 'support-v3-page-joint';
 const QUERY_TABLES = `
     CREATE TABLE IF NOT EXISTS queries(id TEXT PRIMARY KEY,authority TEXT NOT NULL,generation INTEGER NOT NULL,input TEXT NOT NULL,vector BLOB,profile TEXT,retrieval_mode TEXT NOT NULL,resolved TEXT NOT NULL,progress TEXT NOT NULL,expires INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS query_expiry ON queries(expires);

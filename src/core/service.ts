@@ -582,7 +582,14 @@ export class MemoryService {
       ) SELECT m.id,m.revision,m.body FROM best JOIN memories m ON m.id=best.memory_id ORDER BY best.rank,m.id`)
         .all(similarQuery,record.scope,record.project_id) as any[]:[];
       const words=new Set(terms(record.title+' '+record.content));
-      const similar=candidates.map(x=>({memory_id:x.id,revision:x.revision,overlap:terms(JSON.parse(x.body).title+' '+JSON.parse(x.body).content).filter(w=>words.has(w)).length})).filter(x=>x.overlap>=3).sort((a,b)=>b.overlap-a.overlap).slice(0,5);
+      const updateWording=/本条更新此前|更新此前|取代.{0,15}旧|替代此前|不再保留/.test(record.content);
+      const normalizedTitle=record.title.trim().toLowerCase();
+      const similar=candidates.map(x=>{
+        const parsed=JSON.parse(x.body);
+        const sameTitle=String(parsed.title??'').trim().toLowerCase()===normalizedTitle;
+        const overlap=terms(parsed.title+' '+parsed.content).filter(w=>words.has(w)).length;
+        return {memory_id:x.id,revision:x.revision,overlap,...((updateWording||sameTitle)&&{suggested_transition:updateWording?'supersede':'correct'})};
+      }).filter(x=>x.overlap>=3||Boolean(x.suggested_transition)).sort((a,b)=>b.overlap-a.overlap).slice(0,5);
       const id=randomUUID();
       const regular=expires(this.config.retention.proposal_days);
       const expires_at=admissionExpires?new Date(Math.min(admissionExpires,Date.parse(regular))).toISOString():regular;

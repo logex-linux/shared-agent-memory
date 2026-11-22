@@ -43,7 +43,13 @@ export function referenceEvidence(query:string) {
     const refs=namedReferences(query)
         .filter(x=>!/^20\d{2}(?:\d{4}|[-_]\d{1,2}[-_]\d{1,2})?$/.test(x));
     const referenceTerms=new Set(refs.flatMap(terms)),subject=focusTerms(query).filter(t=>!referenceTerms.has(t));
-    const patterns=refs.map(id=>referencePattern(id,true));
+    const patterns=refs.map(id=>{
+        if(/^\d+\.\d+(?:\.0)+$/.test(id)) {
+            const line=id.replace(/(?:\.0)+$/,'').replace(/\./g,'\\.');
+            return new RegExp(`(^|[^\\p{L}\\p{N}_./@-]|\\p{Script=Han})v?${line}(?:\\.0)*(?=$|[^\\p{L}\\p{N}_./@-]|\\p{Script=Han}|\\.(?=\\s|$))`,'iu');
+        }
+        return referencePattern(id,true);
+    });
     return (text:string,words=new Set(terms(text)))=>({count:refs.length,coverage:refs.length?patterns.filter(re=>re.test(text)).length/refs.length:1,subjectCount:subject.length,subjectCoverage:subject.length?subject.filter(t=>words.has(t)).length/subject.length:0});
 }
 export type SupportLevel = 'direct'|'partial'|'missing';
@@ -216,6 +222,99 @@ export function supportAssessment(requirements:SupportRequirement,text:string,wo
     if(!strongSubject) basis.push('weak_subject');
     return result('partial');
 }
+export type PageSupport = {
+    composition: 'multi_record';
+    level: 'direct' | 'partial';
+    contributors: { id: string; revision: number }[];
+    subject_coverage: number;
+    entities_covered: number;
+    entities_required: number;
+    relation_covered: boolean;
+    qualifiers_covered?: number;
+    qualifiers_required?: number;
+    answer_covered?: boolean;
+};
+
+/** Compute conservative page-level multi-record joint coverage without upgrading individual weak items. */
+export function pageSupportAssessment(
+    requirements: SupportRequirement,
+    items: any[],
+    intent: FactState | 'unknown' = 'unknown',
+    tagsById?: Map<string, string[]>,
+    subjectById?: Map<string, number>,
+    stateById?: Map<string, FactState>
+): PageSupport | undefined {
+    const itemSubject = (item: any) => item.support?.subject_coverage ?? subjectById?.get(item.id) ?? 0;
+    const itemState = (item: any) => item.answer_relevance?.state ?? stateById?.get(item.id) ?? 'unknown';
+    const eligible = items.filter(item =>
+        !item.recall_reason?.includes('background_only')
+        && item.applicability === 'current'
+        && item.verification?.status !== 'disputed'
+        && item.lifecycle !== 'quarantined'
+        && item.lifecycle !== 'historical'
+        && !item.does_not_imply_current
+        && Array.isArray(item.sources) && item.sources.length > 0
+        && item.id && Number.isInteger(item.revision)
+        && (intent === 'unknown' || (itemState(item) !== 'disputed'
+            && (itemState(item) === 'unknown' || itemState(item) === intent)))
+        && item.recall_reason?.some((r: string) => ['semantic', 'lexical', 'lexical_weak', 'identifier'].includes(r))
+        && itemSubject(item) >= 0.20
+    );
+    if (eligible.length < 2) return undefined;
+
+    const groups = new Map<string, any[]>();
+    for (const item of eligible) {
+        const key = `${item.project_id ?? 'global'}|${item.scope}|${item.subject_id ?? ''}|${item.context_key ?? ''}|${JSON.stringify(item.valid_for ?? {})}`;
+        const list = groups.get(key) ?? [];
+        list.push(item);
+        groups.set(key, list);
+    }
+
+    let bestDirect: PageSupport | undefined;
+    for (const group of groups.values()) {
+        if (group.length < 2) continue;
+        const combinedText = group.map(item => {
+            const tags = item.tags ?? tagsById?.get(item.id) ?? [];
+            return [item.title, tags.join(' '), item.content].filter(Boolean).join('\n');
+        }).join('\n');
+        const words = new Set(terms(combinedText));
+        const entitiesRequired = requirements.entities.length;
+        const entitiesCovered = requirements.entities.filter(entity => entity.anyOf.some(value => mentions(combinedText, value))).length;
+        const relationCovered = !requirements.relations.length || requirements.relations.every(rule => rule.test.test(combinedText));
+        const qualifiersRequired = requirements.qualifiers.length;
+        const qualifiersCovered = requirements.qualifiers.filter(qualifier => qualifier.anyOf.some(value => mentions(combinedText, value))).length;
+        const answerCovered = answerSatisfied(requirements.answer, combinedText);
+        const subjectCoverage = requirements.subject.length
+            ? requirements.subject.filter(t => words.has(t)).length / requirements.subject.length
+            : 1;
+        const maxItemSubject = Math.max(0, ...group.map(item => itemSubject(item)));
+
+        const isDirect = entitiesCovered === entitiesRequired
+            && relationCovered
+            && qualifiersCovered === qualifiersRequired
+            && answerCovered
+            && maxItemSubject >= 0.50
+            && (subjectCoverage >= 0.60 || (entitiesRequired >= 2 && subjectCoverage >= 0.33));
+
+        if (!isDirect) continue;
+
+        const candidate: PageSupport = {
+            composition: 'multi_record',
+            level: 'direct',
+            contributors: group.map(item => ({ id: item.id, revision: item.revision })),
+            subject_coverage: Number(subjectCoverage.toFixed(3)),
+            entities_covered: entitiesCovered,
+            entities_required: entitiesRequired,
+            relation_covered: relationCovered,
+            ...(qualifiersRequired ? { qualifiers_covered: qualifiersCovered, qualifiers_required: qualifiersRequired } : {}),
+            ...(!answerCovered ? { answer_covered: false } : {})
+        };
+        if (!bestDirect || candidate.subject_coverage > bestDirect.subject_coverage)
+            bestDirect = candidate;
+    }
+    return bestDirect;
+}
+
 // Whole original sentence/line when possible. Long code lines use contiguous windows.
 // Offsets are JS UTF-16 offsets, the same units used by the chunker.
 export function evidenceWindow(text: string, query: string, budget = 200) {
