@@ -38,6 +38,7 @@ const blob=(v:Float32Array)=>Buffer.from(v.buffer,v.byteOffset,v.byteLength);
 const versionHead=(row:Row)=>({memory_id:row.id,revision:row.revision,content_hash:row.content_hash});
 const transitionPlan=(input:ProposeInput):TransitionPlan|undefined=>input.transition||input.expected_refs||input.relations
   ? {transition:input.transition,expected_refs:input.expected_refs,relations:input.relations,version_evolution:input.version_evolution}:undefined;
+const UPDATE_WORDING_RE=/本条更新此前|更新此前|取代.{0,15}旧|替代此前|不再保留|已废弃.{0,12}改用|\bsupersedes?\b|\breplaces?\s+(?:earlier|previous|old)\b/i;
 
 export async function readConfig(path:string):Promise<Config> {
   const raw=JSON.parse(await readFile(path,'utf8'));
@@ -424,9 +425,14 @@ export class MemoryService {
       const generation=this.storage.generation(),plan=transitionPlan(candidate);
       const previous=this.prepareRevision(candidate,supplied,plan,true);
       const decision=admissionDecision(this.db,candidate,record,intent,previous);
+      const updateWording=UPDATE_WORDING_RE.test(record.content),normalizedTitle=record.title.trim().toLowerCase();
       const comparable=analogues?.generation===before&&before===generation
         ? analogues.items.filter((item:any)=>sameOwnership(item,record))
-          .map((item:any)=>({memory_id:item.id,revision:item.revision,evidence_strength:item.evidence_strength})):undefined;
+          .map((item:any)=>{
+            const sameTitle=String(item.title??'').trim().toLowerCase()===normalizedTitle;
+            const transition=sameTitle||(updateWording&&item.evidence_strength==='supported')?(updateWording?'supersede':'correct'):undefined;
+            return {memory_id:item.id,revision:item.revision,evidence_strength:item.evidence_strength,...(transition&&{suggested_transition:transition})};
+          }):undefined;
       const {ready,...details}=decision;
       const result={...details,generation,policy:ADMISSION_POLICY,advisory:true,
         ...(analogues&&{suggestions:comparable??[],suggestion_mode:comparable&&analogues.retrieval_mode})};
@@ -582,14 +588,18 @@ export class MemoryService {
       ) SELECT m.id,m.revision,m.body FROM best JOIN memories m ON m.id=best.memory_id ORDER BY best.rank,m.id`)
         .all(similarQuery,record.scope,record.project_id) as any[]:[];
       const words=new Set(terms(record.title+' '+record.content));
-      const updateWording=/本条更新此前|更新此前|取代.{0,15}旧|替代此前|不再保留/.test(record.content);
+      const updateWording=UPDATE_WORDING_RE.test(record.content);
       const normalizedTitle=record.title.trim().toLowerCase();
+      const titleTerms=new Set(terms(record.title));
       const similar=candidates.map(x=>{
         const parsed=JSON.parse(x.body);
-        const sameTitle=String(parsed.title??'').trim().toLowerCase()===normalizedTitle;
-        const overlap=terms(parsed.title+' '+parsed.content).filter(w=>words.has(w)).length;
-        return {memory_id:x.id,revision:x.revision,overlap,...((updateWording||sameTitle)&&{suggested_transition:updateWording?'supersede':'correct'})};
-      }).filter(x=>x.overlap>=3||Boolean(x.suggested_transition)).sort((a,b)=>b.overlap-a.overlap).slice(0,5);
+        const candidateTitle=String(parsed.title??'');
+        const sameTitle=candidateTitle.trim().toLowerCase()===normalizedTitle;
+        const overlap=terms(candidateTitle+' '+parsed.content).filter(w=>words.has(w)).length;
+        const titleOverlap=terms(candidateTitle).filter(w=>titleTerms.has(w)).length;
+        const transition=sameTitle||(updateWording&&overlap>=3&&titleOverlap>=1)?(updateWording?'supersede' as const:'correct' as const):undefined;
+        return {memory_id:x.id,revision:x.revision,overlap,sameTitle,...(transition&&{suggested_transition:transition})};
+      }).filter(x=>x.overlap>=3||x.sameTitle).sort((a,b)=>b.overlap-a.overlap).slice(0,5).map(({sameTitle:_,...rest})=>rest);
       const id=randomUUID();
       const regular=expires(this.config.retention.proposal_days);
       const expires_at=admissionExpires?new Date(Math.min(admissionExpires,Date.parse(regular))).toISOString():regular;

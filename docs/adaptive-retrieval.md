@@ -84,7 +84,7 @@ CLI 使用同一 JSON 参数：`npm run cli -- recall --input /absolute/path/req
 
 Token 估算是 `ceil(紧凑JSON UTF-8 bytes / 3)`，不是任意 LLM 的真实 tokenizer。预算作用于当前传输的业务结果，包括来源、游标和必要标记；诊断不占内容 Token 预算。字节预算预留最多2048 bytes、内容估算预留256 bytes 给游标及末尾标记；debug 仍服从整体硬字节限制。diagnostics.content_estimated_tokens 为业务结果估算，estimated_tokens 包括诊断本身；两者不可混用。
 
-普通结果保留 id、revision、written_by、项目/类型/标题、content、sources、verification、valid_for、applicability、片段偏移与相关性标记。hash、模型 profile、作者会话等冗长展开信息留给 ids。`view=evidence` 从最佳命中 Chunk 取至多200个JS字符，仍保留完整来源，不截掉来源来凑条目数。来源过大时明确阻塞并允许增大预算，不静默丢弃。
+普通结果保留 id、revision、written_by、项目/类型/标题、content、sources、verification、valid_for、applicability、片段偏移与相关性标记。hash、模型 profile、作者会话等冗长展开信息留给 ids。`view=evidence` 从最佳命中 Chunk 取至多200个JS字符，仍保留完整来源，不截掉来源来凑条目数；客户端亦可显式传 `detail=compact`（仅用于 `view=evidence`）省略冗长诊断性字段（`verification.method/summary/evidence`、`source_hash/checked_at`、`answer_relevance`、`snippet_selection`、`support.basis/subject_coverage`、`tags`、`written_by`、`record_updated_at` 与重复 `excerpt`）以降低 Token 占用，同一游标不可中途切换 `detail`（违反返回 `CURSOR_PAGE_OPTIONS_MISMATCH`）。来源过大时明确阻塞并允许增大预算，不静默丢弃。
 
 诊断包括耗时、累计 candidate_ids、本页 candidates_ranked、正文/片段读取、显式 JSON 解析、查询编码、向量查询及返回行、字节与估算 Token。查询缓存的显式解析也计入 json_parses；模型库初始化不包含在内。内部向量扫描量和距离计算量不可准确观测，保持 null。实际延迟 p50/p95、全局解析观测和 RSS 由基准脚本在外部测量。
 
@@ -92,7 +92,7 @@ Token 估算是 `ceil(紧凑JSON UTF-8 bytes / 3)`，不是任意 LLM 的真实 
 
 canonical Schema5 不变。辅助文件 `<真实database路径>.retrieval.db` 使用 WAL、0600 权限、secure_delete，保存查询参数/向量、候选 ID/分数/Chunk偏移、散列 facet、通道进度与不可变页面选择；不缓存记忆正文或来源原文。游标是随机128位查询 ID 和页序号，服务器查表验证，不是可以绕过 ACL 的令牌。
 
-绑定内容：真实数据库路径、connection_id、允许的项目/操作、all_projects/global、注册项目集合、检索阈值、模型配置、排序策略版本、证据判定版本、原查询和 canonical generation。beta.7 起游标前缀为 `am5`；beta.6 及更早的 `am4` 游标返回 `CURSOR_STALE`，客户端用原问句重新查询，不沿用旧页的逐条证据等级。每页重查权限及适用性。任何正式发布、修订、遗忘或索引重建导致 generation 变化后，旧游标拒绝；时间经过导致旧页条目过期也拒绝重放。新页跳过已过期候选；显式项目过滤和 global 规则从候选 SQL 开始执行。
+绑定内容：真实数据库路径、connection_id、允许的项目/操作、all_projects/global、注册项目集合、检索阈值、模型配置、排序策略版本、证据判定版本、原查询和 canonical generation。beta.7 起游标前缀为 `am5`（`1.0.0-rc.1` 继续沿用 `am5:` 格式并通过 `RANKING_VERSION`/`SUPPORT_VERSION` 变更令旧版游标拒绝继续）；beta.6 及更早的 `am4` 游标返回 `CURSOR_STALE`，客户端用原问句重新查询，不沿用旧页的逐条证据等级。每页重查权限及适用性。任何正式发布、修订、遗忘或索引重建导致 generation 变化后，旧游标拒绝；时间经过导致旧页条目过期也拒绝重放。新页跳过已过期候选；显式项目过滤和 global 规则从候选 SQL 开始执行。
 
 | 错误 | 处理 |
 |---|---|

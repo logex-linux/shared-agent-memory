@@ -36,11 +36,30 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_node_binary(config: dict[str, Any], config_path: str | os.PathLike[str]) -> str:
+    env_node = os.environ.get("SAM_NODE_BINARY")
+    if env_node and Path(env_node).is_file():
+        return env_node
+    manifest_candidates = [config.get("installation_manifest"), str(Path(config_path).expanduser().resolve().with_name("installation.json"))]
+    for candidate in manifest_candidates:
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.is_file():
+            try:
+                node_path = json.loads(path.read_text(encoding="utf-8")).get("node")
+                if node_path and Path(node_path).is_file():
+                    return node_path
+            except (OSError, json.JSONDecodeError):
+                pass
+    return shutil.which("node") or "node"
+
+
 class McpClient:
     """Minimal newline JSON-RPC client; avoids adding a Python MCP dependency."""
-    def __init__(self, config: Path, cwd: Path):
+    def __init__(self, config: Path, cwd: Path, node_binary: str = "node"):
         env = dict(os.environ, SHARED_MEMORY_CONFIG=str(config))
-        self.process = subprocess.Popen(["node", "dist/mcp/server.js"], cwd=cwd, env=env,
+        self.process = subprocess.Popen([node_binary, "dist/mcp/server.js"], cwd=cwd, env=env,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True, bufsize=1)
         self.errors = deque(maxlen=100)
@@ -162,6 +181,7 @@ def compact_observation(case: dict, response: dict, gold: set[str], wall_ms: flo
             "ranking_chunk_rows_read": diagnostics.get("ranking_chunk_rows_read"),
             "vector_rows_returned": diagnostics.get("vector_rows_returned"),
             "duplicate_pairs": duplicate_pairs(items), "evidence_status": response.get("evidence_status"),
+            "page_support": response.get("retrieval", {}).get("page_support"),
             "warnings": response.get("warnings", []), "full_body_reads": diagnostics.get("full_body_records_read"),
             "items": [{"id": item.get("id"), "revision": item.get("revision"), "title": item.get("title"),
                        "evidence_strength": item.get("evidence_strength"), "support": item.get("support"),
@@ -201,7 +221,8 @@ def main() -> None:
     connection.close()
     observations = defaultdict(list)
     errors = []
-    client = McpClient(snapshot_config, root)
+    node_binary = resolve_node_binary(config, args.config)
+    client = McpClient(snapshot_config, root, node_binary)
     try:
         for iteration in range(args.warmup + args.rounds):
             measured = iteration >= args.warmup

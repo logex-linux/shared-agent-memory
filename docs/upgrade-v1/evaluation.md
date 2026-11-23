@@ -258,3 +258,15 @@ Two warm pairs over 12 frozen queries measured beta.6/beta.7 median p95 of
 [44747471987](https://github.com/logex-linux/shared-agent-memory/actions/runs/44747471987)
 passed `npm ci`, model download, 165 tests, the adaptive benchmark and the
 installer/CLI check on commit `b69e3a6`.
+
+## 1.0.0-rc.1 self-evolution benchmark (32 reviewed queries, 96 calls)
+
+Paired evaluation on read-only snapshots of the 473-record live SQLite library
+(`tests/benchmark_evolve.py`, recorded in `EVOLUTION_RFC.md`) measured `1.0.0-beta.7`
+vs `1.0.0-rc.1` (`detail=full` and `detail=compact`) across 96 warmed MCP STDIO calls:
+
+- Hit@5: `96.55%` -> `100.00%` (`87/87`); Recall@5: `70.89%` -> `72.15%`; MRR: `0.908046` -> `0.942529`.
+- Related-hit `insufficient` rate: `41.38%` (`36/87`) -> `27.59%` (`24/87`) via `page_support`, without elevating any individual `weak/partial` record (`51.72%` single-item supported unchanged, `100%` abstention on absent targets, `0` supported noise).
+- `detail=compact`: p50 response tokens `3,619` -> `2,210` (`-38.93%`), content share `17.58%` -> `25.68%`, `RESPONSE_BUDGET` warnings `24` -> `15`.
+- Same-machine paired core latency: p95 `63.972 ms` (`beta7`) -> `60.778 ms` (`full`, `0.95x`) / `58.470 ms` (`compact`, `0.91x`); p99 `140.576 ms` -> `69.153 ms` / `66.750 ms`; empty `exact_only` query `0.1–0.3 ms` with `0` vector rows and `0` ranking chunk reads.
+- Local unit and integration suite: `npm test` passes `170 / 170` tests.

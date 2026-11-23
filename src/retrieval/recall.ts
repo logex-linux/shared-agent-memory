@@ -200,8 +200,10 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 profileTrace?.add('fts_identifiers',performance.now()-preflightStarted);
                 preResolved=request.mode==='broad'||(!request.mode||request.mode==='auto')&&broadIntent(request.query)?'broad':'focused';
                 const preOptions={limit:request.limit??(preResolved==='focused'?8:config.page_item_limit),token_budget:Math.min(request.token_budget??config.response_token_budget,config.response_token_budget),max_bytes:Math.min(request.max_bytes??config.page_response_bytes,config.page_response_bytes),view:request.view??'chunks',detail:request.detail??'full'};
-                const preWarnings=request.graph?['GRAPH_EXACT_ONLY']:[];
-                const prePlan:any={mode:preResolved,assessment:'heuristic',view:preOptions.view,stop_reason:'insufficient',more_unexamined:false,coverage:{projects:0,periods:0,topics:0},...(preOptions.detail==='compact'&&{detail:'compact'}),...(request.graph&&{graph:{state:'disabled',reason:'GRAPH_EXACT_ONLY'}})};
+                const isPreCompact=preOptions.detail==='compact'&&preOptions.view==='evidence';
+                const preGraphReason=request.graph?(graphFallback??(!config.graph_enabled?'GRAPH_DISABLED':'GRAPH_EXACT_ONLY')):undefined;
+                const preWarnings=preGraphReason?[preGraphReason]:[];
+                const prePlan:any={mode:preResolved,assessment:'heuristic',view:preOptions.view,stop_reason:'insufficient',more_unexamined:false,coverage:{projects:0,periods:0,topics:0},...(isPreCompact&&{detail:'compact'}),...(preGraphReason&&{graph:{state:['GRAPH_DISABLED','GRAPH_EXACT_ONLY'].includes(preGraphReason)?'disabled':'degraded',reason:preGraphReason}})};
                 const preResult:any={items:[],generation:preGen,retrieval_mode:retrievalMode,warnings:preWarnings,empty_reason:'no_relevant_evidence',evidence_status:'insufficient',has_more:false,next_cursor:null,retrieval:prePlan};
                 if(Buffer.byteLength(JSON.stringify(preResult))>preOptions.max_bytes)throw new MemoryError('PAGE_BUDGET_TOO_SMALL');
                 d.elapsed_ms=Number((performance.now()-start).toFixed(3));
@@ -937,11 +939,17 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             partial:supportLevels.filter((level:string)=>level==='partial').length,
             missing:supportLevels.filter((level:string)=>level==='missing').length};
         let hasSupported = result.items.some((i: any) => i.evidence_strength === 'supported');
+        delete plan.page_support;
+        delete result.retrieval.page_support;
         if (!hasSupported && supportReq && !expansion && resolved === 'focused') {
             const pageSupport = pageSupportAssessment(supportReq, result.items, decisionIntent(input), itemTagsMap, itemSubjectCoverage, itemAnswerState);
             if (pageSupport?.level === 'direct') {
                 result.retrieval.page_support = pageSupport;
                 if (result.retrieval !== plan) plan.page_support = pageSupport;
+                if (!fits(128)) {
+                    delete result.retrieval.page_support;
+                    if (result.retrieval !== plan) delete plan.page_support;
+                }
                 hasSupported = true;
             }
         }

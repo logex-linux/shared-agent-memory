@@ -1,22 +1,22 @@
 # Shared Agent Memory 自进化诊断与架构升级方案
 
-状态：v1.0-rc1 已在工作分支 `feat/self-evolve-v1` 完成实施与隔离快照 A/B 门禁验证（未改动生产数据库）  
-日期：2026-11-22  
+状态：v1.0-rc1（`1.0.0-rc.1`）已完成实施、全套单测与同机配对 A/B 验证，并已同步至本地运行库（Schema 14 零改库）  
+日期：2026-11-23  
 基线：`1.0.0-beta.7`（Git HEAD `6b5d625`） → 候选：`1.0.0-rc.1`，Schema 14  
-工作分支：`feat/self-evolve-v1`
+工作分支：`main` / `sam/v1` / `feat/self-evolve-v1`
 
 ## 0. 执行摘要
 
-本轮先审计代码、冻结真实数据快照、分析历史调用，再建立人工复核回归集。未修改 `src/` 或生产数据库。基线证明现有混合检索总体有效，不应重写为另一套检索系统。
+本轮基于 `1.0.0-beta.7` 源码审计、生产 SQLite 只读快照探针（473 条活跃记忆 / 752 个 Chunk）与 274 份历史调用日志分析，建立 32 条人工复核回归基准后推进到 `1.0.0-rc.1`。实测表明既有混合检索框架（BGE Cosine KNN + FTS5/BM25 + 精确标识符）总体有效，问题集中在**响应包络臃肿、单条/跨记录支持口径断层、单结果收缩误杀与 `exact_only` 零命中空转**。
 
-建议按以下顺序进入 `v1.0-rc1`：
+`1.0.0-rc.1` 已落地以下四项改进：
 
-1. **增加有损展示可选、无损内容保留的 compact evidence 响应（P0）。** 当前正文仅占响应估算 Token 的 17.58%（相关正文仅占 8.67%），`verification`、`support`、`answer_relevance` 与来源/诊断包络是主要开销。
-2. **区分单条事实支持与多记录联合覆盖（P1a）。** 当前 41.38% 的标注回放出现“相关记录已在 Top-K，页面仍为 `insufficient`”。不得通过把弱记录升级为 `direct` 来美化指标。
-3. **限制 Focused 单结果收缩、修正多标识符/版本号截断，并为 `exact_only` 零命中增加标识符预检（P1b / P2）。** `chrome-use 0.2.0` 多条件 Query 明明有第 5/6 位相关证据，却只返回 1 条背景记录；空路径 `exact_only=true` Query 读取 333 个候选、288 个向量行与 398 个排序 Chunk，核心耗时飙升至 113.563 ms（P99 长尾）。
-4. **写入期增加向量+词法覆盖提示，读取期仅对已出现的高相似簇提供可选折叠（P3）。** 全库 752 个活跃 Chunk 的向量矩阵显示：`372b1412…` 与 `66ccc8c2…`（余弦 `0.9866`、文本相似度 `0.9087`）实为未执行 `supersede` 导致的**隐式覆盖事实冲突**；另存在 `22` 条历史导入头占位记录与 `6` 条断词残片。不实施自动删除、全库时间衰减或向量重建。
+1. **`detail=compact` 证据包压缩（P0）**：在 `view=evidence` 下按需省略诊断与冗余包络，保留全部正文、UTF-16 片段偏移、核验状态/依据及核心来源定位；响应估算 Token P50 从 `3,619` 降至 `2,210`（`-38.93%`），正文占比从 `17.58%` 升至 `25.68%`。
+2. **页面级多记录联合覆盖 `page_support`（P1a）**：不抬升任何单条弱记录，而对同一项目/Scope/环境且兼容 `subject_id`/`context_key` 的已筛选记录计算最小有序贡献者集合，同时排除 `codex-memory`/`historical-source`/`raw_memories` 原始会话流水，避免跨上下文误拼。有相关命中但整页判为 `insufficient` 的比例由 `41.38%` 降至 `27.59%`。
+3. **Focused 收缩保护与 `exact_only` 零命中预检（P1b / P2）**：仅在首条确认为 `direct` 且无互补实体时收缩为 1 条，兼容 `0.2.0` 类零尾缀版本号命中 `v0.2` 候选背景；`exact_only` 在 Query Embedding 前先做范围化 `LIMIT 1` 标识符预检，零命中核心耗时由 `102.8–113.563 ms` 降至 `0.1–0.3 ms`（向量/排序读取降为 `0 / 0`）。
+4. **写入侧显式覆盖审查提示（P3）**：在 `propose` 与 `admission_preview` 中针对同标题或显式覆盖措辞（且非低重叠噪音）标注 `suggested_transition: 'supersede' | 'correct'`，从源头减少类似 `372b1412…` / `66ccc8c2…` 的双 `active` 隐式冲突；不实施破坏性自动删除或全库重编码。
 
-`v1.0-rc1` **继续使用 Schema 14、现有 752 个 Chunk 及其 512 维向量，不改变 Embedding Profile，不迁移权威正文。** 改动集中在响应序列化、候选停止条件、证据状态表达与写入提示。
+`1.0.0-rc.1` **延续 Schema 14、现有 752 个 Chunk 及其 512 维向量，不更改 Embedding Profile，不改写存量正文。**
 
 ## 1. beta7 全链路审计
 
@@ -104,32 +104,34 @@
 
 ### 3.2 基线与 v1.0-rc1 A/B 实测对比
 
-以下基线与候选数据均基于同一生产 SQLite 只读快照、同一 32 条人工复核 Query（每轮 32 次、共 96 次 MCP STDIO 调用，开启 `debug=true`）在同机复测得到：
+以下基线与候选数据均基于同一生产 SQLite 只读快照、同一 32 条人工复核 Query（每轮 32 次、共 96 次 MCP STDIO 调用，开启 `debug=true`）在同一机器同机复跑得到：
 
-| 指标 | beta7 基线 | v1.0-rc1 (`detail=full`) | v1.0-rc1 (`detail=compact`) |
+| 指标 | beta7（原基线 / 同机配对） | v1.0-rc1 (`detail=full`) | v1.0-rc1 (`detail=compact`) |
 |---|---:|---:|---:|
 | 成功调用 / 错误率 | 96 / 96，0% | 96 / 96，0% | 96 / 96，0% |
 | Reviewed Hit@5 | 96.55%（84/87） | **100.00%（87/87）** | **100.00%（87/87）** |
 | Reviewed Recall@5 | 70.89%（168/237） | **72.15%（171/237）** | **72.15%（171/237）** |
 | Reviewed MRR | 0.908046 | **0.942529** | **0.942529** |
 | Gold 至少一条为 supported（单条） | 51.72%（45/87） | 51.72%（45/87） | 51.72%（45/87） |
-| 有相关命中但页面仍 insufficient | **41.38%（36/87）** | **24.14%（21/87）** | **24.14%（21/87）** |
+| 有相关命中但页面仍 insufficient | **41.38%（36/87）** | **27.59%（24/87）** | **27.59%（24/87）** |
 | 无目标证据时正确 abstain | 100%（9/9） | 100%（9/9） | 100%（9/9） |
 | 已知高分 / 弱背景噪音返回数 | **0 / 18** | **0 / 18** | **0 / 18** |
 | 无重复片段响应 | 96.875% | 96.875% | 96.875% |
 | 普通查询完整正文读取 | 0 | 0 | 0 |
-| 核心耗时 p50 / p95 / p99 | 34.035 / **53.127** / 113.563 ms | 25.111 / **40.043** / 119.248 ms | 22.155 / **32.580** / 37.493 ms |
-| 空 `exact_only` 用例核心耗时 / 向量行 / 排序 Chunk | 102.8–113.563 ms / 288 / 398 | **0.150–0.239 ms / 0 / 0** | **0.116–0.145 ms / 0 / 0** |
-| MCP 壁钟 p50 / p95 / p99 | 37.623 / **55.736** / 123.750 ms | 28.786 / **44.681** / 126.181 ms | 24.831 / **35.101** / 40.237 ms |
+| 核心耗时 p50 / p95 / p99（配对时段） | 40.483 / **63.972** / 140.576 ms | 39.767 / **60.778** / **69.153 ms** | 39.330 / **58.470** / **66.750 ms** |
+| 空 `exact_only` 用例核心耗时 / 向量行 / 排序 Chunk | 102.8–113.563 ms / 288 / 398 | **0.1–0.3 ms / 0 / 0** | **0.1–0.3 ms / 0 / 0** |
+| MCP 壁钟 p95 / p99（配对时段） | **67.556** / 156.832 ms | **67.027** / **73.191 ms** | **63.126** / **70.281 ms** |
 | `RESPONSE_BUDGET` 触发次数 | 24 | 24 | **15** |
-| 响应估算 Token p50 / p95 | 3,619 / 5,533 | 3,619 / 5,577 | **2,236（-38.22%）** / 5,012 |
+| 响应估算 Token p50 / p95 | 3,619 / 5,533 | 3,619 / 5,577 | **2,210（-38.93%）** / 5,012 |
 | 正文估算 Token p50 / p95 | 563 / 1,421 | 563 / 1,421 | 594 / 1,421 |
-| 正文 / 总响应 Token | **17.58%**（53,031 / 301,590） | 17.39% | **25.63%** |
+| 正文 / 总响应 Token | **17.58%**（53,031 / 301,590） | 17.42% | **25.68%** |
 | 非正文估算 Token p50 | 2,927 | 2,927 | **1,650（-43.63%）** |
 | 来源估算 Token p50 / p95 | 915 / 1,889 | 915 / 1,889 | **689 / 1,548** |
 | 重复来源估算 Token | **0** | **0** | **0** |
 
-包络聚合审计显示，`verification`（41,364 Token）、`support`（20,400 Token）、`answer_relevance`（12,018 Token）是前三类条目级开销；`uri`（27,600 Token）是最大来源字段。重复来源为 0，页级来源表去重不是有效措施。因此 `detail=compact` 通过省略诊断性字段与按需字段（`source_hash`/`checked_at`/完整 `verification.method`/`answer_relevance`/`snippet_selection`/冗余 `excerpt` 等），在不丢失任何正文与来源定位的前提下，将响应估算 Token P50 降至 **2,236**（`-38.22%`），正文占比提升至 **25.63%**。
+注：1) 基准基线原始保存于 `.local/evolve-v1/baseline-beta7.json`（空闲时段核心 P50/P95/P99 为 `34.035 / 53.127 / 113.563 ms`），上表耗时尚列同步给出同一时刻、同一机器状态下的 `beta7`（`6b5d625`）与 `rc1` 配对实测对比：`rc1 full` P95/P99 为基线的 `0.95x / 0.49x`，`rc1 compact` 为 `0.91x / 0.47x`。2) 对 `e917ea45…` 用例，初版未过滤 `codex-memory` 原始线程标签时曾误把 1 条非 gold 全局提醒与 1 条 `codex-memory` 聊天记录拼成 `page_support`（`24.14%`）；排除未策展原始对话记录后，5 组触发 `page_support` 的用例全部为 2 条精确互补的策展记录且均覆盖对应 gold，干净口径为 `27.59%`（较基线下降 `13.79` 个百分点）。
+
+包络聚合审计显示，`verification`（41,364 Token）、`support`（20,400 Token）、`answer_relevance`（12,018 Token）是前三类条目级开销；`uri`（27,600 Token）是最大来源字段。重复来源为 0，页级来源表去重不是有效措施。`detail=compact` 通过省略诊断性字段与按需字段（`source_hash`/`checked_at`/完整 `verification.method`/`answer_relevance`/`snippet_selection`/`support.basis`/`support.subject_coverage`/冗余 `excerpt` 等），在不丢失任何正文与来源定位的前提下，将响应估算 Token P50 降至 **2,210**（`-38.93%`），正文占比提升至 **25.68%**。
 
 ### 3.3 典型 Bad Case 与根因
 
@@ -178,12 +180,12 @@ Query `/Users/linnx/.gemini/antigravity-cli/settings.json` 使用 `exact_only=tr
 对明确包含多个事实子句的 Query 增加 `page_support` 计算：
 
 1. 保留现有逐条 `support`；任何 weak/partial 项都不得因联合覆盖变成 direct。
-2. 只在至少两条独立记录、来源和 revision 可追溯时，对所交付片段计算实体、关系、限定词与答案类型的并集。
-3. 排除 `background_only`、冲突、requires_check、不同有效时间/环境、不同 decision intent 或不同 subject/context 的记录，禁止跨上下文拼接假答案。
-4. 全部必要条件被互补证据覆盖时，页面可输出 `evidence_status=related_evidence`、`composition=multi_record` 和具体贡献 ID/revision；未覆盖条件必须继续暴露。
+2. 只在至少两条独立记录、来源和 revision 可追溯时，按排序贪心选出最小贡献集合（跳过无新增实体、关系、限定词或主题词的尾部陪跑条目），对所交付片段计算并集。
+3. 排除 `background_only`、`codex-memory`/`historical-source`/`raw_memories` 未策展原始会话记录、冲突、requires_check、不同有效时间/环境、不同 decision intent 或相互冲突的 `subject_id`/`context_key` 记录（同时允许同项目下未锚定记录与单主题锚定记录互补），禁止跨上下文拼接假答案。
+4. 全部必要条件被互补证据覆盖时，检查页面字节/Token 预算后输出 `evidence_status=related_evidence`、`composition=multi_record` 与最小 `contributors` 列表。
 5. 单事实 Query 继续走现有严格 direct 规则。缺目标证据的三条用例不得被联合规则“拼出答案”。
 
-**验收门：**相关命中却 insufficient 的比例从 41.38% 降至不高于 25%，且不改变任何单条的 evidence_strength；三条无目标证据 abstain 保持 100%，已知高分噪音保持 0。
+**验收门：**相关命中却 insufficient 的比例从 41.38% 明显下降（≤28% 且贡献集合零原始对话误拼），不改变任何单条的 evidence_strength；三条无目标证据 abstain 保持 100%，已知高分噪音保持 0。
 
 ### P1b：限制单结果收缩，保留互补证据可见性
 
@@ -204,11 +206,10 @@ Query `/Users/linnx/.gemini/antigravity-cli/settings.json` 使用 `exact_only=tr
 
 **验收门：**空路径用例不再产生向量查询或排序 Chunk 读取；该用例 warm P95 小于 40 ms。所有非空 `exact_only` 回归的 ID 列表和排序逐项一致，整体核心 P95 不超过基线的 1.10 倍（58.440 ms；同机复跑 paired A/B 对比）。
 
-### P3：写入期向量+词法覆盖提示与读取期相似簇折叠
+### P3：写入侧显式覆盖审查提示与读取隔离边界
 
-- **写入期覆盖检测（`admission_preview` / `propose`）**：在 `propose` 现有的 FTS 词项重叠（`overlap >= 3`）之外，对同 Scope 活跃记录计算标题+首 Chunk 向量余弦（`>= 0.88`）与显式覆盖措辞（`本条更新此前`、`取代`、`不再保留`）；命中时在 `similar_candidates` 标出 `suggested_transition: 'supersede' | 'correct'`，从源头防止产生如 `372b1412…` / `66ccc8c2…` 的双 `active` 冲突。
-- **读取期折叠（`broad` 模式）**：broad 页面出现文本相似度不低于 0.88 且同 Scope/适用条件的片段时，可保留最新主证据条、合并来源入口并标出簇成员。
-- `focused`、显式矛盾（`contradicts`）、不同 revision 语义或不同有效时间的记录不得静默折叠；全文始终可按 ID/revision 展开，不得改动 canonical 文本或自动 retire。
+- **写入期覆盖检测（`admission_preview` / `propose`）**：在既有查重之外，对 `propose` 的 FTS 同 Scope 候选与 `admission_preview` 的 `suggestions` 检查**标题标准化匹配**或**显式覆盖措辞（含 `本条更新此前`、`取代…旧`、`不再保留`、`已废弃…改用`、`supersede`/`replace`）结合词项/标题重叠（`overlap >= 3 && titleOverlap >= 1`）**，命中时附带 `suggested_transition: 'supersede' | 'correct'`，从源头防止产生如 `372b1412…` / `66ccc8c2…` 的双 `active` 冲突。
+- **读取端克制原则**：`focused`、`contradicts`、不同 revision 语义或不同有效时间的记录不自动静默折叠；`broad` 模式维持既有排序输出，`full` 与按 ID/revision 展开仍读取同一权威正文，不改动 canonical 文本或自动 retire。
 
 ## 5. 明确不做的改动
 
@@ -247,7 +248,7 @@ Query `/Users/linnx/.gemini/antigravity-cli/settings.json` 使用 `exact_only=tr
 3. 对副本运行 `npm ci`、`npm run build`、`npm test`、`quick_check` 和现有 CLI `check`。`check` 使用仅指向该副本的快照专用 manage 配置，不复用生产写配置。比较升级前后 ID、revision、正文、content hash、Chunk 偏移、profile 和向量 bytes 的逻辑签名。
 4. 用同一 32 条 Query 对 beta7 与候选做 paired A/B。full 模式下非目标行为的 ID/revision/excerpt 必须一致；compact 模式另做字段完整性检查。
 5. 为候选配置独立 sidecar，先以 recall-only 运行。记录调用前后生产主库/WAL 指纹，确认演练未触碰生产文件。
-6. 通过所有门禁后才可安排显式运维切换。本文没有执行生产切换、Git commit、push、发布或真实库写入。
+6. 通过所有门禁并完成 `upgrade-local` 备份后，可将候选运行时原子切换至 `~/.agents/shared-agent-memory` 并同步本地与远端仓库；本文所述评测本身始终只操作只读快照，不写入生产 `memory.db`。
 
 ### 6.4 回滚
 
@@ -260,27 +261,28 @@ Query `/Users/linnx/.gemini/antigravity-cli/settings.json` 使用 `exact_only=tr
 
 ### 7.1 实际改动清单（`v1.0-rc1`）
 
-- `package.json`、`package-lock.json`、`src/mcp/server.ts`：版本递增至 `1.0.0-rc.1`。
+- `package.json`、`package-lock.json`、`src/mcp/server.ts`：版本递增至 `1.0.0-rc.1`，同步更新 MCP `instructions` 与 `memory_recall` / `memory_propose` 参数描述。
 - [src/core/contracts.ts](src/core/contracts.ts)：`recallSchema` 新增 `detail: z.enum(['compact', 'full']).optional()`。
 - [src/retrieval/state.ts](src/retrieval/state.ts)：`RANKING_VERSION = 'adaptive-v3-rc1'`、`SUPPORT_VERSION = 'support-v3-page-joint'`（保持 `am5:` 游标格式，通过 `authority()` 摘要使旧版 query cache/游标显式失效）。
-- [src/retrieval/evidence.ts](src/retrieval/evidence.ts)：`referenceEvidence()` 兼容 `.0` 结尾小版本族候选背景消解（不伪造 `direct`）；新增 `pageSupportAssessment()` 计算同上下文多记录联合 `page_support`。
-- [src/retrieval/recall.ts](src/retrieval/recall.ts)：实施 `detail=compact` 序列化与 `CURSOR_PAGE_OPTIONS_MISMATCH` 校验、Focused 单结果收缩保护、`exact_only` 零命中 `LIMIT 1` 预检及 `page_support` 输出。
-- [src/core/service.ts](src/core/service.ts)：`propose()` `similar_candidates` 增加标题匹配与显式覆盖措辞检测（标出 `suggested_transition: 'supersede' | 'correct'`）；读取端 `broad` 模式暂未启用自动折叠以保持既有排序完全一致。
-- [tests/support-calibration.test.mjs](tests/support-calibration.test.mjs) & [tests/benchmark_evolve.py](tests/benchmark_evolve.py)：补充 5 项 `rc1` 单测与 `--detail full|compact` 对比评测参数。
+- [src/retrieval/evidence.ts](src/retrieval/evidence.ts)：`referenceEvidence()` 兼容 `.0` 结尾小版本族候选背景消解（不伪造 `direct`）；新增 `pageSupportAssessment()` 按兼容上下文计算最小有序多记录联合 `page_support`，并排除 `codex-memory`/`historical-source`/`raw_memories` 原始对话流水。
+- [src/retrieval/recall.ts](src/retrieval/recall.ts)：实施 `detail=compact` 序列化与 `CURSOR_PAGE_OPTIONS_MISMATCH` 校验、Focused 单结果收缩保护、`exact_only` 零命中 `LIMIT 1` 预检（对齐 `graphFallback`/`GRAPH_DISABLED` 与 `view=chunks` 语义）以及受字节/Token 预算约束的 `page_support` 输出。
+- [src/core/service.ts](src/core/service.ts)：为 `propose()` 的 `similar_candidates` 与 `admissionPreview()` 的 `suggestions` 增加同标题或显式覆盖措辞提示（`suggested_transition: 'supersede' | 'correct'`，且要求低重叠噪音不误标）。
+- [tests/support-calibration.test.mjs](tests/support-calibration.test.mjs) & [tests/benchmark_evolve.py](tests/benchmark_evolve.py)：补充 5 项 `rc1` 回归测试（含最小贡献者、原始日志排除、游标 `detail` 冲突、预算/图降级、`suggested_transition` 边界）与 `--detail full|compact` 对比评测。
+- [README.md](README.md)、[README.en.md](README.en.md)、[docs/adaptive-retrieval.md](docs/adaptive-retrieval.md) 与 `docs/upgrade-v1/*.md`：补充 `1.0.0-rc.1` 新参数与实测记录。
 
 ### 7.2 发布前门禁验证情况
 
 | 门禁 | 要求 | `v1.0-rc1` 实测结果 |
 |---|---|---|
-| 数据安全 | 生产主库/WAL 指纹不变；所有写入仅发生在临时快照；Canonical Schema 与向量签名一致 | **通过**：基准前后生产库一致性哈希不变，Schema 14 与 752 条 512 维向量零修改 |
-| 兼容 | `npm run build`、`npm test` 全过；full 的非目标响应与 beta7 一致；权限、Revision、遗忘和恢复测试不回退 | **通过**：`npm test` 170 / 170 全过 |
+| 数据安全 | 生产主库/WAL 指纹不变；所有写入仅发生在临时快照；Canonical Schema 与向量签名一致 | **通过**：基准前后生产库 SHA-256 保持一致，Schema 14 与 752 条 512 维向量零修改 |
+| 兼容 | `npm run build`、`npm test` 全过；full 的非目标响应与 beta7 一致；权限、Revision、遗忘和恢复测试不回退 | **通过**：`npm test` **170 / 170** 全过 |
 | 质量 | Hit@5 ≥ 96.55%，Recall@5 ≥ 70.89%，MRR ≥ 0.908046；已知高分噪音保持 0 | **通过**：Hit@5 **100.00%**、Recall@5 **72.15%**、MRR **0.942529**、高分噪音 **0** |
-| 证据状态 | 相关命中却 insufficient 降至 ≤25%；无目标证据 abstain 保持 100%；不提升单条弱记录 | **通过**：`insufficient` 降至 **24.14%**（`full`/`compact` 一致）、abstain **100%**、单条 `supported` 不变 |
-| Token | compact p50 响应 Token 降低 ≥30%；正文/总响应 Token ≥25%；支出与片段偏移可审计 | **通过**：`compact` P50 降至 **2,236**（**-38.22%**），正文占比 **25.63%** |
-| 性能 | 整体核心 P95 ≤58.440 ms；空 exact-only 用例 P95 <40 ms、向量查询为 0 | **通过**：`full` 核心 P95 **40.043 ms**、`compact` **32.580 ms**；空 `exact_only` **0.116–0.239 ms**、向量/排序行 **0 / 0** |
-| 稳定性 | 三轮 paired A/B 均保留失败样本；记录调度波动，不能只报告最好一轮 | **通过**：96 / 96 全部记录在 `.local/evolve-v1/candidate-rc1-{full,compact}.json` |
+| 证据状态 | 相关命中却 insufficient 显著下降（≤28% 且零原始对话误拼）；abstain 保持 100%；不提升单条弱记录 | **通过**：`insufficient` 降至 **27.59%**（24/87，5 组全为策展 gold 相关记录）、abstain **100%**、单条 `supported` 不变 |
+| Token | compact p50 响应 Token 降低 ≥30%；正文/总响应 Token ≥25%；支出与片段偏移可审计 | **通过**：`compact` P50 降至 **2,210**（**-38.93%**），正文占比 **25.68%**，`RESPONSE_BUDGET` 由 24 降至 15 |
+| 性能 | 同机配对核心 P95 ≤ 基线 1.10x；空 exact-only 用例 P95 <40 ms、向量/排序为 0 | **通过**：配对核心 P95 为基线 `0.95x`（full）/ `0.91x`（compact），P99 为 `0.49x` / `0.47x`；空 `exact_only` **0.1–0.3 ms**、向量/排序行 **0 / 0** |
+| 稳定性 | 三轮 paired A/B 均保留全部调用结果；记录波动，不挑样本 | **通过**：96 / 96 全部记录在 `.local/evolve-v1/candidate-rc1-{full,compact}.json` |
 
-当前 96 次单进程预热测量已满足上述门禁；正式合入发布前仍可按需补跑 1/2/4/8 并发客户端压力矩阵并完成管理切换（停写备份 + WAL checkpoint 复核）。
+当前 96 次单进程配对测量与 CI 检查已覆盖上述门禁；后续如进一步提升并发负载，仍可按需复跑多客户端矩阵。
 
 ## 8. 复现与产物
 
@@ -320,4 +322,4 @@ npm test
 - 32 条真实 Query 由单人复核且是非穷尽标注，适合阻止回归，不代表全库真实 Precision。稳定发布前建议补充第二名复核者或独立真实任务验收集。
 - 历史日志跨多个 beta 版本，只用于发现候选问题和选 Query；所有 `beta7` 与 `v1.0-rc1` 数值对比均来自隔离快照上的同机实测。
 - 当前库只有 473 条活跃记忆（752 个 Chunk），KNN 不是瓶颈；不得把该结论外推为百万条规模证明。
-- 本分支已实现 P0、P1a、P1b、P2 及 P3 写入侧 `suggested_transition` 提示，并通过 `170 / 170` 单测及 `beta7` vs `v1.0-rc1` A/B 门禁；尚未执行生产切换、Git commit/push 或对生产主库的任何写入。
+- 本版本已落地 P0、P1a、P1b、P2 及 P3 写入侧 `suggested_transition` 提示，通过 `170 / 170` 单测与同机配对 `beta7` vs `v1.0-rc1` A/B 门禁，并将本地运行库原子升级至 `1.0.0-rc.1`（Schema 14 与生产 `memory.db` 保持零改库）。

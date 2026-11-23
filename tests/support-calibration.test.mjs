@@ -95,12 +95,16 @@ test('rc1 multi-record joint coverage elevates page_support without inflating we
   try {
     const a = await publish(s, record(project, {title:'GatewayA 故障分析', content:'GatewayA 在 Linux 服务器启动异常，记录服务启动故障原因。'}));
     const b = await publish(s, record(project, {title:'GatewayB 一键修复', content:'GatewayB 的修复脚本完成发布并用于线上启动修复。'}));
+    const trailing = await publish(s, record(project, {title:'Linux 运维手册摘要', content:'服务器日常巡检流程及磁盘空间检查步骤说明。'}));
+    const rawImport = await publish(s, record(project, {title:'Codex · Raw Memories / Thread x', tags:['codex-memory', 'historical-source'], content:'GatewayB 历史聊天日志片段：线上启动修复备注。'}));
     const page = await s.recall({query:'GatewayA GatewayB 服务启动故障与线上修复', mode:'focused', view:'evidence', limit:5, debug:true});
     assert.equal(page.evidence_status, 'related_evidence');
     assert.equal(page.retrieval.page_support?.composition, 'multi_record');
     assert.equal(page.retrieval.page_support?.level, 'direct');
     const contributors = page.retrieval.page_support.contributors.map(c => c.id);
     assert.ok(contributors.includes(a.memory_id) && contributors.includes(b.memory_id));
+    assert.ok(!contributors.includes(trailing.memory_id), 'trailing non-contributing item should not be listed');
+    assert.ok(!contributors.includes(rawImport.memory_id), 'raw codex-memory import should not be synthesized into page_support');
     for (const item of page.items) {
       assert.equal(item.evidence_strength, 'weak');
       assert.equal(item.support?.level, 'partial');
@@ -108,6 +112,7 @@ test('rc1 multi-record joint coverage elevates page_support without inflating we
     const compactPage = await s.recall({query:'GatewayA GatewayB 服务启动故障与线上修复', mode:'focused', view:'evidence', detail:'compact', limit:5, debug:true});
     assert.equal(compactPage.evidence_status, 'related_evidence');
     assert.equal(compactPage.retrieval.page_support?.composition, 'multi_record');
+    assert.deepEqual(compactPage.retrieval.page_support.contributors, page.retrieval.page_support.contributors);
   } finally { s.close(); }
 });
 
@@ -139,6 +144,11 @@ test('rc1 exact_only zero-hit preflight skips query embedding and vector search'
     assert.equal(empty.diagnostics.query_embeddings, 0);
     assert.equal(empty.diagnostics.vector_queries, 0);
     assert.equal(empty.diagnostics.ranking_chunk_rows_read, 0);
+    const chunksGraph = await s.recall({query:'/Users/missing/nonexistent/settings.json', mode:'focused', view:'chunks', detail:'compact', exact_only:true, graph:true, debug:true});
+    assert.ok(chunksGraph.warnings.includes('GRAPH_DISABLED'));
+    assert.equal(chunksGraph.retrieval.graph?.reason, 'GRAPH_DISABLED');
+    assert.equal(chunksGraph.retrieval.detail, undefined);
+    assert.equal(queryEmbeds, 0);
     const present = await s.recall({query:'/etc/existing/app.conf', mode:'focused', view:'evidence', exact_only:true, debug:true});
     assert.equal(present.items.length, 1);
     assert.equal(queryEmbeds, 1);
@@ -149,12 +159,20 @@ test('rc1 propose marks supersede/correct suggestion for matching title or expli
   const {service:s,project} = await setup(); s.encoder = encoder;
   try {
     const prev = await publish(s, record(project, {title:'作业材料打包位置约定', content:'2026-11-10 打包汇总，原文件保留原位未删除。'}));
-    const proposal = await s.propose({
-      request_id: randomUUID(),
-      record: record(project, {title:'作业材料打包位置约定', content:'2026-11-10 按用户要求删除原文件，本条更新此前同主题记录：原文件已不再保留。'})
-    });
+    const unrelated = await publish(s, record(project, {title:'完全不相关的气象脚本备忘', content:'2026-11-10 每日气象雷达图像归档路径记录。'}));
+    const nextRecord = record(project, {title:'作业材料打包位置约定', content:'2026-11-10 按用户要求删除原文件，本条更新此前同主题记录：原文件已不再保留。'});
+    const preview = await s.admissionPreview({intent:'reusable', suggestions: true, candidate:{request_id: randomUUID(), record:nextRecord}});
+    const previewMatch = preview.suggestions?.find(c => c.memory_id === prev.memory_id);
+    assert.equal(previewMatch?.suggested_transition, 'supersede');
+    const proposal = await s.propose({request_id: randomUUID(), record: nextRecord});
     const match = proposal.similar_candidates.find(c => c.memory_id === prev.memory_id);
     assert.ok(match, 'should find previous record in similar_candidates');
     assert.equal(match.suggested_transition, 'supersede');
+    const noiseProposal = await s.propose({
+      request_id: randomUUID(),
+      record: record(project, {title:'独立视频转码参数', content:'本条更新此前关于转码参数设定的个人笔记，只涉及音频比特率。'})
+    });
+    const unrelatedMatch = noiseProposal.similar_candidates.find(c => c.memory_id === unrelated.memory_id);
+    assert.equal(unrelatedMatch?.suggested_transition, undefined);
   } finally { s.close(); }
 });

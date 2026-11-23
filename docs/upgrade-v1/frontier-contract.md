@@ -200,3 +200,12 @@ The six frozen families and the real-BGE before/after results are in
 [44747471987](https://github.com/logex-linux/shared-agent-memory/actions/runs/44747471987)
 passed `npm ci`, model download, 165 tests, the adaptive benchmark and the
 installer/CLI check on commit `b69e3a6`.
+
+## 1.0.0-rc.1 retrieval & write-hint refinements
+
+`1.0.0-rc.1` preserves Schema 14, existing 512-dimensional embeddings, and all
+individual `support.level` semantics while adding:
+
+- `detail=compact|full` on `view=evidence` (bounded to the initial `detail` for the lifetime of a cursor via `CURSOR_PAGE_OPTIONS_MISMATCH`).
+- `retrieval.page_support` (`composition: "multi_record"`, `contributors`) when complementary curated records in the same project/scope/environment and compatible `subject_id`/`context_key` jointly satisfy a focused query (excluding uncurated `codex-memory`/`historical-source`/`raw_memories` transcripts).
+- `RANKING_VERSION = "adaptive-v3-rc1"` and `SUPPORT_VERSION = "support-v3-page-joint"` on `am5` cursors, plus `exact_only` zero-hit identifier preflight and `suggested_transition` hints in `memory_propose` / `memory_admission_preview`. See `EVOLUTION_RFC.md` (170 passing tests).

@@ -246,8 +246,11 @@ export function pageSupportAssessment(
 ): PageSupport | undefined {
     const itemSubject = (item: any) => item.support?.subject_coverage ?? subjectById?.get(item.id) ?? 0;
     const itemState = (item: any) => item.answer_relevance?.state ?? stateById?.get(item.id) ?? 'unknown';
+    const itemTags = (item: any): string[] => item.tags ?? tagsById?.get(item.id) ?? [];
+    const rawImportTag = new Set(['codex-memory', 'historical-source', 'raw_memories']);
     const eligible = items.filter(item =>
         !item.recall_reason?.includes('background_only')
+        && !itemTags(item).some(tag => rawImportTag.has(tag))
         && item.applicability === 'current'
         && item.verification?.status !== 'disputed'
         && item.lifecycle !== 'quarantined'
@@ -264,16 +267,20 @@ export function pageSupportAssessment(
 
     const groups = new Map<string, any[]>();
     for (const item of eligible) {
-        const key = `${item.project_id ?? 'global'}|${item.scope}|${item.subject_id ?? ''}|${item.context_key ?? ''}|${JSON.stringify(item.valid_for ?? {})}`;
+        const key = `${item.project_id ?? 'global'}|${item.scope}|${item.valid_for?.branch ?? ''}|${item.valid_for?.commit ?? ''}|${item.valid_for?.environment ?? ''}`;
         const list = groups.get(key) ?? [];
         list.push(item);
         groups.set(key, list);
     }
 
-    let bestDirect: PageSupport | undefined;
-    for (const group of groups.values()) {
-        if (group.length < 2) continue;
-        const combinedText = group.map(item => {
+    const compatibleSubjectContext = (chosen: any[], candidate: any) =>
+        !chosen.some(s =>
+            (s.subject_id && candidate.subject_id && s.subject_id !== candidate.subject_id)
+            || (s.context_key && candidate.context_key && s.context_key !== candidate.context_key)
+        );
+
+    const evaluateGroup = (subset: any[]) => {
+        const combinedText = subset.map(item => {
             const tags = item.tags ?? tagsById?.get(item.id) ?? [];
             return [item.title, tags.join(' '), item.content].filter(Boolean).join('\n');
         }).join('\n');
@@ -287,27 +294,72 @@ export function pageSupportAssessment(
         const subjectCoverage = requirements.subject.length
             ? requirements.subject.filter(t => words.has(t)).length / requirements.subject.length
             : 1;
-        const maxItemSubject = Math.max(0, ...group.map(item => itemSubject(item)));
-
+        const maxItemSubject = Math.max(0, ...subset.map(item => itemSubject(item)));
         const isDirect = entitiesCovered === entitiesRequired
             && relationCovered
             && qualifiersCovered === qualifiersRequired
             && answerCovered
             && maxItemSubject >= 0.50
             && (subjectCoverage >= 0.60 || (entitiesRequired >= 2 && subjectCoverage >= 0.33));
+        return { entitiesRequired, entitiesCovered, relationCovered, qualifiersRequired, qualifiersCovered, answerCovered, subjectCoverage, isDirect };
+    };
 
-        if (!isDirect) continue;
+    let bestDirect: PageSupport | undefined;
+    for (const group of groups.values()) {
+        if (group.length < 2) continue;
+        const coveredEntities = new Set<number>();
+        const coveredRelations = new Set<number>();
+        const coveredQualifiers = new Set<number>();
+        const coveredSubject = new Set<string>();
+        let answerCovered = requirements.answer === 'unknown' || requirements.answer === 'choice';
+        const selected: any[] = [];
+        const itemMetrics = group.map(item => {
+            const tags = item.tags ?? tagsById?.get(item.id) ?? [];
+            const text = [item.title, tags.join(' '), item.content].filter(Boolean).join('\n');
+            const words = new Set(terms(text));
+            const entHits = requirements.entities.flatMap((entity, idx) => entity.anyOf.some(value => mentions(text, value)) ? [idx] : []);
+            const relHits = requirements.relations.flatMap((rule, idx) => rule.test.test(text) ? [idx] : []);
+            const qualHits = requirements.qualifiers.flatMap((qualifier, idx) => qualifier.anyOf.some(value => mentions(text, value)) ? [idx] : []);
+            const subjHits = requirements.subject.filter(t => words.has(t));
+            const ansHit = !answerCovered && answerSatisfied(requirements.answer, text);
+            return { item, entHits, relHits, qualHits, subjHits, ansHit };
+        });
+
+        for (const entry of itemMetrics) {
+            if (!compatibleSubjectContext(selected, entry.item)) continue;
+            const addsNew = selected.length === 0
+                || entry.entHits.some(idx => !coveredEntities.has(idx))
+                || entry.relHits.some(idx => !coveredRelations.has(idx))
+                || entry.qualHits.some(idx => !coveredQualifiers.has(idx))
+                || entry.subjHits.some(t => !coveredSubject.has(t))
+                || (!answerCovered && entry.ansHit);
+            if (!addsNew) continue;
+            selected.push(entry.item);
+            for (const idx of entry.entHits) coveredEntities.add(idx);
+            for (const idx of entry.relHits) coveredRelations.add(idx);
+            for (const idx of entry.qualHits) coveredQualifiers.add(idx);
+            for (const t of entry.subjHits) coveredSubject.add(t);
+            if (entry.ansHit) answerCovered = true;
+            if (selected.length >= 2 && evaluateGroup(selected).isDirect) break;
+        }
+        if (selected.length === 1) {
+            const corroborator = itemMetrics.find(entry => !selected.includes(entry.item) && compatibleSubjectContext(selected, entry.item) && (entry.entHits.length > 0 || entry.subjHits.length >= 2));
+            if (corroborator) selected.push(corroborator.item);
+        }
+        if (selected.length < 2) continue;
+        const evalResult = evaluateGroup(selected);
+        if (!evalResult.isDirect) continue;
 
         const candidate: PageSupport = {
             composition: 'multi_record',
             level: 'direct',
-            contributors: group.map(item => ({ id: item.id, revision: item.revision })),
-            subject_coverage: Number(subjectCoverage.toFixed(3)),
-            entities_covered: entitiesCovered,
-            entities_required: entitiesRequired,
-            relation_covered: relationCovered,
-            ...(qualifiersRequired ? { qualifiers_covered: qualifiersCovered, qualifiers_required: qualifiersRequired } : {}),
-            ...(!answerCovered ? { answer_covered: false } : {})
+            contributors: selected.map(item => ({ id: item.id, revision: item.revision })),
+            subject_coverage: Number(evalResult.subjectCoverage.toFixed(3)),
+            entities_covered: evalResult.entitiesCovered,
+            entities_required: evalResult.entitiesRequired,
+            relation_covered: evalResult.relationCovered,
+            ...(evalResult.qualifiersRequired ? { qualifiers_covered: evalResult.qualifiersCovered, qualifiers_required: evalResult.qualifiersRequired } : {}),
+            ...(!evalResult.answerCovered ? { answer_covered: false } : {})
         };
         if (!bestDirect || candidate.subject_coverage > bestDirect.subject_coverage)
             bestDirect = candidate;

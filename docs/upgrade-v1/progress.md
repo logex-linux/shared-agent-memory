@@ -150,3 +150,17 @@ Beta.7 was activated as `1.0.0-beta.7` on Schema 14 with commit
 up before the swap and remained at generation 583 with 460 records. The
 beta.7 candidate, beta.6 rollback runtime, evidence and CI report are under
 `~/.agents/backups/shared-agent-memory/beta7-stable-20261120/`.
+
+## 1.0.0-rc.1 self-evolution candidate
+
+Following a forensic probe of the 473-record Schema-14 library, 274 historical
+session logs, and a 32-query reviewed benchmark (`EVOLUTION_RFC.md`), `1.0.0-rc.1`
+keeps Schema 14 and all 752 existing 512-dimensional BGE vectors unchanged while
+shipping four targeted upgrades: optional `detail=compact` envelope reduction on
+`view=evidence`, conservative multi-record joint `retrieval.page_support`
+(`composition=multi_record` with minimal rank-ordered curated contributors and
+raw `codex-memory`/`historical-source`/`raw_memories` transcript exclusion),
+focused single-result contraction protection plus zero-patch minor version-line
+matching (`0.2.0` -> `v0.2`), an `exact_only` zero-hit identifier preflight, and
+advisory `suggested_transition` hints on `propose`/`admissionPreview`. The test
+suite now has 170 passing tests.
