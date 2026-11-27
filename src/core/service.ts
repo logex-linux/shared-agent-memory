@@ -28,7 +28,7 @@ import { appendAction, currentMaintenance, maintenancePath, parseMaintenance, pr
 import { cutoff, expires, pinned, pruneBody, retainedSourceKeys, versionCandidate } from '../memory/retention.js';
 import { MemoryError, applicability, hash, stable, configSchema, proposeSchema, recallSchema, commitSchema, forgetSchema, feedbackSchema,
   recordSchema, consolidationPreviewSchema, forgetPreviewSchema, projectAliasesSchema, reassignSchema,retentionSchema,proposalRenewSchema,
-  type Config, type Encoder, type MemoryRecord, type Chunk, type Ownership, type ProposeInput } from './contracts.js';
+  type AdmissionCandidateInput, type Config, type Encoder, type MemoryRecord, type Chunk, type Ownership, type ProposeInput } from './contracts.js';
 import { admissionSchema,browseSchema,classifySchema,contextPackSchema,inspectMemorySchema,taskOverrideSchema,type ViewScope } from './frontier-contracts.js';
 
 type Row=Ownership&{id:string;body:string;revision:number;status:string;created_at:string;verified_at:string;profile_id:string;content_hash:string;import_key:string|null;written_by:string};
@@ -36,9 +36,28 @@ type Project={id:string;name:string;aliases:string};
 const now=()=>new Date().toISOString();
 const blob=(v:Float32Array)=>Buffer.from(v.buffer,v.byteOffset,v.byteLength);
 const versionHead=(row:Row)=>({memory_id:row.id,revision:row.revision,content_hash:row.content_hash});
-const transitionPlan=(input:ProposeInput):TransitionPlan|undefined=>input.transition||input.expected_refs||input.relations
+const transitionPlan=(input:ProposeInput|AdmissionCandidateInput):TransitionPlan|undefined=>input.transition||input.expected_refs||input.relations
   ? {transition:input.transition,expected_refs:input.expected_refs,relations:input.relations,version_evolution:input.version_evolution}:undefined;
 const UPDATE_WORDING_RE=/本条更新此前|更新此前|取代.{0,15}旧|替代此前|不再保留|已废弃.{0,12}改用|\bsupersedes?\b|\breplaces?\s+(?:earlier|previous|old)\b/i;
+function suggestAction(
+  record:MemoryRecord,
+  candidateTitle:string,
+  candidateSubjectId:string|undefined,
+  candidateContextKey:string|undefined,
+  updateWording:boolean,
+  overlapMatch:boolean,
+): {suggested_action?:'supersede'|'update_revision';suggested_transition?:'supersede'} {
+  const sameTitle=candidateTitle.trim().toLowerCase()===record.title.trim().toLowerCase();
+  if(!sameTitle && !(updateWording && overlapMatch)) return {};
+  const canSupersede=updateWording
+    && Boolean(candidateSubjectId?.trim())
+    && Boolean(candidateContextKey?.trim())
+    && (!record.subject_id || record.subject_id===candidateSubjectId)
+    && (!record.context_key || record.context_key===candidateContextKey);
+  return canSupersede
+    ? {suggested_action:'supersede',suggested_transition:'supersede'}
+    : {suggested_action:'update_revision'};
+}
 
 export async function readConfig(path:string):Promise<Config> {
   const raw=JSON.parse(await readFile(path,'utf8'));
@@ -383,14 +402,14 @@ export class MemoryService {
   }
   private legacyIdentity(record:MemoryRecord,plan?:TransitionPlan) {
     if(!plan?.version_evolution?.adopt_legacy_identity)return undefined;
-    if(!record.subject_id||!record.context_key)throw new MemoryError('RULE_IDENTITY_REQUIRED');
+    if(!record.subject_id||!record.context_key)throw new MemoryError('RULE_IDENTITY_REQUIRED','RULE_IDENTITY_REQUIRED',{hint:'Adopted preference/decision records require non-empty subject_id and context_key (or omit decision_state / use kind=fact|lesson|procedure).'});
     return {subject_id:record.subject_id,context_key:record.context_key};
   }
   private readTransition(id:string) {
     const row=this.db.prepare('SELECT plan FROM proposal_transitions WHERE proposal_id=?').get(id);
     return row?String(row.plan):null;
   }
-  private prepareRevision(input:ProposeInput,supplied:object,plan:TransitionPlan|undefined,preview=false) {
+  private prepareRevision(input:ProposeInput|AdmissionCandidateInput,supplied:object,plan:TransitionPlan|undefined,preview=false) {
     if(!input.target_id)return;
     const {record}=input,target=this.find(input.target_id);
     if(target.status!=='active'||target.revision!==input.expected_revision)throw new MemoryError('VERSION_CONFLICT');
@@ -425,13 +444,12 @@ export class MemoryService {
       const generation=this.storage.generation(),plan=transitionPlan(candidate);
       const previous=this.prepareRevision(candidate,supplied,plan,true);
       const decision=admissionDecision(this.db,candidate,record,intent,previous);
-      const updateWording=UPDATE_WORDING_RE.test(record.content),normalizedTitle=record.title.trim().toLowerCase();
+      const updateWording=UPDATE_WORDING_RE.test(record.content);
       const comparable=analogues?.generation===before&&before===generation
-        ? analogues.items.filter((item:any)=>sameOwnership(item,record))
+        ? analogues.items.filter((item:any)=>item.id!==candidate.target_id&&sameOwnership(item,record))
           .map((item:any)=>{
-            const sameTitle=String(item.title??'').trim().toLowerCase()===normalizedTitle;
-            const transition=sameTitle||(updateWording&&item.evidence_strength==='supported')?(updateWording?'supersede':'correct'):undefined;
-            return {memory_id:item.id,revision:item.revision,evidence_strength:item.evidence_strength,...(transition&&{suggested_transition:transition})};
+            const suggestion=suggestAction(record,String(item.title??''),item.subject_id,item.context_key,updateWording,item.evidence_strength==='supported');
+            return {memory_id:item.id,revision:item.revision,evidence_strength:item.evidence_strength,...suggestion};
           }):undefined;
       const {ready,...details}=decision;
       const result={...details,generation,policy:ADMISSION_POLICY,advisory:true,
@@ -454,9 +472,12 @@ export class MemoryService {
       if(blockers.length)return {...result,required_operations,blockers};
       const refs=[...(candidate.target_id?[{memory_id:candidate.target_id,revision:candidate.expected_revision!}]:[]),
         ...candidate.expected_refs??[],...record.derived_from,...decision.related];
+      const identity=decision.identity?{scope:record.scope,project_id:record.project_id,
+        subject_id:decision.identity.subject_id,context_key:decision.identity.context_key,
+        related_ids:decision.related.map(r=>r.memory_id).sort()}:undefined;
       const admission_id=randomUUID(),state=QueryState.open(this.db,this.config);
       const until=state.saveLease('admission',admission_id,authority(this.config,this.db),generation,
-        JSON.stringify({policy:ADMISSION_POLICY,digest,refs}),Date.now()+600_000);
+        JSON.stringify({policy:ADMISSION_POLICY,digest,refs,...(identity&&{identity})}),Date.now()+600_000);
       return {...result,required_operations,admission_id,expires_at:new Date(until).toISOString()};
     });
   }
@@ -582,24 +603,25 @@ export class MemoryService {
         SELECT f.memory_id,bm25(chunk_fts) rank FROM chunk_fts f
         JOIN memory_chunks c ON c.id=f.chunk_id AND c.memory_id=f.memory_id
         JOIN memories m ON m.id=c.memory_id AND m.revision=c.revision AND m.profile_id=c.profile_id
-        WHERE chunk_fts MATCH ? AND m.status='active' AND m.scope=? AND m.project_id IS ?
+        WHERE chunk_fts MATCH ? AND m.status='active' AND m.scope=? AND m.project_id IS ? AND (? IS NULL OR m.id<>?)
       ), best AS (
         SELECT memory_id,min(rank) rank FROM matches GROUP BY memory_id ORDER BY rank,memory_id LIMIT 20
       ) SELECT m.id,m.revision,m.body FROM best JOIN memories m ON m.id=best.memory_id ORDER BY best.rank,m.id`)
-        .all(similarQuery,record.scope,record.project_id) as any[]:[];
+        .all(similarQuery,record.scope,record.project_id,input.target_id??null,input.target_id??null) as any[]:[];
       const words=new Set(terms(record.title+' '+record.content));
       const updateWording=UPDATE_WORDING_RE.test(record.content);
       const normalizedTitle=record.title.trim().toLowerCase();
       const titleTerms=new Set(terms(record.title));
       const similar=candidates.map(x=>{
-        const parsed=JSON.parse(x.body);
+        const parsed=JSON.parse(x.body) as MemoryRecord;
         const candidateTitle=String(parsed.title??'');
         const sameTitle=candidateTitle.trim().toLowerCase()===normalizedTitle;
         const overlap=terms(candidateTitle+' '+parsed.content).filter(w=>words.has(w)).length;
         const titleOverlap=terms(candidateTitle).filter(w=>titleTerms.has(w)).length;
-        const transition=sameTitle||(updateWording&&overlap>=3&&titleOverlap>=1)?(updateWording?'supersede' as const:'correct' as const):undefined;
-        return {memory_id:x.id,revision:x.revision,overlap,sameTitle,...(transition&&{suggested_transition:transition})};
+        const suggestion=suggestAction(record,candidateTitle,parsed.subject_id,parsed.context_key,updateWording,overlap>=3&&titleOverlap>=1);
+        return {memory_id:x.id,revision:x.revision,overlap,sameTitle,...suggestion};
       }).filter(x=>x.overlap>=3||x.sameTitle).sort((a,b)=>b.overlap-a.overlap).slice(0,5).map(({sameTitle:_,...rest})=>rest);
+      this.expirePendingProposals({connection_id:this.config.connection_id,scope:record.scope,project_id:record.project_id});
       const id=randomUUID();
       const regular=expires(this.config.retention.proposal_days);
       const expires_at=admissionExpires?new Date(Math.min(admissionExpires,Date.parse(regular))).toISOString():regular;
@@ -920,7 +942,28 @@ export class MemoryService {
     const cache=QueryState.open(this.db,this.config);
     try{if(maintenance){cache.begin();try{cache.cleanup();cache.commit();}catch(e){cache.rollback();throw e;}cache.checkpoint();}return cache.inspect();}finally{cache.close();}
   }
-  async maintenance() {this.permission('manage');return {...await this.maintain(),query_cache:this.cache(true)};}
+  private expirePendingProposals(scopeFilter?:{connection_id:string;scope:string;project_id:string|null}) {
+    const current=now();
+    let rows:{id:string}[];
+    if(scopeFilter) {
+      rows=this.db.prepare(`SELECT id FROM proposals
+        WHERE status='pending' AND connection_id=? AND scope=? AND project_id IS ? AND julianday(expires_at)<=julianday(?)`)
+        .all(scopeFilter.connection_id,scopeFilter.scope,scopeFilter.project_id,current) as {id:string}[];
+    } else {
+      const canRead=(owner:Ownership)=>owner.scope==='global'?this.config.allow_global:
+        this.config.all_projects||this.config.allowed_projects.includes(owner.project_id!);
+      rows=(this.db.prepare(`SELECT id,project_id,scope FROM proposals
+        WHERE status='pending' AND julianday(expires_at)<=julianday(?)`)
+        .all(current) as (Ownership&{id:string})[]).filter(canRead);
+    }
+    for(const row of rows)this.clearProposal(row.id,'expired');
+    return rows.length;
+  }
+  async maintenance() {
+    this.permission('manage');
+    const expired_proposals_cleared=this.storage.transaction(()=>this.expirePendingProposals());
+    return {...await this.maintain(),expired_proposals_cleared,query_cache:this.cache(true)};
+  }
   private async maintain() {
     const errors:string[]=[];
     // Serialize filesystem maintenance with exporters/forgetters; no asynchronous gap.

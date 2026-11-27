@@ -366,3 +366,32 @@ for(const action of ['reassign','forget','retention','commit'])test(action+' sur
     verify(read);
   } finally {read?.close();s.close();}
 });
+
+test('rc2 expires stale pending proposals on propose for same connection/scope and on maintenance',async()=>{
+  const {service:s,config,project,other}=await setupFake();
+  const rival=new MemoryService({...config,connection_id:'other-connection'},fake);
+  try {
+    const pOwn=await propose(s,sameFixture(project,'own expired proposal'));
+    const pOtherProj=await propose(s,sameFixture(other,'other project expired proposal'));
+    const pRival=await propose(rival,sameFixture(project,'rival expired proposal'));
+    const pFresh=await propose(s,sameFixture(project,'fresh still pending'));
+    for(const p of [pOwn,pOtherProj,pRival])
+      s.db.prepare('UPDATE proposals SET expires_at=? WHERE id=?').run(oldTime,p.proposal_id);
+
+    // New propose on same connection+project clears only own expired pending proposal in same scope
+    await propose(s,sameFixture(project,'trigger cleanup'));
+    assert.equal(s.db.prepare('SELECT status,body FROM proposals WHERE id=?').get(pOwn.proposal_id).status,'expired');
+    noBody(s,pOwn.proposal_id);
+    assert.equal(s.db.prepare('SELECT status FROM proposals WHERE id=?').get(pOtherProj.proposal_id).status,'pending');
+    assert.equal(s.db.prepare('SELECT status FROM proposals WHERE id=?').get(pRival.proposal_id).status,'pending');
+    assert.equal(s.db.prepare('SELECT status FROM proposals WHERE id=?').get(pFresh.proposal_id).status,'pending');
+    await assert.rejects(commit(s,pOwn),{code:'PROPOSAL_EXPIRED'});
+
+    // maintenance() clears all remaining accessible expired pending proposals
+    const m=await s.maintenance();
+    assert.equal(m.expired_proposals_cleared,2);
+    noBody(s,pOtherProj.proposal_id);
+    noBody(s,pRival.proposal_id);
+    assert.equal(s.db.prepare('SELECT status FROM proposals WHERE id=?').get(pFresh.proposal_id).status,'pending');
+  } finally {rival.close();s.close();}
+});

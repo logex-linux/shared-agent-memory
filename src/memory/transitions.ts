@@ -28,7 +28,7 @@ export function migrateRelations(db:DatabaseSync) {
 
 export function validateTransition(record:MemoryRecord, previous:MemoryRecord, type:TransitionPlan['transition'], evolution?:TransitionPlan['version_evolution']) {
   if (type!=='reinforce' && type!=='supersede' && type!=='branch') return;
-  if (!record.subject_id || record.subject_id!==previous.subject_id)throw new MemoryError('TRANSITION_SUBJECT_MISMATCH');
+  if (!record.subject_id || record.subject_id!==previous.subject_id)throw new MemoryError('TRANSITION_SUBJECT_MISMATCH','TRANSITION_SUBJECT_MISMATCH',{hint:'reinforce, supersede, and branch require matching non-empty subject_id (and context_key) on both records; to update a record without subject_id, pass target_id and expected_revision without transition.'});
   if ((previous.lifecycle??'current')!=='current' || (record.lifecycle??'current')!=='current')
     throw new MemoryError('TRANSITION_LIFECYCLE_CONFLICT');
   const contextPairs = [

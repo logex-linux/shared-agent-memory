@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { MemoryError, recordSchema, validSchema, decisionStateSchema, versionRefSchema } from '../core/contracts.js';
+import { MemoryError, isoDateTime, recordSchema, validSchema, decisionStateSchema, versionRefSchema } from '../core/contracts.js';
 import { recordHash } from './versions.js';
 
 export const LEGACY_VERSION_ARCHIVE = 'shared-agent-memory/versions-v1';
@@ -9,13 +9,13 @@ const versionSchema = z.object({
   revision:z.number().int().positive().safe(),
   body:z.string(),
   content_hash:digest,
-  recorded_at:z.string().datetime(),
+  recorded_at:isoDateTime,
   profile_id:z.string().min(1),
   written_by:z.string().min(1)
 }).strict();
 const context=z.object({
   valid_for:validSchema.strict().nullable(),
-  valid_time:z.object({valid_from:z.string().datetime().optional(),valid_to:z.string().datetime().optional()}).strict().nullable(),
+  valid_time:z.object({valid_from:isoDateTime.optional(),valid_to:isoDateTime.optional()}).strict().nullable(),
   decision_state:decisionStateSchema.nullable(),subject_id:z.string().max(256).nullable(),context_key:z.string().max(256).nullable()
 }).strict();
 const alias=z.discriminatedUnion('kind',[

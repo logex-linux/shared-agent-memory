@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -12,9 +13,16 @@ test('official SDK STDIO: schemas, instructions, cross-process updates, restart,
   let a=await connect('sdk-a'),b=await connect('sdk-b');
   async function call(client,name,args){const result=await client.callTool({name,arguments:args});assert.ok(!result.isError,JSON.stringify(result));return JSON.parse(result.content[0].text);}
   try{
+    const pkg=JSON.parse(readFileSync(new URL('../package.json',import.meta.url),'utf8'));
+    assert.equal(a.getServerVersion()?.version,pkg.version);
     const tools=(await a.listTools()).tools;
     assert.equal(tools.length,12);assert.ok(a.getInstructions().includes(project));
     assert.ok(!tools.find(t=>t.name==='memory_recall').inputSchema.required?.includes('project_id'));
+    const previewTool=tools.find(t=>t.name==='memory_admission_preview');
+    assert.ok(!previewTool.inputSchema.properties.candidate.required?.includes('request_id'));
+    const admission=await call(a,'memory_admission_preview',{candidate:{record:record(project,{title:'MCP preview without request_id',content:'Preview without dummy UUID succeeds cleanly.'})}});
+    assert.equal(admission.action,'new');
+    assert.ok(admission.admission_id);
     const p=await call(a,'memory_propose',{request_id:randomUUID(),record:record(project)});
     const m=await call(a,'memory_commit',{request_id:randomUUID(),proposal_id:p.proposal_id,expected_revision:0});
     let found=await call(b,'memory_recall',{query:'录屏授权为什么坏了'});assert.equal(found.items[0].id,m.memory_id);

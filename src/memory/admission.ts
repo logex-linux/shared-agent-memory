@@ -1,5 +1,5 @@
 import type {DatabaseSync} from 'node:sqlite';
-import {hash,MemoryError,type MemoryRecord,type ProposeInput} from '../core/contracts.js';
+import {hash,MemoryError,type AdmissionCandidateInput,type MemoryRecord,type ProposeInput} from '../core/contracts.js';
 import {authority,QueryState} from '../retrieval/state.js';
 import {resolveSubject} from './subjects.js';
 import {checkDuplicate,findExactDuplicate} from './writes.js';
@@ -9,13 +9,26 @@ export const ADMISSION_POLICY='frontier-admission-v1';
 export type AdmissionIntent='reusable'|'progress'|'receipt'|'temporary'|'correct'|'supersede'|'variant'|'derive';
 type Version={memory_id:string;revision:number};
 type Evidence=Version&{body:string};
+export type AdmissionIdentityBinding={scope:'project'|'global';project_id:string|null;subject_id:string;context_key:string;related_ids:string[]};
 
-export function admissionDigest(candidate:ProposeInput,rawRecord:object) {
-  const {request_id,admission_id,...material}=candidate;
-  return hash({material,fields:Object.keys(rawRecord).sort()});
+function stripUndefined(value:unknown):unknown {
+  if(Array.isArray(value))return value.map(stripUndefined);
+  if(value && typeof value==='object')
+    return Object.fromEntries(Object.entries(value).filter(([,v])=>v!==undefined).map(([k,v])=>[k,stripUndefined(v)]));
+  return value;
 }
 
-export function admissionDecision(db:DatabaseSync,input:ProposeInput,record:MemoryRecord,intent:AdmissionIntent,previous?:MemoryRecord) {
+export function admissionDigest(candidate:ProposeInput|AdmissionCandidateInput,rawRecord:object) {
+  const {request_id,admission_id,transition,...rest}=candidate;
+  const normalizedTransition=transition&&transition!=='new'?transition:undefined;
+  const material=stripUndefined({...rest,...(normalizedTransition?{transition:normalizedTransition}:{})});
+  const inherited_overrides=candidate.target_id
+    ? (['tags','valid_for','derived_from'] as const).filter(k=>Object.hasOwn(rawRecord,k)&&(rawRecord as any)[k]!==undefined)
+    : [];
+  return hash({material,inherited_overrides});
+}
+
+export function admissionDecision(db:DatabaseSync,input:ProposeInput|AdmissionCandidateInput,record:MemoryRecord,intent:AdmissionIntent,previous?:MemoryRecord) {
   const identity=record.subject_id&&record.context_key?resolveSubject(db,record,record.subject_id,record.context_key):null;
   const related:Evidence[]=identity?db.prepare(`SELECT i.memory_id,i.revision,m.body
     FROM subject_claims i JOIN memories m ON m.id=i.memory_id
@@ -66,14 +79,23 @@ export function admissionDecision(db:DatabaseSync,input:ProposeInput,record:Memo
     :decision('new','independent_claim',true);
 }
 
-type Binding={policy:string;digest:string;refs:Version[]};
-export function checkAdmission(db:DatabaseSync,state:QueryState,config:Parameters<typeof authority>[0],generation:number,id:string,digest?:string) {
+type Binding={policy:string;digest:string;refs:Version[];identity?:AdmissionIdentityBinding};
+export function checkAdmission(db:DatabaseSync,state:QueryState,config:Parameters<typeof authority>[0],_generation:number,id:string,digest?:string) {
   const lease=state.lease('admission',id,authority(config,db));
   if(!lease)throw new MemoryError('ADMISSION_EXPIRED_OR_UNAVAILABLE');
   const binding=JSON.parse(lease.payload) as Binding;
-  if(binding.policy!==ADMISSION_POLICY||lease.generation!==generation)throw new MemoryError('ADMISSION_STALE');
+  if(binding.policy!==ADMISSION_POLICY)throw new MemoryError('ADMISSION_STALE');
   if(digest!==undefined && binding.digest!==digest)throw new MemoryError('ADMISSION_CANDIDATE_MISMATCH');
   const head=db.prepare("SELECT revision FROM memories WHERE id=? AND status='active'");
   for(const ref of binding.refs)if(head.get(ref.memory_id)?.revision!==ref.revision)throw new MemoryError('ADMISSION_STALE');
+  if(binding.identity) {
+    const {scope,project_id,subject_id,context_key,related_ids}=binding.identity;
+    if(resolveSubject(db,{scope,project_id},subject_id,context_key).match==='alias')throw new MemoryError('ADMISSION_STALE');
+    const currentIds=(db.prepare(`SELECT memory_id FROM subject_claims
+      WHERE scope=? AND project_id IS ? AND subject_id=? AND context_key=? AND lifecycle='current'
+      ORDER BY memory_id`).all(scope,project_id,subject_id,context_key) as {memory_id:string}[]).map(r=>r.memory_id);
+    if(currentIds.length!==related_ids.length || currentIds.some((cid,i)=>cid!==related_ids[i]))
+      throw new MemoryError('ADMISSION_STALE');
+  }
   return lease.expires;
 }

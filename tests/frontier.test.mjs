@@ -332,3 +332,61 @@ test('an old schema backup reconciles erasure before rebuilding a catalog',async
     assert.equal(recovery.check().projection_mismatch.n,0);
   }finally{recovery.close();s.close();}
 });
+
+test('rc2 admission accepts omitted preview request_id, normalizes default fields, tolerates unrelated commits, and blocks same-subject conflicts',async()=>{
+  const {service:s,project}=await setupFake();
+  try {
+    const r=record(project,{kind:'fact',title:'Offset and admission fixture',content:'Initial claim for admission normalization.'});
+    delete r.tags;
+    const preview=await s.admissionPreview({candidate:{record:r}});
+    assert.equal(preview.action,'new');
+    assert.ok(preview.admission_id);
+    // Adding transition:'new' and explicit tags:[] on new record matches digest
+    const draft=await s.propose({request_id:randomUUID(),admission_id:preview.admission_id,transition:'new',record:{...r,tags:[]}});
+    // Unrelated concurrent commit advances generation without invalidating admission_id
+    await publish(s,record(project,{kind:'fact',title:'Unrelated concurrent record',content:'Independent fact advancing generation.'}));
+    const committed=await commit(s,draft);
+    assert.equal(committed.revision,1);
+
+    // On updates, omitting vs clearing tags:[] must still mismatch due to inheritance semantics
+    const updateBase=record(project,{kind:'fact',title:'Update tag override check',content:'Original body.',tags:['keep-tag']});
+    const m=await publish(s,updateBase);
+    const updPreview=await s.admissionPreview({candidate:{target_id:m.memory_id,expected_revision:1,record:{...updateBase,content:'Edited body.',tags:[]}}});
+    const omitTags={...updateBase,content:'Edited body.'};
+    delete omitTags.tags;
+    await assert.rejects(s.propose({request_id:randomUUID(),admission_id:updPreview.admission_id,target_id:m.memory_id,expected_revision:1,record:omitTags}),{code:'ADMISSION_CANDIDATE_MISMATCH'});
+
+    // Same (subject_id, context_key) concurrent commit MUST mark admission stale
+    const ruleA=pref(project,'Rule A version 1.',{subject_id:'concurrent.rule',context_key:'prod',decision_state:'proposed'});
+    const ruleB=pref(project,'Rule B version 1.',{subject_id:'concurrent.rule',context_key:'prod',decision_state:'proposed'});
+    const pRule=await s.admissionPreview({candidate:{record:ruleA}});
+    const dRule=await s.propose({request_id:randomUUID(),admission_id:pRule.admission_id,record:ruleA});
+    await publish(s,ruleB);
+    await assert.rejects(commit(s,dRule),{code:'ADMISSION_STALE'});
+  } finally {s.close();}
+});
+
+test('rc2 accepts ISO-8601 timezone offsets and returns actionable rule/transition hints',async()=>{
+  const {service:s,project}=await setupFake();
+  try {
+    const offsetRecord=record(project,{
+      kind:'fact',title:'Timezone offset fixture',content:'Valid during CST business window.',
+      sources:[{source_type:'user',uri:'codex://thread/tz',locator:'offset timestamp',revision_ref:'v1',checked_at:'2026-11-22T08:00:00+08:00'}],
+      valid_for:{expires_at:'2099-01-01T08:00:00+08:00'},
+      valid_time:{valid_from:'2026-11-22T00:00:00+08:00',valid_to:'2026-12-22T00:00:00+08:00'}
+    });
+    const saved=await publish(s,offsetRecord);
+    assert.equal((await s.recall({ids:[saved.memory_id],as_of:'2026-11-21T15:59:59+00:00'})).items.length,0);
+    assert.equal((await s.recall({ids:[saved.memory_id],as_of:'2026-11-21T16:00:00+00:00'})).items[0].id,saved.memory_id);
+
+    await assert.rejects(
+      s.propose({request_id:randomUUID(),record:record(project,{kind:'preference',decision_state:'adopted',title:'Missing subject rule',content:'Needs identity.'})}),
+      err=>err.code==='RULE_IDENTITY_REQUIRED'&&Boolean(err.details?.hint?.includes('subject_id'))
+    );
+    const legacy=await publish(s,record(project,{kind:'fact',title:'Legacy record without subject',content:'Legacy content.'}));
+    await assert.rejects(
+      s.propose({request_id:randomUUID(),transition:'supersede',expected_refs:[ref(legacy)],record:record(project,{kind:'fact',subject_id:'sub.x',context_key:'ctx.x',valid_time:{valid_from:'2026-11-22T00:00:00+08:00'}})}),
+      err=>err.code==='TRANSITION_SUBJECT_MISMATCH'&&Boolean(err.details?.hint?.includes('without transition'))
+    );
+  } finally {s.close();}
+});

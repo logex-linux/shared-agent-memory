@@ -11,7 +11,7 @@ export function checkCurrentRule(db:DatabaseSync,record:MemoryRecord,except:stri
   if(!record.subject_id?.trim()||!record.context_key?.trim()) {
     if(previouslyAdopted?.decision_state==='adopted' && previouslyAdopted.kind===record.kind &&
       previouslyAdopted.subject_id===record.subject_id && previouslyAdopted.context_key===record.context_key)return;
-    throw new MemoryError('RULE_IDENTITY_REQUIRED');
+    throw new MemoryError('RULE_IDENTITY_REQUIRED','RULE_IDENTITY_REQUIRED',{hint:'Adopted preference/decision records require non-empty subject_id and context_key (or omit decision_state / use kind=fact|lesson|procedure).'});
   }
   if(record.subject_id!==record.subject_id.trim()||record.context_key!==record.context_key.trim())
     throw new MemoryError('RULE_IDENTITY_INVALID');

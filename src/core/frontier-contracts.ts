@@ -1,5 +1,5 @@
 import {z} from 'zod';
-import {ownershipSchema,planHashSchema,proposeSchema,recallSchema,validSchema,versionRefSchema} from './contracts.js';
+import {admissionCandidateSchema,isoDateTime,ownershipSchema,planHashSchema,recallSchema,validSchema,versionRefSchema} from './contracts.js';
 
 const name=z.string().trim().min(1).max(256);
 export const taskIdSchema=z.string().uuid();
@@ -12,7 +12,7 @@ export const taskOverrideSchema=z.object({
 }).strict();
 
 export const admissionSchema=z.object({
-  candidate:proposeSchema,
+  candidate:admissionCandidateSchema,
   intent:z.enum(['reusable','progress','receipt','temporary','correct','supersede','variant','derive']).default('reusable'),
   suggestions:z.boolean().default(false)
 }).strict();
@@ -24,7 +24,7 @@ export const contextPackSchema=z.object({
 export const viewScopeSchema=z.object({
   project_id:z.string().uuid().optional(),include_global:z.boolean().optional(),
   context:validSchema.omit({expires_at:true}).default({}),
-  as_of:z.string().datetime().optional(),task_id:taskIdSchema.optional(),
+  as_of:isoDateTime.optional(),task_id:taskIdSchema.optional(),
   exclude_ids:z.array(z.string().uuid()).max(64).optional()
 }).strict();
 export const browseSchema=viewScopeSchema.extend({

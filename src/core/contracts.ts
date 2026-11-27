@@ -2,8 +2,9 @@ import { z } from 'zod';
 import { createHash } from 'node:crypto';
 
 export class MemoryError extends Error {
-  constructor(public code: string, message = code, public details?: {required_operation:string;hint:string}) { super(message); }
+  constructor(public code: string, message = code, public details?: {required_operation?:string;hint:string}) { super(message); }
 }
+export const isoDateTime = z.string().datetime({ offset: true });
 export const hash = (value: unknown) => createHash('sha256').update(typeof value === 'string' || value instanceof Uint8Array ? value : stable(value)).digest('hex');
 export function stable(value: unknown): string {
   if (Array.isArray(value)) return '[' + value.map(stable).join(',') + ']';
@@ -15,19 +16,19 @@ const request = z.string().uuid().describe('A fresh real UUID per tool operation
 export const sourceSchema = z.object({
   source_type: z.enum(['user', 'code', 'document', 'web', 'test']),
   uri: text(2048), locator: text(500), revision_ref: text(256),
-  checked_at: z.string().datetime().describe('Actual source-check time as an ISO 8601 UTC datetime, for example 2026-01-01T00:00:00.000Z; never use placeholder text.'), source_hash: z.string().regex(/^[a-f0-9]{64}$/).optional()
+  checked_at: isoDateTime.describe('Actual source-check time as an ISO 8601 datetime with Z or timezone offset, for example 2026-01-01T00:00:00.000Z or 2026-01-01T08:00:00+08:00; never use placeholder text.'), source_hash: z.string().regex(/^[a-f0-9]{64}$/).optional()
 }).strict();
 export const validSchema = z.object({
   branch: text(256).optional(), commit: text(128).optional(), environment: text(256).optional(),
-  expires_at: z.string().datetime().optional()
+  expires_at: isoDateTime.optional()
 }).strict();
 export const verificationSchema = z.object({
   method:text(300),summary:text(1000),
   status:z.enum(['unverified','verified','disputed']).default('unverified').describe('Use unverified for ordinary storage. verified requires the connection to have separate verify permission and review evidence; explicit user confirmation alone does not grant it.'),
   basis:z.enum(['source_claim','model_inference','user_confirmation','code_review','document_review']).default('source_claim').describe('Provenance basis, independent of verification status. user_confirmation may be stored with status=unverified.'),
-  evidence:text(2000).optional(),reviewer:text(256).optional(),reviewed_at:z.string().datetime().optional()
+  evidence:text(2000).optional(),reviewer:text(256).optional(),reviewed_at:isoDateTime.optional()
 }).strict();
-const eventTime = z.string().datetime().nullable().optional();
+const eventTime = isoDateTime.nullable().optional();
 const episodeSchema = z.object({
   conversation_ref:text(500).optional(), session_ref:text(500).optional(), event_ref:text(500).optional(),
   speaker:text(180).nullable().optional(), event_time:eventTime, context:text(500).optional()
@@ -100,7 +101,7 @@ export const consolidationPreviewSchema=z.object({
   title:text(180),claim:text(1000),kind:z.enum(['preference','fact','decision','procedure','lesson']),
   context:validSchema.omit({expires_at:true}).default({}),evidence:consolidationSchema
 }).strict();
-export const proposeSchema = z.object({ request_id: request, record: recordSchema,
+const proposeShape = { request_id: request, record: recordSchema,
   admission_id:z.string().uuid().optional().describe('Optional current admission receipt for this exact proposed write.'),
   target_id: z.string().uuid().optional(), expected_revision: z.number().int().positive().optional().describe('Updates only: current positive revision, together with target_id. For a new proposal omit both fields; revision 0 belongs to memory_commit.'),
   work_directory: z.string().startsWith('/').max(4096).optional().describe('Actual working directory for a project write. Resolve it first with memory_resolve_project.'),
@@ -111,7 +112,9 @@ export const proposeSchema = z.object({ request_id: request, record: recordSchem
     from_commit:text(128),to_commit:text(128),sources:z.array(sourceSchema).min(2).max(12),
     adopt_legacy_identity:z.boolean().optional()
   }).strict().optional().describe('Explicit supersession across recorded code versions in the same context, backed by both revisions.')
-}).strict().superRefine((r,ctx) => {
+};
+const proposeBaseSchema = z.object(proposeShape).strict();
+const refinePropose = (r: { target_id?: string; expected_revision?: number; transition?: string; expected_refs?: { memory_id: string }[]; relations?: { target_id: string }[]; version_evolution?: unknown }, ctx: z.RefinementCtx) => {
   if (Boolean(r.target_id) !== Boolean(r.expected_revision)) ctx.addIssue({code:'custom', message:'target_id and expected_revision required together'});
   const refs=new Set(r.expected_refs?.map(ref=>ref.memory_id));
   if (refs.size!==(r.expected_refs?.length??0))
@@ -119,14 +122,17 @@ export const proposeSchema = z.object({ request_id: request, record: recordSchem
   if (r.relations?.some(relation=>!refs.has(relation.target_id)))
     ctx.addIssue({code:'custom',message:'every relation target requires an expected_refs revision'});
   if (r.transition==='quarantine' ? !r.target_id : Boolean(r.transition&&r.transition!=='supersede'&&r.target_id))
-    ctx.addIssue({code:'custom',message:'quarantine requires target_id; supersede accepts an existing or new successor'});
+    ctx.addIssue({code:'custom',message:'plain revision updates omit transition; quarantine requires target_id; supersede replaces a different record in expected_refs'});
   if (r.transition==='supersede' && r.target_id && refs.has(r.target_id))
     ctx.addIssue({code:'custom',message:'an existing successor cannot replace itself'});
   if(r.version_evolution&&r.transition!=='supersede')
     ctx.addIssue({code:'custom',message:'version_evolution requires supersede'});
   if (r.transition && ['reinforce','supersede','branch'].includes(r.transition) && !refs.size)
     ctx.addIssue({code:'custom',message:'reinforce, supersede and branch require expected_refs'});
-});
+};
+export const proposeSchema = proposeBaseSchema.superRefine(refinePropose);
+export const admissionCandidateSchema = z.object({ ...proposeShape, request_id: request.optional() }).strict().superRefine(refinePropose);
+export type AdmissionCandidateInput = z.infer<typeof admissionCandidateSchema>;
 export const commitSchema = z.object({ request_id: request, proposal_id: z.string().uuid(), expected_revision: z.number().int().nonnegative() }).strict();
 export const forgetPreviewSchema=z.object({memory_id:z.string().uuid(),expected_revision:z.number().int().positive()}).strict();
 export const forgetSchema=forgetPreviewSchema.extend({request_id:request,plan_hash:planHashSchema.optional()}).strict();
@@ -148,7 +154,7 @@ export const recallSchema = z.object({
   task_id:z.string().uuid().optional().describe('Bound task exclusions created from the current request. Continue using the same task ID for all reads.'),
   subject_id:text(256).optional(), context_key:text(256).optional(),
   graph:z.boolean().optional(),
-  as_of:z.string().datetime().optional(), include_history:z.boolean().optional(), decision_state:decisionStateSchema.optional(),
+  as_of:isoDateTime.optional(), include_history:z.boolean().optional(), decision_state:decisionStateSchema.optional(),
   project_id: z.string().uuid().optional(), include_global: z.boolean().optional(),
   context: validSchema.omit({expires_at:true}).default({}), limit: z.number().int().positive().safe().optional(),
   exact_only:z.boolean().default(false),token_budget:z.number().int().min(512).max(1000000).optional(),
