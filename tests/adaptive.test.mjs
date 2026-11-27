@@ -97,3 +97,20 @@ test('an oversized sourced record can resume with a larger page budget; expiry p
   s.db.prepare('UPDATE memory_search SET expires_at=? WHERE memory_id=?').run(new Date().toISOString().replace(/\.\d+Z$/,'Z'),m.memory_id);assert.equal((await s.recall({ids:[m.memory_id]})).items.length,0);
  }finally{s.close();}
 });
+
+test('auto mode cursors accept their resolved mode and equivalent offset as_of while rejecting opposite mode',async()=>{
+ const {service:s,project}=await setup();s.encoder=fake;
+ try{
+  for(let i=0;i<6;i++) await publish(s,record(project,{kind:'fact',title:'签名授权事实 '+i,content:'签名授权排错记录 '+i}));
+  const first=await s.recall({query:'签名授权 排错',mode:'auto',as_of:'2026-11-27T08:00:00+08:00',limit:2});
+  assert.equal(first.retrieval.mode,'focused');
+  await assert.rejects(s.recall({cursor:first.next_cursor,mode:'broad'}),{code:'CURSOR_QUERY_MISMATCH'});
+  const next=await s.recall({cursor:first.next_cursor,mode:'focused',as_of:'2026-11-27T00:00:00.000Z'});
+  assert.equal(next.items.length,2);
+  assert.ok(next.items.every(i=>!first.items.some(j=>j.id===i.id)));
+  const omitted=await s.recall({query:'签名授权 排错',limit:2});
+  assert.equal(omitted.retrieval.mode,'focused');
+  const omittedNext=await s.recall({cursor:omitted.next_cursor,mode:'focused'});
+  assert.equal(omittedNext.items.length,2);
+ }finally{s.close();}
+});

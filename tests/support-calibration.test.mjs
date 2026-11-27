@@ -155,24 +155,152 @@ test('rc1 exact_only zero-hit preflight skips query embedding and vector search'
   } finally { s.close(); }
 });
 
-test('rc1 propose marks supersede/correct suggestion for matching title or explicit update wording', async () => {
+test('rc2 propose and admissionPreview suggest update_revision vs supersede cleanly and exclude target_id', async () => {
   const {service:s,project} = await setup(); s.encoder = encoder;
   try {
     const prev = await publish(s, record(project, {title:'作业材料打包位置约定', content:'2026-11-10 打包汇总，原文件保留原位未删除。'}));
+    const structured = await publish(s, record(project, {title:'温度保存规则', subject_id:'storage.retention', context_key:'north', content:'北仓保留 30 天。'}));
     const unrelated = await publish(s, record(project, {title:'完全不相关的气象脚本备忘', content:'2026-11-10 每日气象雷达图像归档路径记录。'}));
-    const nextRecord = record(project, {title:'作业材料打包位置约定', content:'2026-11-10 按用户要求删除原文件，本条更新此前同主题记录：原文件已不再保留。'});
-    const preview = await s.admissionPreview({intent:'reusable', suggestions: true, candidate:{request_id: randomUUID(), record:nextRecord}});
-    const previewMatch = preview.suggestions?.find(c => c.memory_id === prev.memory_id);
-    assert.equal(previewMatch?.suggested_transition, 'supersede');
-    const proposal = await s.propose({request_id: randomUUID(), record: nextRecord});
-    const match = proposal.similar_candidates.find(c => c.memory_id === prev.memory_id);
-    assert.ok(match, 'should find previous record in similar_candidates');
-    assert.equal(match.suggested_transition, 'supersede');
+    const nextLegacy = record(project, {title:'作业材料打包位置约定', content:'2026-11-10 按用户要求删除原文件，本条更新此前同主题记录：原文件已不再保留。'});
+    const previewLegacy = await s.admissionPreview({intent:'reusable', suggestions: true, candidate:{record:nextLegacy}});
+    const previewLegacyMatch = previewLegacy.suggestions?.find(c => c.memory_id === prev.memory_id);
+    assert.equal(previewLegacyMatch?.suggested_action, 'update_revision');
+    assert.equal(previewLegacyMatch?.suggested_transition, undefined);
+    const proposalLegacy = await s.propose({request_id: randomUUID(), record: nextLegacy});
+    const matchLegacy = proposalLegacy.similar_candidates.find(c => c.memory_id === prev.memory_id);
+    assert.ok(matchLegacy, 'should find previous record in similar_candidates');
+    assert.equal(matchLegacy.suggested_action, 'update_revision');
+    assert.equal(matchLegacy.suggested_transition, undefined);
+
+    const sameTitleNoUpdate = record(project, {title:'温度保存规则', subject_id:'storage.retention', context_key:'north', content:'北仓补充记录：核查温度传感器校准时间。'});
+    const plainProp = await s.propose({request_id: randomUUID(), record: sameTitleNoUpdate});
+    const plainMatch = plainProp.similar_candidates.find(c => c.memory_id === structured.memory_id);
+    assert.equal(plainMatch?.suggested_action, 'update_revision');
+    assert.equal(plainMatch?.suggested_transition, undefined);
+
+    const nextStructured = record(project, {title:'温度保存规则', subject_id:'storage.retention', context_key:'north', content:'本条更新此前记录：北仓改为保留 45 天。'});
+    const previewStruct = await s.admissionPreview({intent:'reusable', suggestions: true, candidate:{record:nextStructured}});
+    const previewStructMatch = previewStruct.suggestions?.find(c => c.memory_id === structured.memory_id);
+    assert.equal(previewStructMatch?.suggested_action, 'supersede');
+    assert.equal(previewStructMatch?.suggested_transition, 'supersede');
+    const proposalStruct = await s.propose({request_id: randomUUID(), record: nextStructured});
+    const structMatch = proposalStruct.similar_candidates.find(c => c.memory_id === structured.memory_id);
+    assert.equal(structMatch?.suggested_action, 'supersede');
+    assert.equal(structMatch?.suggested_transition, 'supersede');
+
+    const updatePreview = await s.admissionPreview({intent:'reusable', suggestions:true, candidate:{target_id:structured.memory_id, expected_revision:1, record:nextStructured}});
+    assert.ok(!updatePreview.suggestions?.some(c => c.memory_id === structured.memory_id), 'suggestions must exclude target_id');
+    const updateProp = await s.propose({request_id:randomUUID(), target_id:structured.memory_id, expected_revision:1, record:nextStructured});
+    assert.ok(!updateProp.similar_candidates.some(c => c.memory_id === structured.memory_id), 'similar_candidates must exclude target_id');
+
     const noiseProposal = await s.propose({
       request_id: randomUUID(),
       record: record(project, {title:'独立视频转码参数', content:'本条更新此前关于转码参数设定的个人笔记，只涉及音频比特率。'})
     });
     const unrelatedMatch = noiseProposal.similar_candidates.find(c => c.memory_id === unrelated.memory_id);
+    assert.equal(unrelatedMatch?.suggested_action, undefined);
     assert.equal(unrelatedMatch?.suggested_transition, undefined);
+  } finally { s.close(); }
+});
+
+test('rc2 tight budget breaks after first truncated item without duplicate warnings or popped warning leaks', async () => {
+  const {service:s,project} = await setup(); s.encoder = encoder;
+  try {
+    await publish(s, record(project, {
+      title:'OmniFetch 架构说明',
+      content:'OmniFetch 架构设计说明：'.padEnd(260, 'A')
+    }));
+    await publish(s, record(project, {title:'无关背景记录', content:'OmniFetch 早期背景补充内容，不包含其他工具名。'}));
+    const page = await s.recall({query:'OmniFetch AlphaTool BetaTool 架构设计说明', mode:'focused', view:'evidence', limit:5, token_budget:550});
+    assert.equal(page.items.length, 1);
+    assert.equal(page.items[0].truncated, true);
+    assert.equal(page.warnings.filter(w => w === 'RESPONSE_BUDGET').length, 1);
+    assert.ok(!page.warnings.includes('EFFECTIVE_TIME_UNKNOWN'));
+
+    // Item 1 fits with known valid_time and full entities; item 2 exceeds budget and is popped -> no warning leaks
+    const cleanSetup = await setup(); cleanSetup.service.encoder = encoder;
+    try {
+      const validWindow = {valid_from:'2020-01-01T00:00:00Z', valid_to:'2099-01-01T00:00:00Z'};
+      await publish(cleanSetup.service, record(cleanSetup.project, {
+        title:'AlphaTool BetaTool 主文档',
+        content:'AlphaTool 与 BetaTool 核心流程与架构设计说明完整记录。',
+        valid_time: validWindow
+      }));
+      await publish(cleanSetup.service, record(cleanSetup.project, {
+        title:'AlphaTool 早期碎片',
+        content:'AlphaTool 早期背景说明。'
+      }));
+      const single = await cleanSetup.service.recall({query:'AlphaTool BetaTool 架构设计', mode:'focused', view:'evidence', limit:5, as_of:new Date().toISOString()});
+      const oneItemBytes = Buffer.byteLength(JSON.stringify({...single, items: single.items.slice(0, 1)}));
+      const popPage = await cleanSetup.service.recall({
+        query:'AlphaTool BetaTool 架构设计', mode:'focused', view:'evidence', limit:5,
+        as_of:new Date().toISOString(), max_bytes: Math.max(2048, oneItemBytes + 120)
+      });
+      assert.equal(popPage.items.length, 1);
+      assert.equal(popPage.warnings.filter(w => w === 'RESPONSE_BUDGET').length, 1);
+      assert.ok(!popPage.warnings.includes('REFERENCE_EVIDENCE_MISSING'));
+      assert.ok(!popPage.warnings.includes('EFFECTIVE_TIME_UNKNOWN'));
+    } finally { cleanSetup.service.close(); }
+
+    const hugeUri = 'test://blocked/' + 'y'.repeat(1500);
+    const blockedOnly = await setup(); blockedOnly.service.encoder = encoder;
+    try {
+      await publish(blockedOnly.service, record(blockedOnly.project, {
+        title:'BlockedItem 架构',
+        content:'BlockedItem 说明。',
+        sources:[{source_type:'test', uri:hugeUri, locator:'blocked', revision_ref:'v1', checked_at:'2026-11-22T00:00:00Z'}]
+      }));
+      const blocked = await blockedOnly.service.recall({query:'BlockedItem AlphaTool BetaTool 架构', mode:'focused', view:'evidence', limit:5, token_budget:512, max_bytes:2048, as_of:new Date().toISOString()});
+      assert.equal(blocked.empty_reason, 'item_exceeds_budget');
+      assert.equal(blocked.warnings.filter(w => w === 'RESPONSE_BUDGET').length, 1);
+      assert.ok(!blocked.warnings.includes('REFERENCE_EVIDENCE_MISSING'));
+      assert.ok(!blocked.warnings.includes('EFFECTIVE_TIME_UNKNOWN'));
+    } finally { blockedOnly.service.close(); }
+  } finally { s.close(); }
+});
+
+test('rc2 tight budget dropping page_support keeps evidence_status insufficient', async () => {
+  const {service:s,project} = await setup(); s.encoder = encoder;
+  try {
+    await publish(s, record(project, {title:'GatewayA 故障分析', content:'GatewayA 在 Linux 服务器启动异常，记录服务启动故障原因。'}));
+    await publish(s, record(project, {title:'GatewayB 一键修复', content:'GatewayB 的修复脚本完成发布并用于线上启动修复。'}));
+    const full = await s.recall({query:'GatewayA GatewayB 服务启动故障与线上修复', mode:'focused', view:'evidence', limit:5});
+    assert.equal(full.retrieval.page_support?.level, 'direct');
+    const fullBytes = Buffer.byteLength(JSON.stringify(full));
+    const tightMaxBytes = Math.max(2048, fullBytes - 40);
+    const tight = await s.recall({query:'GatewayA GatewayB 服务启动故障与线上修复', mode:'focused', view:'evidence', limit:5, max_bytes:tightMaxBytes});
+    assert.equal(tight.retrieval.page_support, undefined);
+    assert.equal(tight.evidence_status, 'insufficient');
+  } finally { s.close(); }
+});
+
+test('rc2 3-entity complementary records form page_support while single-record match and tags alone do not', async () => {
+  const {service:s,project} = await setup(); s.encoder = encoder;
+  try {
+    const a = await publish(s, record(project, {title:'AlphaService 社交平台', content:'AlphaService 负责社交平台与视频下载接入。'}));
+    const b = await publish(s, record(project, {title:'BetaEngine 海外引擎', content:'BetaEngine 负责海外引擎与视频下载，不含其他。'}));
+    const c = await publish(s, record(project, {title:'GammaWorker 支持范围', content:'GammaWorker 补充海外引擎与支持范围清单。'}));
+    const page = await s.recall({query:'AlphaService BetaEngine GammaWorker 社交平台 视频下载 海外引擎 支持范围', mode:'focused', view:'evidence', limit:5});
+    assert.equal(page.evidence_status, 'related_evidence');
+    assert.equal(page.retrieval.page_support?.composition, 'multi_record');
+    assert.equal(page.retrieval.page_support?.level, 'direct');
+    const contributors = page.retrieval.page_support.contributors.map(x => x.id);
+    assert.deepEqual(new Set(contributors), new Set([a.memory_id, b.memory_id, c.memory_id]));
+    assert.ok(page.items.every(item => item.support?.level === 'partial'));
+    assert.ok(page.items.every(item => item.recall_reason.includes('background_only')));
+
+    // Single record covers title+content requirements, plus a second record that adds nothing new -> no fake multi_record
+    const single = await publish(s, record(project, {title:'DeltaX 部署流程', content:'DeltaX 通过 CLI 部署并输出运行日志。'}));
+    const dup = await publish(s, record(project, {title:'DeltaX 运行日志备忘', content:'DeltaX 常规运行日志巡检说明。'}));
+    assert.ok(single.memory_id && dup.memory_id);
+    const noFake = await s.recall({query:'DeltaX 部署流程 CLI', mode:'focused', view:'evidence', limit:5});
+    assert.equal(noFake.retrieval.page_support, undefined);
+
+    // Un-delivered tags cannot synthesize page_support
+    await publish(s, record(project, {title:'EpsilonA 接入', content:'EpsilonA 接入流程说明。', tags:['EpsilonC']}));
+    await publish(s, record(project, {title:'EpsilonB 接入', content:'EpsilonB 接入流程说明。', tags:['EpsilonC']}));
+    const tagPage = await s.recall({query:'EpsilonA EpsilonB EpsilonC 接入流程', mode:'focused', view:'evidence', limit:5});
+    assert.equal(tagPage.retrieval.page_support, undefined);
+    assert.equal(tagPage.evidence_status, 'insufficient');
   } finally { s.close(); }
 });

@@ -247,9 +247,15 @@ export function pageSupportAssessment(
     const itemSubject = (item: any) => item.support?.subject_coverage ?? subjectById?.get(item.id) ?? 0;
     const itemState = (item: any) => item.answer_relevance?.state ?? stateById?.get(item.id) ?? 'unknown';
     const itemTags = (item: any): string[] => item.tags ?? tagsById?.get(item.id) ?? [];
+    const itemText = (item: any) => [item.title, item.content].filter(Boolean).join('\n');
+    const multiEntityEligible = (item: any) => {
+        if (requirements.entities.length < 3) return false;
+        const text = itemText(item);
+        return requirements.entities.some(entity => entity.anyOf.some(value => mentions(text, value)));
+    };
     const rawImportTag = new Set(['codex-memory', 'historical-source', 'raw_memories']);
     const eligible = items.filter(item =>
-        !item.recall_reason?.includes('background_only')
+        (!item.recall_reason?.includes('background_only') || multiEntityEligible(item))
         && !itemTags(item).some(tag => rawImportTag.has(tag))
         && item.applicability === 'current'
         && item.verification?.status !== 'disputed'
@@ -280,10 +286,7 @@ export function pageSupportAssessment(
         );
 
     const evaluateGroup = (subset: any[]) => {
-        const combinedText = subset.map(item => {
-            const tags = item.tags ?? tagsById?.get(item.id) ?? [];
-            return [item.title, tags.join(' '), item.content].filter(Boolean).join('\n');
-        }).join('\n');
+        const combinedText = subset.map(itemText).join('\n');
         const words = new Set(terms(combinedText));
         const entitiesRequired = requirements.entities.length;
         const entitiesCovered = requirements.entities.filter(entity => entity.anyOf.some(value => mentions(combinedText, value))).length;
@@ -314,8 +317,7 @@ export function pageSupportAssessment(
         let answerCovered = requirements.answer === 'unknown' || requirements.answer === 'choice';
         const selected: any[] = [];
         const itemMetrics = group.map(item => {
-            const tags = item.tags ?? tagsById?.get(item.id) ?? [];
-            const text = [item.title, tags.join(' '), item.content].filter(Boolean).join('\n');
+            const text = itemText(item);
             const words = new Set(terms(text));
             const entHits = requirements.entities.flatMap((entity, idx) => entity.anyOf.some(value => mentions(text, value)) ? [idx] : []);
             const relHits = requirements.relations.flatMap((rule, idx) => rule.test.test(text) ? [idx] : []);
@@ -341,10 +343,6 @@ export function pageSupportAssessment(
             for (const t of entry.subjHits) coveredSubject.add(t);
             if (entry.ansHit) answerCovered = true;
             if (selected.length >= 2 && evaluateGroup(selected).isDirect) break;
-        }
-        if (selected.length === 1) {
-            const corroborator = itemMetrics.find(entry => !selected.includes(entry.item) && compatibleSubjectContext(selected, entry.item) && (entry.entHits.length > 0 || entry.subjHits.length >= 2));
-            if (corroborator) selected.push(corroborator.item);
         }
         if (selected.length < 2) continue;
         const evalResult = evaluateGroup(selected);

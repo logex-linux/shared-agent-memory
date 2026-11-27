@@ -275,9 +275,17 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
             progress = parse(found.row.progress);
             effectiveAt=progress.effectiveAt??input.as_of??effectiveAt;
             warnings = progress.warnings;
-            for (const key of ['project_id', 'include_global', 'mode', 'as_of', 'include_history', 'decision_state', 'graph','subject_id','context_key','task_id'] as const)
+            for (const key of ['project_id', 'include_global', 'include_history', 'decision_state', 'graph','subject_id','context_key','task_id'] as const)
                 if (request[key] !== undefined && request[key] !== input[key])
                     throw new MemoryError('CURSOR_QUERY_MISMATCH');
+            if (request.mode !== undefined) {
+                const originalMode = input.mode ?? 'auto';
+                const modeMatches = request.mode === originalMode || (originalMode === 'auto' && request.mode === resolved);
+                if (!modeMatches)
+                    throw new MemoryError('CURSOR_QUERY_MISMATCH');
+            }
+            if (request.as_of !== undefined && (input.as_of === undefined || Date.parse(request.as_of) !== Date.parse(input.as_of)))
+                throw new MemoryError('CURSOR_QUERY_MISMATCH');
             if(request.exclude_ids!==undefined && hash(request.exclude_ids)!==hash(input.exclude_ids??[]))
                 throw new MemoryError('CURSOR_QUERY_MISMATCH');
             if (Object.keys(request.context).length && hash(request.context) !== hash(input.context))
@@ -850,6 +858,7 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 : { id, revision: row.revision, project_id: row.project_id, scope: row.scope, kind: body.kind, title: body.title, written_by: row.written_by, content: excerpts.map(e => e.text).join('\n…\n'), sources: body.sources, verification: parsedVerification, valid_for: body.valid_for ?? {}, applicability: requiresCheck ? 'requires_check' : 'current', evidence_strength: strength, tags: body.tags, record_updated_at: row.verified_at, excerpt: { start: excerpts[0]?.start ?? 0, end: excerpts.at(-1)?.end ?? 0 }, excerpts: excerpts.map(({ text, ...e }) => e), recall_reason: c?.reasons ?? [ref?'version':'id'], ...extendedMetadata(body) };
             if(ref&&(body.scope!==row.scope||body.project_id!==row.project_id))
                 item.recorded_ownership={scope:body.scope,project_id:body.project_id};
+            const prevWarnings = [...result.warnings];
             if (input.as_of) item.effective_time=unknownTime?'unknown':'matched';
             if (unknownTime && !result.warnings.includes('EFFECTIVE_TIME_UNKNOWN')) result.warnings.push('EFFECTIVE_TIME_UNKNOWN');
             if (ref) Object.assign(item,{recorded_at:row.recorded_at,current_revision:row.current_revision,history_start_revision:row.history_start_revision,
@@ -882,11 +891,12 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 Object.assign(item, { written_by: row.written_by, content_hash: row.content_hash, embedding_profile_id: row.profile_id, derived_from: body.derived_from, author_client: body.author_client, author_session: body.author_session, import_key: body.import_key, relevance: c ? { rrf: c.rrf, cosine: c.cosine, identifier_matches: c.exact } : undefined });
             result.items.push(item);
             if (!fits()) {
-                result.warnings.push('RESPONSE_BUDGET');
                 if (result.items.length > 1) {
                     result.items.pop();
+                    result.warnings = prevWarnings.includes('RESPONSE_BUDGET') ? prevWarnings : [...prevWarnings, 'RESPONSE_BUDGET'];
                     break;
                 }
+                if (!result.warnings.includes('RESPONSE_BUDGET')) result.warnings.push('RESPONSE_BUDGET');
                 // Truncate each actual segment; separator characters are not source offsets.
                 const shorten = (length: number) => { let remaining = length; const parts: any[] = []; for (const e of excerpts) {
                     if (remaining <= 0)
@@ -911,17 +921,24 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 }
                 if (!best) {
                     result.items.pop();
+                    result.warnings = prevWarnings.includes('RESPONSE_BUDGET') ? prevWarnings : [...prevWarnings, 'RESPONSE_BUDGET'];
                     result[request.versions?'blocked_versions':'blocked_ids'] = expansionRefs([key]);
                     blocked = true;
                     break;
                 }
                 shorten(best);
+                fitted.push(key);
+                break;
             }
             fitted.push(key);
         }
         if(expansion){
             const remaining=selected.filter(id=>!fitted.includes(id));
-            if(remaining.length){result[remainingKey]=expansionRefs(remaining);result.warnings.push(request.versions?'PARTIAL_VERSION_EXPANSION':'PARTIAL_ID_EXPANSION');}
+            if(remaining.length){
+                result[remainingKey]=expansionRefs(remaining);
+                const partialWarning=request.versions?'PARTIAL_VERSION_EXPANSION':'PARTIAL_ID_EXPANSION';
+                if(!result.warnings.includes(partialWarning))result.warnings.push(partialWarning);
+            }
             else delete result[remainingKey];
             plan.stop_reason=blocked?'item_exceeds_budget':remaining.length?'page_budget':'exhausted';
         }
@@ -949,8 +966,9 @@ export async function retrieve(ctx: Context, request: RecallInput, channel: 'hyb
                 if (!fits(128)) {
                     delete result.retrieval.page_support;
                     if (result.retrieval !== plan) delete plan.page_support;
+                } else {
+                    hasSupported = true;
                 }
-                hasSupported = true;
             }
         }
         const persistStarted=performance.now();
