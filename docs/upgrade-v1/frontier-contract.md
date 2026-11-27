@@ -208,4 +208,10 @@ individual `support.level` semantics while adding:
 
 - `detail=compact|full` on `view=evidence` (bounded to the initial `detail` for the lifetime of a cursor via `CURSOR_PAGE_OPTIONS_MISMATCH`).
 - `retrieval.page_support` (`composition: "multi_record"`, `contributors`) when complementary curated records in the same project/scope/environment and compatible `subject_id`/`context_key` jointly satisfy a focused query (excluding uncurated `codex-memory`/`historical-source`/`raw_memories` transcripts).
-- `RANKING_VERSION = "adaptive-v3-rc1"` and `SUPPORT_VERSION = "support-v3-page-joint"` on `am5` cursors, plus `exact_only` zero-hit identifier preflight and `suggested_transition` hints in `memory_propose` / `memory_admission_preview`. See `EVOLUTION_RFC.md` (170 passing tests).
+- `RANKING_VERSION = "adaptive-v3-rc1"` and `SUPPORT_VERSION = "support-v3-rc2"` on `am5` cursors, plus `exact_only` zero-hit identifier preflight and `suggested_action` / `suggested_transition` hints in `memory_propose` / `memory_admission_preview`.
+
+## 1.0.0-rc.2 call-log hardening
+
+- `SUPPORT_VERSION` bumped to `support-v3-rc2`; `mode="auto"` continuations accept the resolved mode and offset-equivalent `as_of`, and budget-dropped `page_support` reverts cleanly to `insufficient`.
+- `memory_admission_preview` accepts optional `candidate.request_id`, normalizes `transition: "new"` and default fields in `admissionDigest`, and validates concurrency against referenced revisions and subject claims rather than global `generation`.
+- ISO-8601 timezone offsets are accepted across timestamp fields, expired pending proposals are cleared on `propose()` (same connection/scope) and `maintenance()` (accessible scopes), and `RULE_IDENTITY_REQUIRED` / `TRANSITION_SUBJECT_MISMATCH` return actionable `details.hint` messages.

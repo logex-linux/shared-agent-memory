@@ -2,7 +2,7 @@
 
 [English](README.en.md) · [协议](docs/protocol.md) · [维护](docs/operations.md) · [自适应检索](docs/adaptive-retrieval.md) · [实测报告](docs/adaptive-results.md) · [MIT](LICENSE)
 
-`1.0.0-rc.1`（Schema 14）在保持原有向量与存储结构不变的基础上，增加 `view=evidence` 的 `detail=compact|full` 紧凑响应模式、Focused 多记录联合覆盖 `retrieval.page_support`（`composition=multi_record`）、Focused 单结果收缩保护、`exact_only` 零命中标识符预检，以及 `memory_propose` / `memory_admission_preview` 的 `suggested_transition` 冲突/覆盖审查提示；`am4` 旧游标返回 `CURSOR_STALE`，当前 `am5` 游标随新版本排序/支持语义自动失效需重查。确定性证据包仍由连接配置启用。见 [自进化诊断与架构升级方案](EVOLUTION_RFC.md)、[事项目录与证据包](docs/upgrade-v1/frontier-contract.md)、[生命周期维护](docs/upgrade-v1/lifecycle.md)及[迁移和恢复](docs/upgrade-v1/migration-and-rollback.md)。
+`1.0.0-rc.2`（Schema 14）在 `1.0.0-rc.1`（`view=evidence` 的 `detail=compact|full`、Focused 多记录联合覆盖 `retrieval.page_support`、单结果收缩保护、`exact_only` 零命中预检）基础上，进一步修复全客户端调用日志暴露的问题：`memory_admission_preview` 免除 `candidate.request_id` 并对默认字段与无关并发提交解耦；`suggested_action` / `suggested_transition` 区分普通修订与可迁移规则并排除自身；`recall` 预算截断防重复/防警告泄漏、`page_support` 超预算退回 `insufficient`、`mode="auto"` 游标续页、3+ 实体互补联合覆盖、ISO-8601 时区偏移、以及过期 `pending` 提案自动清理与活跃进程升级告警。`am4` 旧游标返回 `CURSOR_STALE`，当前 `am5` 游标随新版本排序/支持语义自动失效需重查。确定性证据包仍由连接配置启用。见 [自进化诊断与架构升级方案](EVOLUTION_RFC.md)、[事项目录与证据包](docs/upgrade-v1/frontier-contract.md)、[生命周期维护](docs/upgrade-v1/lifecycle.md)及[迁移和恢复](docs/upgrade-v1/migration-and-rollback.md)。
 
 供同一台机器上的多个 AI Agent 共用的本地记忆服务。提供标准 **MCP STDIO** 和 **CLI**，用本地 embedding、关键词和代码标识符检索，按当前任务返回相关片段。
 

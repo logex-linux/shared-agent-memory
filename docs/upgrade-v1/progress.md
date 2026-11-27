@@ -164,3 +164,33 @@ focused single-result contraction protection plus zero-patch minor version-line
 matching (`0.2.0` -> `v0.2`), an `exact_only` zero-hit identifier preflight, and
 advisory `suggested_transition` hints on `propose`/`admissionPreview`. The test
 suite now has 170 passing tests.
+
+## 1.0.0-rc.2 call-log hardening
+
+Full multi-client call-log audits across Codex (active and `.jsonl.zst` archives),
+StepCode, Antigravity transcripts, and production `memory.db` proposals identified nine
+code and tooling issues fixed in `1.0.0-rc.2` on Schema 14 without DB changes:
+
+- `recall.ts` / `evidence.ts`: stops after first-item budget truncation without
+  duplicating `RESPONSE_BUDGET` or leaking dropped-item warnings; drops `hasSupported`
+  when `page_support` fails tight-budget fit; allows 3+-entity complementary focused
+  records through `page_support` while excluding raw transcripts, un-delivered `tags`,
+  and forced single-record `multi_record` corroboration; allows `mode="auto"`
+  continuations with resolved mode and offset-equivalent `as_of`; bumps
+  `SUPPORT_VERSION` to `support-v3-rc2`.
+- `contracts.ts` / `frontier-contracts.ts` / `archive.ts`: supports ISO-8601 timezone
+  offsets across datetime fields (`isoDateTime`) and makes `candidate.request_id`
+  optional in `memory_admission_preview`.
+- `admission.ts` / `service.ts` / `writes.ts` / `transitions.ts`: normalizes
+  `transition: "new"` and non-update defaults in `admissionDigest`, replaces the
+  global `generation` lock in `checkAdmission` with target/reference/subject-claim
+  checks, excludes `target_id` from similarity candidates, emits actionable
+  `suggested_action` (`update_revision` / `supersede`) without invalid `'correct'`,
+  adds actionable `details.hint` on `RULE_IDENTITY_REQUIRED` and
+  `TRANSITION_SUBJECT_MISMATCH`, and clears expired pending proposals on `propose()`
+  and `maintenance()`.
+- `server.ts` / `upgrade-local.mjs` / `analyze_recall_logs.py`: reads MCP server
+  version from `package.json`, clarifies budget/transition hints, warns on live
+  `dist/mcp/server.js` processes during local upgrades, and covers `detail`, Codex
+  `Ok` envelopes, `.jsonl.zst` archives, Antigravity transcripts, and all `memory_*`
+  tools in `tool_summary`.

@@ -6,6 +6,25 @@ import {DatabaseSync,backup} from 'node:sqlite';
 import {artifactHash,makeInstallation,readInstallation} from '../dist/storage/installation.js';
 import {SCHEMA_VERSION} from '../dist/storage/database.js';
 
+function findLiveMcpProcesses(runtimeDir) {
+  if (process.platform === 'win32') return [];
+  try {
+    const target = join(runtimeDir, 'dist/mcp/server.js');
+    const out = execFileSync('ps', ['-eo', 'pid=,lstart=,args='], { encoding: 'utf8' });
+    const hits = [];
+    for (const line of out.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.includes(target)) continue;
+      const match = /^(\d+)\s+([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/.exec(trimmed);
+      if (match) hits.push({ pid: Number(match[1]), started: match[2], command: match[3] });
+      else hits.push({ raw: trimmed });
+    }
+    return hits;
+  } catch {
+    return [];
+  }
+}
+
 const args=process.argv.slice(2),option=name=>args[args.indexOf('--'+name)+1];
 if(args.length!==4||!args.includes('--manifest')||!args.includes('--output'))
   throw Error('Usage: upgrade-local.mjs --manifest INSTALLED_MANIFEST --output NEW_DIRECTORY');
@@ -56,7 +75,12 @@ try {
   const candidate=await makeInstallation({...installed,runtime,version,commit,schema:SCHEMA_VERSION});
   await writeFile(join(output,'installed.json'),JSON.stringify(installed,null,2)+'\n',{mode:0o600});
   await writeFile(join(output,'candidate.json'),JSON.stringify(candidate,null,2)+'\n',{mode:0o600});
-  console.log(JSON.stringify({output,database,runtime,commit,version,schema:SCHEMA_VERSION}));
+  const live_mcp_processes=findLiveMcpProcesses(installed.runtime);
+  const restart_warning=live_mcp_processes.length
+    ? 'Restart or reload running MCP clients so live server.js processes pick up the upgraded dist and schemas.'
+    : undefined;
+  if(restart_warning)console.error(`WARNING: ${restart_warning} (${live_mcp_processes.length} live process(es))`);
+  console.log(JSON.stringify({output,database,runtime,commit,version,schema:SCHEMA_VERSION,live_mcp_processes,...(restart_warning&&{restart_warning})}));
 } catch(error) {
   await rm(output,{recursive:true,force:true});
   throw error;

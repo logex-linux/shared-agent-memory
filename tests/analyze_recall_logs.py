@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract memory_recall calls from Codex/StepCode JSONL and quantify failure proxies."""
+"""Extract shared-agent-memory calls from Codex/StepCode/Antigravity logs and quantify failure proxies."""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +10,9 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any
+import shutil
+import subprocess
+from typing import Any, Iterable
 
 from evolve_common import DEFAULT_OUTPUT, distribution, estimated_tokens, write_report
 
@@ -23,7 +25,10 @@ def arguments() -> argparse.Namespace:
     home = Path.home()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log-root", action="append", dest="roots",
-                        default=[str(home / ".codex/sessions"), str(home / ".stepcode/agent/sessions")])
+                        default=[str(home / ".codex/sessions"),
+                                 str(home / ".codex/archived_sessions"),
+                                 str(home / ".stepcode/agent/sessions")])
+    parser.add_argument("--antigravity-root", default=str(home / ".gemini/antigravity/brain"))
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT / "log-analysis.json"))
     parser.add_argument("--cases-output", default=str(DEFAULT_OUTPUT / "replay-cases.json"))
     parser.add_argument("--case-count", type=int, default=32)
@@ -35,7 +40,7 @@ def json_payload(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         if "items" in value and ("generation" in value or "retrieval_mode" in value):
             return value
-        for key in ("structuredContent", "result", "output"):
+        for key in ("Ok", "structuredContent", "result", "output"):
             if key in value and (found := json_payload(value[key])):
                 return found
         if "text" in value and (found := json_payload(value["text"])):
@@ -88,11 +93,56 @@ def message_text(message: Any) -> str:
     return "\n".join(parts)
 
 
-def parse_file(path: Path) -> tuple[list[dict], list[dict], int, bool]:
-    calls, users, pending = [], [], {}
+def iter_lines(path: Path, zstd_skipped: list[int]) -> Iterable[str]:
+    if path.suffix == ".zst":
+        if not shutil.which("zstd"):
+            zstd_skipped[0] += 1
+            return ()
+        proc = subprocess.run(["zstd", "-dc", str(path)], capture_output=True, text=True, errors="replace")
+        if proc.returncode != 0:
+            return ()
+        return proc.stdout.splitlines()
+    return path.open(encoding="utf-8", errors="replace")
+
+
+def has_tool_error(value: Any) -> bool:
+    if isinstance(value, dict):
+        if "Err" in value or value.get("isError") is True:
+            return True
+        if "error" in value:
+            return True
+        for key in ("Ok", "structuredContent", "result", "output", "content"):
+            if key in value and has_tool_error(value[key]):
+                return True
+        if "text" in value and has_tool_error(value["text"]):
+            return True
+        return False
+    if isinstance(value, list):
+        return any(has_tool_error(entry) for entry in value)
+    if isinstance(value, str):
+        stripped = value.lstrip()
+        if stripped.startswith("{"):
+            try:
+                return has_tool_error(json.loads(stripped))
+            except json.JSONDecodeError:
+                pass
+        return stripped.startswith(("MCP error", "Validation failed", "ERR:")) or '"error":' in stripped
+    return False
+
+
+def normalize_tool_name(name: Any) -> str | None:
+    text = str(name or "").strip().strip('"')
+    match = re.search(r"(?:^|__)memory_([a-z0-9_]+)$", text)
+    if not match:
+        return None
+    return "memory_" + match.group(1)
+
+
+def parse_file(path: Path, zstd_skipped: list[int]) -> tuple[list[dict], list[dict], int, bool, list[tuple[str, bool]]]:
+    calls, users, pending, tool_events, pending_tools = [], [], {}, [], {}
     malformed, skip = 0, False
     objective_marker = "自进化迭代为一个高可用、高性能的生产级候选版本"
-    for line_number, line in enumerate(path.open(encoding="utf-8", errors="replace"), 1):
+    for line_number, line in enumerate(iter_lines(path, zstd_skipped), 1):
         if objective_marker in line:
             skip = True
         try:
@@ -103,11 +153,15 @@ def parse_file(path: Path) -> tuple[list[dict], list[dict], int, bool]:
         timestamp = root.get("timestamp")
         payload = root.get("payload", {})
         item = payload.get("item", {}) if isinstance(payload, dict) else {}
-        if item.get("type") == "McpToolCall" and item.get("tool") == "memory_recall":
-            calls.append({"call_id": item.get("id"), "session": str(path), "line": line_number,
-                          "timestamp": timestamp, "request": item.get("arguments", {}),
-                          "response": json_payload(item.get("result")), "raw_error": item.get("result") if not json_payload(item.get("result")) else None,
-                          "duration_ms": milliseconds(item.get("duration"))})
+        if item.get("type") == "McpToolCall":
+            tool_name = normalize_tool_name(item.get("tool"))
+            if tool_name:
+                tool_events.append((tool_name, has_tool_error(item.get("result"))))
+            if item.get("tool") == "memory_recall":
+                calls.append({"call_id": item.get("id"), "session": str(path), "line": line_number,
+                              "timestamp": timestamp, "request": item.get("arguments", {}),
+                              "response": json_payload(item.get("result")), "raw_error": item.get("result") if not json_payload(item.get("result")) else None,
+                              "duration_ms": milliseconds(item.get("duration"))})
         if payload.get("type") == "message" and payload.get("role") == "user":
             text = message_text(payload)
             if text and not text.startswith("# AGENTS.md instructions"):
@@ -123,18 +177,64 @@ def parse_file(path: Path) -> tuple[list[dict], list[dict], int, bool]:
         for entry in content if isinstance(content, list) else []:
             if not isinstance(entry, dict):
                 continue
+            if entry.get("type") == "toolCall":
+                tool_name = normalize_tool_name(entry.get("name"))
+                if tool_name and entry.get("id"):
+                    pending_tools[entry.get("id")] = tool_name
             if entry.get("type") == "toolCall" and str(entry.get("name", "")).endswith("memory_recall"):
                 call = {"call_id": entry.get("id"), "session": str(path), "line": line_number,
                         "timestamp": timestamp, "request": entry.get("arguments", {}),
                         "response": None, "duration_ms": None}
                 calls.append(call)
                 pending[entry.get("id")] = call
-            if message.get("role") == "toolResult" and str(message.get("toolName", "")).endswith("memory_recall"):
-                call = pending.get(message.get("toolCallId"))
-                if call:
-                    call["response"] = json_payload(message.get("content"))
-                    call["duration_ms"] = wall_ms(call["timestamp"], timestamp)
-    return ([] if skip else calls), users, malformed, skip
+        if message.get("role") == "toolResult":
+            tool_name = pending_tools.pop(message.get("toolCallId"), None) or normalize_tool_name(message.get("toolName"))
+            if tool_name:
+                tool_events.append((tool_name, bool(message.get("isError")) or has_tool_error(message.get("content"))))
+        if message.get("role") == "toolResult" and str(message.get("toolName", "")).endswith("memory_recall"):
+            call = pending.get(message.get("toolCallId"))
+            if call:
+                call["response"] = json_payload(message.get("content"))
+                call["duration_ms"] = wall_ms(call["timestamp"], timestamp)
+    return ([] if skip else calls), users, malformed, skip, ([] if skip else tool_events)
+
+
+def parse_antigravity_transcript(path: Path) -> tuple[int, list[tuple[str, bool]]]:
+    malformed, events = 0, []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return 0, []
+    parsed: list[dict[str, Any] | None] = []
+    for line in lines:
+        try:
+            parsed.append(json.loads(line))
+        except json.JSONDecodeError:
+            malformed += 1
+            parsed.append(None)
+    for index, obj in enumerate(parsed):
+        if not isinstance(obj, dict):
+            continue
+        for call in obj.get("tool_calls") or []:
+            if not isinstance(call, dict) or call.get("name") != "call_mcp_tool":
+                continue
+            args = call.get("args") or {}
+            if "shared_memory" not in str(args.get("ServerName", "")):
+                continue
+            tool_name = normalize_tool_name(args.get("ToolName"))
+            if not tool_name:
+                continue
+            is_err = False
+            for follow in parsed[index + 1:index + 12]:
+                if not isinstance(follow, dict) or follow.get("type") != "GENERIC":
+                    continue
+                if follow.get("status") == "ERROR" or has_tool_error(follow.get("error") or follow.get("content")):
+                    is_err = True
+                    break
+                if tool_name in str(follow.get("content", "")) or "items" in str(follow.get("content", "")) or "proposal_id" in str(follow.get("content", "")):
+                    break
+            events.append((tool_name, is_err))
+    return malformed, events
 
 
 def parse_time(value: str | None) -> float | None:
@@ -290,7 +390,7 @@ def select_cases(calls: list[dict], stats: dict[int, dict], limit: int, reformul
     for entry in ranked:
         add(entry)
     cases = []
-    allowed = ("query", "mode", "view", "limit", "token_budget", "max_bytes", "project_id",
+    allowed = ("query", "mode", "view", "detail", "limit", "token_budget", "max_bytes", "project_id",
                "include_global", "context", "exact_only", "decision_state", "subject_id",
                "context_key", "include_history", "as_of", "graph")
     for score, chosen, indexes, reasons in selected:
@@ -311,15 +411,33 @@ def main() -> None:
     args = arguments()
     if not 20 <= args.case_count <= 50:
         raise ValueError("--case-count must be between 20 and 50")
-    paths = sorted({path for root in args.roots for path in Path(root).expanduser().rglob("*.jsonl")
+    paths = sorted({path for root in args.roots for pattern in ("*.jsonl", "*.jsonl.zst")
+                    for path in Path(root).expanduser().rglob(pattern)
                     if not any(session in str(path) for session in args.exclude_session)})
     calls, malformed, skipped, users_by_session = [], 0, 0, defaultdict(list)
+    tool_events: list[tuple[str, bool]] = []
+    zstd_skipped = [0]
     for path in paths:
-        parsed, users, bad, skip = parse_file(path)
+        parsed, users, bad, skip, events = parse_file(path, zstd_skipped)
         calls.extend(parsed)
+        tool_events.extend(events)
         users_by_session[str(path)].extend(users)
         malformed += bad
         skipped += int(skip)
+    ag_root = Path(args.antigravity_root).expanduser()
+    ag_paths = sorted(ag_root.glob("*/.system_generated/logs/transcript.jsonl")) if ag_root.is_dir() else []
+    for ag_path in ag_paths:
+        if any(session in str(ag_path) for session in args.exclude_session):
+            continue
+        bad, events = parse_antigravity_transcript(ag_path)
+        malformed += bad
+        tool_events.extend(events)
+    tool_counts: dict[str, dict[str, int]] = {}
+    for tool_name, is_err in tool_events:
+        bucket = tool_counts.setdefault(tool_name, {"calls": 0, "errors": 0})
+        bucket["calls"] += 1
+        if is_err:
+            bucket["errors"] += 1
     calls.sort(key=lambda call: (call.get("timestamp") or "", call["session"], call["line"]))
     stats = {}
     for index, call in enumerate(calls):
@@ -360,7 +478,11 @@ def main() -> None:
                             "ids" if call.get("request", {}).get("ids") else "unknown" for call in calls)
     report = {
         "format": "shared-agent-memory/evolve-log-analysis-v1",
-        "files": {"discovered": len(paths), "excluded_current_objective": skipped, "malformed_lines": malformed},
+        "files": {"discovered": len(paths), "zst_files": sum(1 for p in paths if p.suffix == ".zst"),
+                  "zst_skipped": zstd_skipped[0], "antigravity_transcripts": len(ag_paths),
+                  "excluded_current_objective": skipped, "malformed_lines": malformed},
+        "tool_summary": {"total_calls": len(tool_events), "total_errors": sum(1 for _, err in tool_events if err),
+                         "by_tool": dict(sorted(tool_counts.items()))},
         "summary": {"calls": len(calls), "query_calls": len(query_calls), "responses": len(responses),
                     "errors_or_incomplete": len(calls) - len(responses), "request_kinds": dict(request_kinds),
                     "query_responses": len(query_responses),
